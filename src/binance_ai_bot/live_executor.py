@@ -154,11 +154,17 @@ class BinanceLiveSpotExecutor:
         for item in data.get("balances", []):
             asset = str(item.get("asset", "")).upper()
             free_amt = Decimal(str(item.get("free", "0")))
-            if free_amt > 0 or asset == "USDC":
+            if free_amt > 0 or asset in {"USDC", "LDUSDC"}:
                 balances[asset] = free_amt
 
         usdc_free = balances.get("USDC", Decimal("0"))
+        ldusdc_free = balances.get("LDUSDC", Decimal("0"))
         self.storage.set_state("live_spot_cash_usdc", f"{usdc_free:.8f}")
+        self.storage.set_state("live_earn_ldusdc", f"{ldusdc_free:.8f}")
+
+        perms = {str(p).upper() for p in data.get("permissions", [])}
+        spot_perm = "SPOT" in perms
+        self.storage.set_state("live_spot_permission_ok", "1" if spot_perm else "0")
         return balances
 
     def execute_live_market_buy(

@@ -157,9 +157,26 @@ def main() -> None:
                                 ui_live_confirmed=True
                             )
                             st.session_state["live_balance_synced"] = True
+                            usdc_now = bals.get("USDC", Decimal("0"))
+                            ldusdc_now = bals.get("LDUSDC", Decimal("0"))
+                            spot_perm_ok = storage.get_state("live_spot_permission_ok", "0") == "1"
                             st.success(
-                                f"Gerçek Spot bağlantısı doğrulandı. Serbest USDC: {bals.get('USDC', Decimal('0')):.2f} USDC"
+                                f"Gerçek hesap okundu. Spot Serbest USDC: {usdc_now:.2f} USDC"
                             )
+                            if not spot_perm_ok:
+                                st.warning(
+                                    "⚠️ API anahtarınızda **'Enable Spot & Margin & Stock Trading'** kutusu henüz "
+                                    "işaretli değil (yalnızca Okuma açık). Emir gönderebilmek için Binance API "
+                                    "ekranında önce IP adresinizi girip bu kutuyu işaretlemeniz gerekir."
+                                )
+                            if usdc_now < Decimal("5.0") and ldusdc_now > Decimal("0"):
+                                st.warning(
+                                    f"💡 Spot cüzdanınızda serbest USDC `{usdc_now:.2f}` görünüyor; ancak "
+                                    f"**Binance Simple Earn (Esnek Birikim)** hesabınızda **`{ldusdc_now:.2f} LDUSDC`** bulundu! "
+                                    "Binance API'si Earn içindeki parayı doğrudan kullanamaz. Uygulamadan "
+                                    "**Earn (Kazan) -> USDC -> Redeem (Parayı Çek / Geri Al -> Spot Cüzdanı)** "
+                                    "yapıp **Auto-Subscribe (Otomatik Katılım)** özelliğini kapatın."
+                                )
                         except Exception as exc:
                             st.error(f"Canlı hesap okuma uyarısı: {exc}")
 
