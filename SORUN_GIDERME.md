@@ -4,7 +4,17 @@ Bu rehber teknik bilgisi sınırlı kullanıcılar için en sık karşılaşıla
 
 ---
 
-## 1. `WinError 10054` / `Binance Global veri sunucusuna bağlantı sıfırlandı` Hatası
+## 1. Tarayıcıda `127.0.0.1 bağlanmayı reddetti (ERR_CONNECTION_REFUSED)` Hatası
+- **Nedeni:** `http://127.0.0.1:8501` adresi internetteki bir web sitesi değil, **yalnızca bilgisayarınızda `baslat.bat` açıkken çalışan yerel paneldir**. `baslat.bat` henüz çalıştırılmamışsa veya açılan siyah komut penceresi kapatılmışsa tarayıcı bu hatayı verir.
+- **Çözüm:**
+  1. Klasördeki **`baslat.bat`** dosyasına çift tıklayın.
+  2. Açılan siyah pencereyi **kapatmayın** (arka planda simge durumuna küçültebilirsiniz).
+  3. 3 saniye içinde tarayıcınız otomatik olarak `http://127.0.0.1:8501` adresini açacaktır; açılmazsa sayfayı yenileyin (`F5`).
+  4. İşiniz bittiğinde siyah pencereyi kapatabilir veya **`durdur.bat`** dosyasına çift tıklayabilirsiniz.
+
+---
+
+## 2. `WinError 10054` / `Binance Global veri sunucusuna bağlantı sıfırlandı` Hatası
 - **Nedeni:** Türkiye'deki bazı internet servis sağlayıcılarında `binance.com` ve `binance.vision` alan adlarına yönelik ağ düzeyinde bağlantı sıfırlaması uygulanabilmektedir.
 - **Sistemin Güvenli Davranışı:** Program çökmez, hayalî işlem üretmez ve bakiyenizi korur.
 - **Ne Yapabilirsiniz?**
