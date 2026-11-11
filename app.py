@@ -30,7 +30,9 @@ from binance_ai_bot.config import AppConfig, load_config
 from binance_ai_bot.domain import Candle, RiskSettings
 from binance_ai_bot.engine import TradingSystemEngine
 from binance_ai_bot.market_data import MarketDataError
+from binance_ai_bot.profiles import TRADING_PROFILES, get_profile
 from binance_ai_bot.risk import EXIT_POLICY_DESCRIPTIONS_TR, RISK_DISCLAIMER_TR
+from binance_ai_bot.runner import RUNNER_STOP_KEY, is_runner_alive
 from binance_ai_bot.security import assert_localhost_only
 from binance_ai_bot.simulator import FILL_MODEL_EXPLANATION_TR
 from binance_ai_bot.validation import (
@@ -83,7 +85,7 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.4.0"
+ENGINE_STATE_VERSION = "1.5.0"
 
 
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
@@ -127,6 +129,35 @@ def main() -> None:
             horizontal=True,
             help="Spot cüzdanınızda bulundurduğunuz ana bakiye para birimi (USDT veya USDC).",
         )
+
+        # --- Kesintisiz Arka Plan Botu Durumu ---
+        runner_alive, runner_info = is_runner_alive(storage)
+        if runner_alive:
+            r_mode = "🔴 CANLI SPOT" if runner_info.get("mode") == "LIVE_SPOT" else "🟢 SANAL"
+            st.success(
+                f"🤖 **Arka Plan Botu Çalışıyor** — {r_mode} | "
+                f"Profil: `{runner_info.get('profile', '?')}` | "
+                f"Parite: `{runner_info.get('symbol', '?')} ({runner_info.get('interval', '?')})`\n\n"
+                "Çift emir olmaması için paneldeki otomatik döngü ve analiz düğmesi kilitlendi."
+            )
+            if st.button("⏹️ Arka Plan Botunu Durdur", width="stretch"):
+                storage.set_state(RUNNER_STOP_KEY, "1")
+                st.info("Durdurma isteği gönderildi; bot en geç bir döngü içinde kapanır.")
+        else:
+            st.caption(
+                "🤖 Arka plan botu kapalı. Kesintisiz alım-satım için proje klasöründeki "
+                "`bot_sanal.bat` (deneme) veya `bot_canli.bat` (gerçek para) dosyasını çalıştırın."
+            )
+
+        profile_keys = list(TRADING_PROFILES.keys())
+        selected_profile_key = st.selectbox(
+            "İşlem Profili",
+            options=profile_keys,
+            index=profile_keys.index("AKTIF"),
+            format_func=lambda k: TRADING_PROFILES[k].label_tr,
+        )
+        active_profile = get_profile(selected_profile_key)
+        st.caption(active_profile.description_tr)
 
         mode_choice = st.radio(
             "İşlem Yürütme Modu",
@@ -204,7 +235,11 @@ def main() -> None:
         )
 
         interval_options = ["5m", "15m", "30m", "1h", "4h"]
-        default_int_idx = interval_options.index(cfg.default_interval) if cfg.default_interval in interval_options else 1
+        default_int_idx = (
+            interval_options.index(active_profile.interval)
+            if active_profile.interval in interval_options
+            else 1
+        )
         selected_interval = st.selectbox(
             "Kapanmış Mum Periyodu",
             options=interval_options,
@@ -228,15 +263,21 @@ def main() -> None:
         daily_ai_limit = st.number_input(
             "Günlük Maksimum Model Çağrısı",
             min_value=1,
-            max_value=200,
-            value=int(cfg.ai_daily_call_limit),
+            max_value=500,
+            value=int(max(cfg.ai_daily_call_limit, active_profile.ai_daily_call_limit)),
             step=1,
         )
         auto_loop = st.toggle(
-            "Otomatik Döngü (Her 60 sn'de Kontrol Et)",
+            "Otomatik Döngü (Panel açıkken kontrol et)",
             value=False,
-            help="Bilgisayar açık ve uyanık kaldığı sürece 60 saniyede bir yeni kapanmış mum kontrolü yapar.",
+            disabled=runner_alive,
+            help=(
+                "Yalnızca bu tarayıcı sekmesi açıkken çalışır. Sekmeden bağımsız kesintisiz çalışma için "
+                "bot_sanal.bat / bot_canli.bat kullanın."
+            ),
         )
+        if runner_alive:
+            auto_loop = False
 
     effective_mode = "LIVE_SPOT" if (mode_choice == "LIVE_SPOT" and ui_live_confirmed) else "PAPER"
     active_track = "LIVE_SPOT" if effective_mode == "LIVE_SPOT" else "MAIN"
@@ -268,7 +309,12 @@ def main() -> None:
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1.4, 1.4, 1.4, 2.0])
 
     with btn_col1:
-        run_now = st.button("▶️ Analiz Adımını Şimdi Çalıştır", type="primary", width="stretch")
+        run_now = st.button(
+            "▶️ Analiz Adımını Şimdi Çalıştır",
+            type="primary",
+            width="stretch",
+            disabled=runner_alive,
+        )
 
     with btn_col2:
         if paused:
@@ -309,11 +355,13 @@ def main() -> None:
             step_res = engine.run_analysis_step(
                 symbol=selected_symbol,
                 interval=selected_interval,
-                settings=settings,
+                settings=active_profile.apply_to_risk_settings(settings),
                 ai_enabled_by_user=ai_enabled,
                 daily_ai_limit_override=int(daily_ai_limit),
+                min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
                 execution_mode=effective_mode,
                 ui_live_confirmed=ui_live_confirmed,
+                strategy_params=active_profile.strategy,
             )
             st.session_state["last_step_summary"] = step_res
 
@@ -742,9 +790,9 @@ def main() -> None:
             width="stretch",
         )
 
-    # Otomatik yenileme açıksa 60 sn bekle ve yeniden çiz
+    # Otomatik yenileme açıksa profil döngü süresi kadar bekle ve yeniden çiz
     if auto_loop:
-        time.sleep(60)
+        time.sleep(active_profile.loop_seconds)
         st.rerun()
 
 

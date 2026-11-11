@@ -787,3 +787,124 @@ def test_usdt_spot_pair_discovery_risk_and_live_balance(tmp_path: Path) -> None:
     bals = live_exec.fetch_live_spot_balances(ui_live_confirmed=True, quote_asset="USDT")
     assert bals["USDT"] == Decimal("86.72628900")
     assert storage.get_cash_balance(track="LIVE_SPOT") == Decimal("86.72628900")
+
+
+# ---------------------------------------------------------------------------
+# TEST 13: Aktif profil sert sınırları korur; arka plan botu döngüsü, kalp atışı ve canlı onay kilidi
+# ---------------------------------------------------------------------------
+def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
+    from binance_ai_bot.engine import StepCycleSummary
+    from binance_ai_bot.profiles import get_profile
+    from binance_ai_bot.runner import RUNNER_HEARTBEAT_KEY, is_runner_alive, run_bot
+
+    # 13a: Aktif profil işlem sıklığını artırır ama pozisyon ve günlük zarar sınırlarını AYNEN korur
+    base = RiskSettings(max_position_size_usdc=Decimal("10.00"), daily_loss_limit_usdc=Decimal("2.00"))
+    aktif = get_profile("aktif")
+    applied = aktif.apply_to_risk_settings(base)
+    assert applied.max_position_size_usdc == Decimal("10.00")
+    assert applied.daily_loss_limit_usdc == Decimal("2.00")
+    assert applied.max_open_positions == 1
+    assert applied.max_daily_new_positions == 12
+    assert applied.allow_stablecoin_conversion is False
+    assert aktif.interval == "5m"
+
+    storage = SQLiteStorage(tmp_path / "t13.db", initial_balance_usdc=Decimal("86.73"))
+
+    class _StubLive:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_live_spot_balances(self, *, ui_live_confirmed: bool, quote_asset: str = "USDC"):
+            self.calls += 1
+            return {quote_asset: Decimal("86.72")}
+
+    class _StubEngine:
+        def __init__(self) -> None:
+            self.storage = storage
+            self.live_executor = _StubLive()
+            self.step_kwargs: list[dict] = []
+
+        def default_risk_settings(self) -> RiskSettings:
+            return base
+
+        def run_analysis_step(self, **kwargs):
+            self.step_kwargs.append(kwargs)
+            # Döngü sırasında kalp atışı yazılmış olmalı (panel kilidi için)
+            alive, info = is_runner_alive(storage)
+            assert alive and info["profile"] == "AKTIF"
+            return StepCycleSummary(
+                ok=True,
+                timestamp_iso=datetime.now(timezone.utc).isoformat(),
+                symbol=kwargs["symbol"],
+                interval=kwargs["interval"],
+                data_source="stub",
+                wake_gap_detected=False,
+                tech_signal=None,
+                ai_decision=None,
+                final_action="BEKLE",
+                executed_order=None,
+                block_or_info_message="test",
+            )
+
+    # 13b: Sanal modda 2 döngü çalışır, profil parametreleri motora iletilir, çıkışta kalp atışı temizlenir
+    stub = _StubEngine()
+    cfg = AppConfig(sqlite_db_path=tmp_path / "t13.db", default_symbol="BTCUSDT", quote_asset="USDT")
+    rc = run_bot(
+        ["--mod", "sanal", "--profil", "aktif", "--parite", "BTCUSDT", "--max-dongu", "2"],
+        engine=stub,  # type: ignore[arg-type]
+        config=cfg,
+        sleep_fn=lambda _s: None,
+        lock_path=tmp_path / "t13.lock",
+    )
+    assert rc == 0
+    assert len(stub.step_kwargs) == 2
+    first = stub.step_kwargs[0]
+    assert first["execution_mode"] == "PAPER" and first["ui_live_confirmed"] is False
+    assert first["interval"] == "5m"
+    assert first["strategy_params"].min_volume_ratio == 0.5
+    assert first["settings"].max_daily_new_positions == 12
+    assert storage.get_state(RUNNER_HEARTBEAT_KEY, "") == ""
+    assert is_runner_alive(storage)[0] is False
+
+    # 13c: Canlı mod, .env kilidi kapalıysa hiç başlamaz
+    stub_live = _StubEngine()
+    rc_locked = run_bot(
+        ["--mod", "canli", "--max-dongu", "1"],
+        engine=stub_live,  # type: ignore[arg-type]
+        config=cfg,
+        sleep_fn=lambda _s: None,
+        lock_path=tmp_path / "t13.lock",
+    )
+    assert rc_locked == 2 and stub_live.step_kwargs == []
+
+    # 13d: Canlı mod açık olsa bile konsoldan "EVET" yazılmazsa tek emir/analiz yapılmaz
+    cfg_live = AppConfig(
+        sqlite_db_path=tmp_path / "t13.db",
+        default_symbol="BTCUSDT",
+        quote_asset="USDT",
+        enable_live_trading=True,
+        binance_api_key="k_test",
+        binance_api_secret="s_test",
+    )
+    rc_denied = run_bot(
+        ["--mod", "canli", "--parite", "BTCUSDT", "--max-dongu", "1"],
+        engine=stub_live,  # type: ignore[arg-type]
+        config=cfg_live,
+        sleep_fn=lambda _s: None,
+        input_fn=lambda _p: "hayir",
+        lock_path=tmp_path / "t13.lock",
+    )
+    assert rc_denied == 4 and stub_live.step_kwargs == []
+
+    # 13e: "EVET" onayıyla canlı döngü ui_live_confirmed=True ve LIVE_SPOT ile çalışır
+    rc_ok = run_bot(
+        ["--mod", "canli", "--parite", "BTCUSDT", "--max-dongu", "1"],
+        engine=stub_live,  # type: ignore[arg-type]
+        config=cfg_live,
+        sleep_fn=lambda _s: None,
+        input_fn=lambda _p: "EVET",
+        lock_path=tmp_path / "t13.lock",
+    )
+    assert rc_ok == 0
+    assert stub_live.step_kwargs[0]["execution_mode"] == "LIVE_SPOT"
+    assert stub_live.step_kwargs[0]["ui_live_confirmed"] is True

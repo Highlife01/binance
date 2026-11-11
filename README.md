@@ -75,3 +75,23 @@ Gerçek **86 USDC** Spot bakiyenizle işlem yapmak istediğinizde sistem sizi ka
 - **Doğrulanamayan Dinamik Ücretler:** Kullanıcının kendi Binance VIP/promosyon komisyon oranı (ör. dönemsel USDC kampanyaları) herkese açık uç noktadan bilinemeyeceği için varsayılan Spot komisyonu `%0.10` alınmış ve panelden değiştirilebilir yapılmıştır. Gemini API anlık fatura tarifesi çalışma anında API'den çekilemediği için yapay zekâ maliyeti kesin fatura olarak değil, birim token varsayımına dayalı **tahmini gösterge** olarak sunulur.
 - **Küçük Bakiye (86 USDC) Sınırlaması:** 10 USDC'lik işlemlerde gidiş-dönüş komisyon ve makas maliyeti yaklaşık `%0.26` başabaş eşiği yaratır. Çok kısa periyotlarda (1m) sık işlem yapmak bakiyeyi komisyonla eritir; `15m` veya `1h` gibi periyotlar tercih edilmelidir.
 - **Yerel Çalışma Sınırlaması:** Bilgisayar kapandığında, yeniden başladığında veya Windows uyku moduna geçtiğinde bot çalışmaz. Risk sınırları ani fiyat boşluklarında (gap) veya likidite kurumalarında kesin kayıp garantisi veremez.
+
+
+## Kesintisiz Arka Plan Botu (Sürekli Alım-Satım)
+
+Panelin "Otomatik Döngü" özelliği yalnızca tarayıcı sekmesi açıkken çalışır. Tarayıcıdan bağımsız,
+kesintisiz çalışma için:
+
+| Dosya | Ne yapar |
+|---|---|
+| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan Aktif profil (5dk) ile sürekli çalışır |
+| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile canlı Spot alım-satım yapar |
+
+- İşlem profilleri (`src/binance_ai_bot/profiles.py`):
+  - `TEMKINLI`: 15dk mum, günde en fazla 3 pozisyon, %2.5 zarar-kes / %4.5 kâr-al.
+  - `AKTIF`: 5dk mum, gevşetilmiş hacim/RSI eşikleri, günde en fazla 12 pozisyon, %0.8 zarar-kes / %1.2 kâr-al.
+- Hiçbir profil işlem başına pozisyon sınırını (10), günlük zarar eşiğini (2) ve tek açık pozisyon kuralını gevşetmez.
+- Aynı anda tek bot çalışabilir; bot çalışırken panelin otomatik döngüsü ve analiz düğmesi kilitlenir.
+- Bot çalıştığı sürece Windows uykuya geçmez. Durdurmak için `Ctrl+C`, pencereyi kapatmak veya paneldeki **Arka Plan Botunu Durdur**.
+- Kayıtlar: `logs/bot_YYYY-MM-DD.log`.
+- Daha sık işlem daha fazla komisyon demektir; kâr garantisi yoktur.

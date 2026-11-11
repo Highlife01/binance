@@ -32,7 +32,7 @@ from .risk import RiskManager, compute_open_position_unrealized_net_pnl
 from .security import LiveOrderBlockedError
 from .simulator import VirtualExecutionSimulator
 from .storage import SQLiteStorage
-from .strategy import evaluate_technical_strategy
+from .strategy import StrategyParams, evaluate_technical_strategy
 
 
 @dataclass(frozen=True)
@@ -216,6 +216,7 @@ class TradingSystemEngine:
         min_ai_interval_override: int | None = None,
         execution_mode: str = "PAPER",
         ui_live_confirmed: bool = False,
+        strategy_params: StrategyParams | None = None,
     ) -> StepCycleSummary:
         """
         Tek bir tam denetimli analiz ve yürütme döngüsü çalıştırır.
@@ -298,7 +299,10 @@ class TradingSystemEngine:
 
         # 2. Kural tabanlı teknik gösterge hesabı (yalnızca kapanmış mumlarla)
         tech_signal, recent_returns = evaluate_technical_strategy(
-            market.closed_candles, symbol=market.symbol, interval=market.interval
+            market.closed_candles,
+            symbol=market.symbol,
+            interval=market.interval,
+            params=strategy_params,
         )
 
         # 3. Gölge kural tabanlı karşılaştırma portföyünü güncelle

@@ -239,8 +239,8 @@ class VirtualExecutionSimulator:
                 signal_key=signal_key,
                 strategy_source=strategy_source,
                 explanation=(
-                    f"Kısmi/mevcut likidite tutarı ({gross_usdc:.2f} USDC), minimum emir tutarının "
-                    f"({filters.min_notional:.2f} USDC) altında kaldığı için emir gerçekleşmedi."
+                    f"Kısmi/mevcut likidite tutarı ({gross_usdc:.2f} {filters.quote_asset}), minimum emir tutarının "
+                    f"({filters.min_notional:.2f} {filters.quote_asset}) altında kaldığı için emir gerçekleşmedi."
                 ),
                 created_at_iso=now_iso,
             )
@@ -311,8 +311,8 @@ class VirtualExecutionSimulator:
         self.storage.mark_signal_processed(signal_key, order_id, now_iso, track=track)
 
         explanation = (
-            f"Sanal ALIM ({order_status}): {filled_qty} {filters.base_asset} @ {exec_price:.6f} USDC "
-            f"(Tutar: {gross_usdc:.2f} USDC, Komisyon: {fee_usdc:.4f} USDC, Kayma: {slippage_bps:.2f} bps)."
+            f"Sanal ALIM ({order_status}): {filled_qty} {filters.base_asset} @ {exec_price:.6f} {filters.quote_asset} "
+            f"(Tutar: {gross_usdc:.2f} {filters.quote_asset}, Komisyon: {fee_usdc:.4f} {filters.quote_asset}, Kayma: {slippage_bps:.2f} bps)."
         )
         res = SimulatedOrderResult(
             order_id=order_id,
@@ -482,8 +482,8 @@ class VirtualExecutionSimulator:
 
         explanation = (
             f"Sanal SATIŞ ({order_status} - {close_reason}): {filled_qty} {filters.base_asset} "
-            f"@ {exec_price:.6f} USDC (Net Hasılat: {net_proceeds_usdc:.2f} USDC, "
-            f"Çıkış Komisyonu: {exit_fee_usdc:.4f} USDC, Gerçekleşmiş K/Z: {realized_pnl:+.4f} USDC)."
+            f"@ {exec_price:.6f} {filters.quote_asset} (Net Hasılat: {net_proceeds_usdc:.2f} {filters.quote_asset}, "
+            f"Çıkış Komisyonu: {exit_fee_usdc:.4f} {filters.quote_asset}, Gerçekleşmiş K/Z: {realized_pnl:+.4f} {filters.quote_asset})."
         )
         res = SimulatedOrderResult(
             order_id=order_id,
