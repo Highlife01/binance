@@ -111,7 +111,9 @@ def load_config(env_path: Path | None = None) -> AppConfig:
     """`.env` dosyasını güvenli biçimde yükler ve doğrulanmış AppConfig döndürür."""
     target_env = env_path if env_path is not None else (PROJECT_ROOT / ".env")
     if target_env.exists():
-        load_dotenv(dotenv_path=target_env, override=False)
+        # Pytest ortaminda monkeypatch degiskenlerini koru; normal calismada .env guncellemelerini aninda oku
+        should_override = "PYTEST_CURRENT_TEST" not in os.environ
+        load_dotenv(dotenv_path=target_env, override=should_override)
 
     exit_policy = os.getenv("DAILY_LIMIT_EXIT_POLICY", "HOLD_EXISTING").strip().upper()
     if exit_policy not in {"HOLD_EXISTING", "AUTO_CLOSE"}:

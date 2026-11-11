@@ -83,26 +83,27 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.2.0"
+ENGINE_STATE_VERSION = "1.3.0"
 
 
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
-    # Acik Streamlit oturumunda eski engelli URL kalmissa resmi api.binance.me adresine gecir
-    import os
-
-    if os.getenv("BINANCE_PUBLIC_BASE_URL") == "https://data-api.binance.vision":
-        os.environ["BINANCE_PUBLIC_BASE_URL"] = "https://api.binance.me"
-    if os.getenv("BINANCE_LIVE_BASE_URL") == "https://api.binance.com":
-        os.environ["BINANCE_LIVE_BASE_URL"] = "https://api.binance.me"
-
     cfg = load_config()
     assert_localhost_only(cfg.localhost_host)
+    cfg_fingerprint = (
+        ENGINE_STATE_VERSION,
+        cfg.binance_public_base_url,
+        cfg.binance_live_base_url,
+        cfg.enable_live_trading,
+        cfg.has_binance_live_keys,
+        cfg.has_gemini_key,
+        cfg.gemini_model,
+    )
     if (
         "engine" not in st.session_state
-        or st.session_state.get("engine_version") != ENGINE_STATE_VERSION
+        or st.session_state.get("engine_fingerprint") != cfg_fingerprint
     ):
         st.session_state["engine"] = TradingSystemEngine(cfg)
-        st.session_state["engine_version"] = ENGINE_STATE_VERSION
+        st.session_state["engine_fingerprint"] = cfg_fingerprint
     return cfg, st.session_state["engine"]
 
 
@@ -148,6 +149,19 @@ def main() -> None:
                 )
                 unlock_switch = st.toggle("Canlı Spot Emir Kilidini Aç", value=False)
                 ui_live_confirmed = bool(ack_risk and unlock_switch)
+                if ui_live_confirmed:
+                    sync_now = st.button("🔄 Gerçek Binance Bakiyesini Sorgula", width="stretch")
+                    if sync_now or not st.session_state.get("live_balance_synced"):
+                        try:
+                            bals = engine.live_executor.fetch_live_spot_balances(
+                                ui_live_confirmed=True
+                            )
+                            st.session_state["live_balance_synced"] = True
+                            st.success(
+                                f"Gerçek Spot bağlantısı doğrulandı. Serbest USDC: {bals.get('USDC', Decimal('0')):.2f} USDC"
+                            )
+                        except Exception as exc:
+                            st.error(f"Canlı hesap okuma uyarısı: {exc}")
 
         st.divider()
         symbol_options = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "BNBUSDC", "XRPUSDC", "ADAUSDC", "AVAXUSDC"]
