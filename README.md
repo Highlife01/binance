@@ -84,12 +84,17 @@ kesintisiz çalışma için:
 
 | Dosya | Ne yapar |
 |---|---|
-| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan Aktif profil (5dk) ile sürekli çalışır |
-| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile canlı Spot alım-satım yapar |
+| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan Temkinli profil (15dk) ile 10 coini (BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOGE, LINK, SUI) tarar |
+| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile tek paritede (varsayılan BTCUSDT) canlı Spot alım-satım yapar |
+
+- Çoklu coin taraması **yalnızca sanal modda** çalışır: açık pozisyon yokken listedeki pariteler taranır,
+  ilk geçerli AL sinyaline girilir (yine tek pozisyon); pozisyon açıkken yalnızca o parite yönetilir.
+  Gemini yalnızca kuralın AL dediği paritede çağrılır (`KURAL_ON_ELEME`).
 
 - İşlem profilleri (`src/binance_ai_bot/profiles.py`):
   - `TEMKINLI`: 15dk mum, günde en fazla 3 pozisyon, %2.5 zarar-kes / %4.5 kâr-al.
   - `AKTIF`: 5dk mum, gevşetilmiş hacim/RSI eşikleri, günde en fazla 12 pozisyon, %0.8 zarar-kes / %1.2 kâr-al.
+    Son 7 günlük 10 coin geçmiş testinde Temkinli'ye göre ~3 kat fazla zarar ettiği için varsayılan değildir.
 - Hiçbir profil işlem başına pozisyon sınırını (10), günlük zarar eşiğini (2) ve tek açık pozisyon kuralını gevşetmez.
 - Aynı anda tek bot çalışabilir; bot çalışırken panelin otomatik döngüsü ve analiz düğmesi kilitlenir.
 - Bot çalıştığı sürece Windows uykuya geçmez. Durdurmak için `Ctrl+C`, pencereyi kapatmak veya paneldeki **Arka Plan Botunu Durdur**.

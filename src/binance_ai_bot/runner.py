@@ -34,6 +34,11 @@ RUNNER_INFO_KEY = "runner_info_json"
 RUNNER_STOP_KEY = "runner_stop_requested"
 RUNNER_STALE_AFTER_SECONDS = 150
 
+DEFAULT_SCAN_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
+]
+
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 
@@ -131,8 +136,16 @@ def _setup_logger() -> logging.Logger:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Kesintisiz Binance Spot arka plan botu")
     ap.add_argument("--mod", choices=["sanal", "canli"], default="sanal")
-    ap.add_argument("--profil", choices=["aktif", "temkinli"], default="aktif")
+    ap.add_argument("--profil", choices=["aktif", "temkinli"], default="temkinli")
     ap.add_argument("--parite", default="", help="Örn. BTCUSDT (boşsa .env DEFAULT_SYMBOL)")
+    ap.add_argument(
+        "--pariteler",
+        default="",
+        help=(
+            "Çoklu coin taraması (yalnızca SANAL mod): virgülle ayrılmış liste veya 'varsayilan' "
+            f"({','.join(DEFAULT_SCAN_SYMBOLS)})."
+        ),
+    )
     ap.add_argument("--ai", choices=["acik", "kapali"], default="acik")
     ap.add_argument("--max-dongu", type=int, default=0, help="Test amaçlı: 0 = sınırsız")
     ap.add_argument(
@@ -150,7 +163,7 @@ def _summarize_step(res: StepCycleSummary) -> str:
     if res.tech_signal is not None:
         ts = res.tech_signal
         parts.append(
-            f"Kapanis={ts.close_price:.2f} RSI={ts.rsi_14:.1f} Hacim={ts.volume_ratio:.2f}x"
+            f"Kapanis={ts.close_price:.6g} RSI={ts.rsi_14:.1f} Hacim={ts.volume_ratio:.2f}x"
         )
     if res.executed_order is not None:
         parts.append(f"EMIR: {res.executed_order.explanation}")
@@ -177,19 +190,45 @@ def run_bot(
     symbol = (args.parite or cfg.default_symbol).strip().upper()
     is_live = args.mod == "canli"
     execution_mode = "LIVE_SPOT" if is_live else "PAPER"
+    track = "LIVE_SPOT" if is_live else "MAIN"
+
+    raw_list = args.pariteler.strip()
+    if raw_list.lower() in {"varsayilan", "default", "hepsi"}:
+        scan_symbols = list(DEFAULT_SCAN_SYMBOLS)
+    elif raw_list:
+        scan_symbols = [s.strip().upper() for s in raw_list.split(",") if s.strip()]
+    else:
+        scan_symbols = [symbol]
+    multi_scan = len(scan_symbols) > 1
+
+    if multi_scan and is_live:
+        log.error(
+            "Coklu coin taramasi simdilik YALNIZCA SANAL modda kullanilabilir. "
+            "Canli modda tek parite (--parite) secin."
+        )
+        return 6
+
     eng = engine or TradingSystemEngine(cfg)
+    if multi_scan:
+        eng.lock_benchmark_symbol = True
 
     log.info("=" * 78)
     log.info(
-        "ARKA PLAN BOTU | Mod=%s | Profil=%s | Parite=%s | Mum=%s | Dongu=%ss | AI=%s",
+        "ARKA PLAN BOTU | Mod=%s | Profil=%s | Parite(ler)=%s | Mum=%s | Dongu=%ss | AI=%s",
         "CANLI SPOT (GERCEK PARA)" if is_live else "SANAL DENEME",
         profile.key,
-        symbol,
+        ",".join(scan_symbols),
         profile.interval,
         profile.loop_seconds,
         args.ai,
     )
     log.info("Profil: %s", profile.description_tr)
+    if multi_scan:
+        log.info(
+            "Coklu tarama: Acik pozisyon yokken %s parite taranir, ilk gecerli AL sinyaline girilir "
+            "(yine tek pozisyon). Gemini yalnizca kuralin AL dedigi paritede cagrilir.",
+            len(scan_symbols),
+        )
 
     if is_live:
         if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
@@ -236,7 +275,7 @@ def run_bot(
             {
                 "mode": execution_mode,
                 "profile": profile.key,
-                "symbol": symbol,
+                "symbol": ",".join(scan_symbols) if multi_scan else symbol,
                 "interval": profile.interval,
                 "pid": os.getpid(),
                 "started_iso": started_iso,
@@ -247,7 +286,7 @@ def run_bot(
 
     loops = 0
     consecutive_errors = 0
-    last_logged_key = ""
+    last_logged_key: dict[str, str] = {}
     last_alive_log = 0.0
     exit_code = 0
     try:
@@ -260,34 +299,61 @@ def run_bot(
                 log.info("Panelden durdurma istegi alindi; bot guvenli sekilde kapatiliyor.")
                 break
 
-            try:
-                settings = profile.apply_to_risk_settings(eng.default_risk_settings())
-                res = eng.run_analysis_step(
-                    symbol=symbol,
-                    interval=profile.interval,
-                    settings=settings,
-                    ai_enabled_by_user=(args.ai == "acik"),
-                    daily_ai_limit_override=profile.ai_daily_call_limit,
-                    min_ai_interval_override=profile.ai_min_call_interval_seconds,
-                    execution_mode=execution_mode,
-                    ui_live_confirmed=is_live,
-                    strategy_params=profile.strategy,
-                )
+            # Açık pozisyon varsa yalnızca o pariteyi yönet (zarar-kes/kâr-al/SAT); yoksa listeyi tara
+            open_now = storage.get_open_positions(track=track)
+            cycle_symbols = [open_now[0].symbol] if open_now else scan_symbols
+            cycle_ok = True
+            cycle_summaries: list[str] = []
+            for sym in cycle_symbols:
+                storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
+                try:
+                    settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+                    res = eng.run_analysis_step(
+                        symbol=sym,
+                        interval=profile.interval,
+                        settings=settings,
+                        ai_enabled_by_user=(args.ai == "acik"),
+                        daily_ai_limit_override=profile.ai_daily_call_limit,
+                        min_ai_interval_override=profile.ai_min_call_interval_seconds,
+                        execution_mode=execution_mode,
+                        ui_live_confirmed=is_live,
+                        strategy_params=profile.strategy,
+                        ai_only_on_rule_signal=multi_scan,
+                    )
+                except Exception as exc:  # Ağ/geçici hata: botu çökertme, bekle ve yeniden dene
+                    cycle_ok = False
+                    log.exception("Dongu hatasi (%s): %s", sym, exc)
+                    continue
+
                 candle_key = (
                     str(res.tech_signal.candle_open_time_ms) if res.tech_signal is not None else ""
                 )
                 log_key = f"{candle_key}:{res.final_action}:{bool(res.executed_order)}:{bool(res.error_message)}"
-                if res.executed_order is not None or res.error_message or log_key != last_logged_key:
+                if (
+                    res.executed_order is not None
+                    or res.error_message
+                    or log_key != last_logged_key.get(sym, "")
+                ):
                     level = logging.WARNING if (res.error_message or not res.ok) else logging.INFO
                     log.log(level, _summarize_step(res))
-                    last_logged_key = log_key
-                elif time.monotonic() - last_alive_log > 300:
-                    log.info("Bot calisiyor (yeni mum bekleniyor) | %s", _summarize_step(res))
-                    last_alive_log = time.monotonic()
-                consecutive_errors = 0 if res.ok else consecutive_errors + 1
-            except Exception as exc:  # Ağ/geçici hata: botu çökertme, bekle ve yeniden dene
-                consecutive_errors += 1
-                log.exception("Dongu hatasi (#%s): %s", consecutive_errors, exc)
+                    last_logged_key[sym] = log_key
+                else:
+                    cycle_summaries.append(f"{sym}={res.final_action}")
+                if not res.ok:
+                    cycle_ok = False
+
+                # Tarama sırasında bir alım gerçekleştiyse diğer paritelere bakma (tek pozisyon kuralı)
+                if (
+                    res.executed_order is not None
+                    and res.executed_order.side == "BUY"
+                    and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
+                ):
+                    break
+
+            if cycle_summaries and time.monotonic() - last_alive_log > 300:
+                log.info("Bot calisiyor (yeni mum bekleniyor) | %s", " ".join(cycle_summaries))
+                last_alive_log = time.monotonic()
+            consecutive_errors = 0 if cycle_ok else consecutive_errors + 1
 
             if args.max_dongu and loops >= args.max_dongu:
                 break
@@ -295,7 +361,7 @@ def run_bot(
             delay = profile.loop_seconds
             if consecutive_errors >= 3:
                 delay = min(profile.loop_seconds * (2 ** min(consecutive_errors - 2, 4)), 600)
-                log.warning("Ust uste %s hata; %s sn beklenecek.", consecutive_errors, delay)
+                log.warning("Ust uste %s hatali dongu; %s sn beklenecek.", consecutive_errors, delay)
             sleep_fn(delay)
     except KeyboardInterrupt:
         log.info("Ctrl+C alindi; bot durduruluyor. (Acik pozisyon varsa panelden yonetebilirsiniz.)")

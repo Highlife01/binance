@@ -10,16 +10,14 @@ if not exist ".venv\Scripts\python.exe" (
     if %ERRORLEVEL% NEQ 0 exit /b 1
 )
 
-set PARITE=%1
-if "%PARITE%"=="" set PARITE=BTCUSDT
-
 echo ============================================================================
-echo   SANAL DENEME - KESINTISIZ ARKA PLAN BOTU (AKTIF PROFIL, 5dk)
-echo   Parite : %PARITE%   (Gercek bakiyenize DOKUNULMAZ)
+echo   SANAL DENEME - KESINTISIZ ARKA PLAN BOTU (TEMKINLI PROFIL, 15dk)
+echo   10 coin taranir: BTC ETH SOL BNB XRP ADA AVAX DOGE LINK SUI (USDT)
+echo   Ayni anda tek pozisyon, islem basina en fazla 10 USDT (SANAL - gercek bakiyeye DOKUNULMAZ)
 echo   Durdurmak icin: Ctrl+C veya bu pencereyi kapatin.
 echo   Kayitlar: logs\bot_YYYY-MM-DD.log  ^|  Izleme: http://127.0.0.1:8501
 echo ============================================================================
 echo.
 
-.\.venv\Scripts\python.exe bot_calistir.py --mod sanal --profil aktif --parite %PARITE%
+.\.venv\Scripts\python.exe bot_calistir.py --mod sanal --profil temkinli --pariteler varsayilan
 pause

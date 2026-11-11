@@ -153,7 +153,7 @@ def main() -> None:
         selected_profile_key = st.selectbox(
             "İşlem Profili",
             options=profile_keys,
-            index=profile_keys.index("AKTIF"),
+            index=profile_keys.index("TEMKINLI"),
             format_func=lambda k: TRADING_PROFILES[k].label_tr,
         )
         active_profile = get_profile(selected_profile_key)
@@ -226,7 +226,7 @@ def main() -> None:
                             st.error(f"Canlı hesap okuma uyarısı: {exc}")
 
         st.divider()
-        base_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX"]
+        base_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "LINK", "SUI"]
         symbol_options = [f"{coin}{selected_quote}" for coin in base_coins]
         if cfg.default_symbol.endswith(selected_quote) and cfg.default_symbol not in symbol_options:
             symbol_options.insert(0, cfg.default_symbol)

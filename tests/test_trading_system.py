@@ -831,7 +831,7 @@ def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
             self.step_kwargs.append(kwargs)
             # Döngü sırasında kalp atışı yazılmış olmalı (panel kilidi için)
             alive, info = is_runner_alive(storage)
-            assert alive and info["profile"] == "AKTIF"
+            assert alive and info["profile"] in {"AKTIF", "TEMKINLI"}
             return StepCycleSummary(
                 ok=True,
                 timestamp_iso=datetime.now(timezone.utc).isoformat(),
@@ -908,3 +908,121 @@ def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
     assert rc_ok == 0
     assert stub_live.step_kwargs[0]["execution_mode"] == "LIVE_SPOT"
     assert stub_live.step_kwargs[0]["ui_live_confirmed"] is True
+
+
+# ---------------------------------------------------------------------------
+# TEST 14: Çoklu coin taraması (yalnızca sanal), ilk alımda taramayı kesme ve açık pozisyonu yönetme
+# ---------------------------------------------------------------------------
+def test_multi_coin_scan_paper_only_and_single_position(tmp_path: Path) -> None:
+    from binance_ai_bot.domain import Position, SimulatedOrderResult
+    from binance_ai_bot.engine import StepCycleSummary
+    from binance_ai_bot.runner import run_bot
+
+    storage = SQLiteStorage(tmp_path / "t14.db", initial_balance_usdc=Decimal("86.73"))
+
+    class _StubEngine:
+        def __init__(self) -> None:
+            self.storage = storage
+            self.live_executor = None
+            self.lock_benchmark_symbol = False
+            self.calls: list[tuple[int, str, bool]] = []
+            self.loop_no = 0
+
+        def default_risk_settings(self) -> RiskSettings:
+            return RiskSettings()
+
+        def run_analysis_step(self, **kw):
+            sym = kw["symbol"]
+            self.calls.append((self.loop_no, sym, kw["ai_only_on_rule_signal"]))
+            order = None
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if sym == "ETHUSDT" and not storage.get_open_positions(track="MAIN"):
+                storage.insert_position(
+                    Position(
+                        position_id="POS-ETH-1",
+                        symbol="ETHUSDT",
+                        quantity=Decimal("0.004"),
+                        entry_price=Decimal("2500"),
+                        cost_basis_usdc=Decimal("10"),
+                        entry_fee_usdc=Decimal("0.01"),
+                        opened_at_iso=now_iso,
+                        signal_key="SIG-ETH",
+                        strategy_source="TEST",
+                        stop_loss_price=None,
+                        take_profit_price=None,
+                        status="OPEN",
+                    ),
+                    track="MAIN",
+                )
+                order = SimulatedOrderResult(
+                    order_id="O-1",
+                    symbol="ETHUSDT",
+                    side="BUY",
+                    order_type="MARKET",
+                    status="FILLED",
+                    requested_qty=Decimal("0.004"),
+                    filled_qty=Decimal("0.004"),
+                    avg_fill_price=Decimal("2500"),
+                    gross_quote_usdc=Decimal("10"),
+                    fee_usdc=Decimal("0.01"),
+                    slippage_bps=Decimal("0"),
+                    signal_key="SIG-ETH",
+                    strategy_source="TEST",
+                    explanation="test alim",
+                    created_at_iso=now_iso,
+                )
+            return StepCycleSummary(
+                ok=True,
+                timestamp_iso=now_iso,
+                symbol=sym,
+                interval=kw["interval"],
+                data_source="stub",
+                wake_gap_detected=False,
+                tech_signal=None,
+                ai_decision=None,
+                final_action="AL" if order else "BEKLE",
+                executed_order=order,
+                block_or_info_message="test",
+            )
+
+    stub = _StubEngine()
+    loop_counter = {"n": 0}
+
+    def _sleep(_s):
+        loop_counter["n"] += 1
+        stub.loop_no = loop_counter["n"]
+
+    cfg = AppConfig(sqlite_db_path=tmp_path / "t14.db", default_symbol="BTCUSDT", quote_asset="USDT")
+    rc = run_bot(
+        ["--mod", "sanal", "--pariteler", "BTCUSDT,ETHUSDT,SOLUSDT", "--max-dongu", "2"],
+        engine=stub,  # type: ignore[arg-type]
+        config=cfg,
+        sleep_fn=_sleep,
+        lock_path=tmp_path / "t14.lock",
+    )
+    assert rc == 0
+    assert stub.lock_benchmark_symbol is True
+    # 1. döngü: BTC -> ETH (alım) -> SOL'a BAKILMAZ; Gemini ön eleme açık
+    loop0 = [s for (n, s, _) in stub.calls if n == 0]
+    assert loop0 == ["BTCUSDT", "ETHUSDT"]
+    assert all(flag is True for (_, _, flag) in stub.calls)
+    # 2. döngü: açık pozisyon olduğu için yalnızca ETH yönetilir
+    loop1 = [s for (n, s, _) in stub.calls if n == 1]
+    assert loop1 == ["ETHUSDT"]
+
+    # Canlı modda çoklu tarama kesinlikle reddedilir
+    cfg_live = AppConfig(
+        sqlite_db_path=tmp_path / "t14.db",
+        enable_live_trading=True,
+        binance_api_key="k",
+        binance_api_secret="s",
+    )
+    rc_live = run_bot(
+        ["--mod", "canli", "--pariteler", "varsayilan", "--max-dongu", "1"],
+        engine=_StubEngine(),  # type: ignore[arg-type]
+        config=cfg_live,
+        sleep_fn=lambda _s: None,
+        input_fn=lambda _p: "EVET",
+        lock_path=tmp_path / "t14.lock",
+    )
+    assert rc_live == 6

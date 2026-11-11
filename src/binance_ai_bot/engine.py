@@ -12,6 +12,7 @@ Görevleri:
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -72,6 +73,8 @@ class TradingSystemEngine:
         self.simulator = VirtualExecutionSimulator(self.storage)
         self.live_executor = BinanceLiveSpotExecutor(config, self.storage)
         self.ai_advisor = ai_advisor or GeminiDecisionAdvisor(config, self.storage)
+        # Çoklu coin taramasında True yapılır: pasif referans ilk paritede sabit kalır
+        self.lock_benchmark_symbol = False
 
     def default_risk_settings(self) -> RiskSettings:
         fallback = RiskSettings(
@@ -190,9 +193,14 @@ class TradingSystemEngine:
         """
         saved_sym = self.storage.get_state("benchmark_symbol", "")
         saved_px_raw = self.storage.get_state("benchmark_initial_price", "")
+        if self.lock_benchmark_symbol and saved_sym and saved_px_raw and saved_sym != symbol:
+            # Çoklu coin taramasında referans her paritede sıfırlanmasın; son referans değeri korunur
+            last_raw = self.storage.get_state("benchmark_last_equity", "")
+            return Decimal(last_raw) if last_raw else self.config.initial_balance_usdc
         if saved_sym != symbol or not saved_px_raw:
             self.storage.set_state("benchmark_symbol", symbol)
             self.storage.set_state("benchmark_initial_price", f"{current_mid_price:.8f}")
+            self.storage.set_state("benchmark_last_equity", f"{self.config.initial_balance_usdc:.8f}")
             return self.config.initial_balance_usdc
 
         init_px = Decimal(saved_px_raw)
@@ -203,7 +211,9 @@ class TradingSystemEngine:
         passive_cash = self.config.initial_balance_usdc - alloc
         entry_fee = alloc * settings.estimated_fee_rate
         units = (alloc - entry_fee) / init_px
-        return passive_cash + (units * current_mid_price)
+        bench_equity = passive_cash + (units * current_mid_price)
+        self.storage.set_state("benchmark_last_equity", f"{bench_equity:.8f}")
+        return bench_equity
 
     def run_analysis_step(
         self,
@@ -217,6 +227,7 @@ class TradingSystemEngine:
         execution_mode: str = "PAPER",
         ui_live_confirmed: bool = False,
         strategy_params: StrategyParams | None = None,
+        ai_only_on_rule_signal: bool = False,
     ) -> StepCycleSummary:
         """
         Tek bir tam denetimli analiz ve yürütme döngüsü çalıştırır.
@@ -407,15 +418,22 @@ class TradingSystemEngine:
                 )
 
         # 5. Yapay zekâ (veya kural tabanlı geri dönüş) değerlendirmesi
+        # Çoklu coin taramasında maliyet/çağrı aralığı için: açık pozisyon yoksa ve kural AL demiyorsa
+        # Gemini çağrılmaz; karar doğrudan kural tabanlı BEKLE olur (ön eleme).
+        skip_ai_prefilter = (
+            ai_only_on_rule_signal and not has_open_pos and tech_signal.action != "AL"
+        )
         ai_decision = self.ai_advisor.evaluate(
             market=market,
             tech_signal=tech_signal,
             recent_returns_pct=recent_returns,
             has_open_position=has_open_pos,
-            ai_enabled_by_user=ai_enabled_by_user,
+            ai_enabled_by_user=ai_enabled_by_user and not skip_ai_prefilter,
             daily_call_limit_override=daily_ai_limit_override,
             min_interval_override_sec=min_ai_interval_override,
         )
+        if skip_ai_prefilter and ai_enabled_by_user:
+            ai_decision = dataclasses.replace(ai_decision, mode_label="KURAL_ON_ELEME")
 
         final_action = ai_decision.action
         executed_order: SimulatedOrderResult | None = None

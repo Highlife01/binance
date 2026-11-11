@@ -14,13 +14,13 @@ set PARITE=%1
 if "%PARITE%"=="" set PARITE=BTCUSDT
 
 echo ============================================================================
-echo   !!! GERCEK PARA - KESINTISIZ CANLI SPOT ARKA PLAN BOTU (AKTIF PROFIL) !!!
-echo   Parite : %PARITE%
+echo   !!! GERCEK PARA - KESINTISIZ CANLI SPOT ARKA PLAN BOTU (TEMKINLI PROFIL) !!!
+echo   Parite : %PARITE%   (Canli modda coklu coin taramasi kapali)
 echo   Bilgisayar acik kaldigi surece calisir (uyku modu bot tarafindan engellenir).
 echo   Durdurmak icin: Ctrl+C, bu pencereyi kapatmak veya paneldeki "Botu Durdur".
 echo   Kayitlar: logs\bot_YYYY-MM-DD.log  ^|  Izleme: http://127.0.0.1:8501
 echo ============================================================================
 echo.
 
-.\.venv\Scripts\python.exe bot_calistir.py --mod canli --profil aktif --parite %PARITE%
+.\.venv\Scripts\python.exe bot_calistir.py --mod canli --profil temkinli --parite %PARITE%
 pause

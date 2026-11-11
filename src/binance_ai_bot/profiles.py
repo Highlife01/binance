@@ -74,7 +74,8 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         description_tr=(
             "5 dakikalık kapanmış mumlar, gevşetilmiş hacim (0.5x) ve RSI (40-70) eşikleri, "
             "günde en fazla 12 yeni pozisyon, %0.8 zarar-kes / %1.2 kâr-al. "
-            "Daha fazla işlem = daha fazla komisyon; önce Sanal Deneme önerilir."
+            "UYARI: Son 7 günlük 10 coin geçmiş testinde Temkinli profile göre yaklaşık 3 kat fazla "
+            "zarar etti (komisyon etkisi). Yalnızca Sanal Deneme ile izlenmesi önerilir."
         ),
         interval="5m",
         strategy=StrategyParams(
