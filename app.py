@@ -1,5 +1,5 @@
 """
-Binance Global USDC Spot — Türkçe Yerel Web Kontrol Paneli (Streamlit, 127.0.0.1).
+Binance Global Spot (USDT / USDC) — Türkçe Yerel Web Kontrol Paneli (Streamlit, 127.0.0.1).
 
 Çalıştırma:
     baslat.bat
@@ -39,7 +39,7 @@ from binance_ai_bot.validation import (
 )
 
 st.set_page_config(
-    page_title="Binance USDC Spot Kontrol Paneli",
+    page_title="Binance Spot Kontrol Paneli",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -384,8 +384,8 @@ def main() -> None:
         )
         st.write(f"- **Karar Modu:** {ai_status_str}")
         st.write(
-            f"- **Günlük Net K/Z (İstanbul):** `{summary['daily_net_pnl_usdc']:+.3f} USDC` "
-            f"(Zarar Eşiği: `-{settings.daily_loss_limit_usdc:.2f} USDC`)"
+            f"- **Günlük Net K/Z (İstanbul):** `{summary['daily_net_pnl_usdc']:+.3f} {selected_quote}` "
+            f"(Zarar Eşiği: `-{settings.daily_loss_limit_usdc:.2f} {selected_quote}`)"
         )
 
     with info_right:
@@ -433,8 +433,8 @@ def main() -> None:
                     "Pozisyon Kimliği": p.position_id,
                     "Parite": p.symbol,
                     "Miktar": f"{p.quantity:.8f}",
-                    "Giriş Fiyatı (USDC)": f"{p.entry_price:.6f}",
-                    "Maliyet (USDC)": f"{p.cost_basis_usdc:.2f}",
+                    f"Giriş Fiyatı ({selected_quote})": f"{p.entry_price:.6f}",
+                    f"Maliyet ({selected_quote})": f"{p.cost_basis_usdc:.2f}",
                     "Giriş Komisyonu": f"{p.entry_fee_usdc:.4f}",
                     "Zarar-Kes": f"{p.stop_loss_price:.6f}" if p.stop_loss_price else "-",
                     "Kâr-Al": f"{p.take_profit_price:.6f}" if p.take_profit_price else "-",
@@ -456,7 +456,7 @@ def main() -> None:
                     x=snap_df["created_at_iso"],
                     y=snap_df["main_equity_usdc"].astype(float),
                     mode="lines+markers",
-                    name="Aktif Portföy (USDC)",
+                    name=f"Aktif Portföy ({selected_quote})",
                 )
             )
             fig.add_trace(
@@ -464,7 +464,7 @@ def main() -> None:
                     x=snap_df["created_at_iso"],
                     y=snap_df["rule_shadow_equity_usdc"].astype(float),
                     mode="lines",
-                    name="Kural Tabanlı Gölge (USDC)",
+                    name=f"Kural Tabanlı Gölge ({selected_quote})",
                 )
             )
             fig.add_trace(
@@ -473,13 +473,13 @@ def main() -> None:
                     y=snap_df["benchmark_equity_usdc"].astype(float),
                     mode="lines",
                     line={"dash": "dot"},
-                    name="Pasif Referans (USDC)",
+                    name=f"Pasif Referans ({selected_quote})",
                 )
             )
             fig.update_layout(
                 height=340,
                 margin={"l": 20, "r": 20, "t": 20, "b": 20},
-                yaxis_title="Toplam Değer (USDC)",
+                yaxis_title=f"Toplam Değer ({selected_quote})",
                 xaxis_title="Zaman (UTC)",
             )
             st.plotly_chart(fig, width="stretch")
@@ -513,23 +513,23 @@ def main() -> None:
             [
                 {
                     "Yaklaşım": "1. Aktif Portföy (Yapay Zekâ veya Seçili Mod)",
-                    "Toplam Değer (USDC)": f"{summary['total_equity_usdc']:.3f}",
-                    "Net Fark (USDC)": f"{(summary['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
-                    "Toplam Komisyon (USDC)": f"{summary['total_fees_usdc']:.4f}",
+                    f"Toplam Değer ({selected_quote})": f"{summary['total_equity_usdc']:.3f}",
+                    f"Net Fark ({selected_quote})": f"{(summary['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
+                    f"Toplam Komisyon ({selected_quote})": f"{summary['total_fees_usdc']:.4f}",
                     "Tahmini AI Maliyeti (USD)": f"{ai_usage['estimated_cost_usd']:.5f}",
                 },
                 {
                     "Yaklaşım": "2. Saf Kural Tabanlı Strateji (EMA/RSI/MACD Gölge)",
-                    "Toplam Değer (USDC)": f"{shadow_sum['total_equity_usdc']:.3f}",
-                    "Net Fark (USDC)": f"{(shadow_sum['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
-                    "Toplam Komisyon (USDC)": f"{shadow_sum['total_fees_usdc']:.4f}",
+                    f"Toplam Değer ({selected_quote})": f"{shadow_sum['total_equity_usdc']:.3f}",
+                    f"Net Fark ({selected_quote})": f"{(shadow_sum['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
+                    f"Toplam Komisyon ({selected_quote})": f"{shadow_sum['total_fees_usdc']:.4f}",
                     "Tahmini AI Maliyeti (USD)": "0.00000",
                 },
                 {
-                    "Yaklaşım": f"3. Referans (10 USDC {selected_symbol} Al-Tut + 76 USDC Nakit)",
-                    "Toplam Değer (USDC)": f"{bench_val:.3f}",
-                    "Net Fark (USDC)": f"{(bench_val - cfg.initial_balance_usdc):+.3f}",
-                    "Toplam Komisyon (USDC)": f"{(min(settings.max_position_size_usdc, cfg.initial_balance_usdc) * settings.estimated_fee_rate):.4f}",
+                    "Yaklaşım": f"3. Referans ({min(settings.max_position_size_usdc, cfg.initial_balance_usdc):.0f} {selected_quote} {selected_symbol} Al-Tut + Kalan Nakit)",
+                    f"Toplam Değer ({selected_quote})": f"{bench_val:.3f}",
+                    f"Net Fark ({selected_quote})": f"{(bench_val - cfg.initial_balance_usdc):+.3f}",
+                    f"Toplam Komisyon ({selected_quote})": f"{(min(settings.max_position_size_usdc, cfg.initial_balance_usdc) * settings.estimated_fee_rate):.4f}",
                     "Tahmini AI Maliyeti (USD)": "0.00000",
                 },
             ]
@@ -542,12 +542,12 @@ def main() -> None:
             - shadow_sum["total_equity_usdc"]
         )
         st.caption(
-            f"Tahmini AI Maliyeti Düşülmüş Yapay Zekâ Ek Katkısı (vs. Kural Tabanlı): `{ai_alpha:+.4f} USDC` "
+            f"Tahmini AI Maliyeti Düşülmüş Yapay Zekâ Ek Katkısı (vs. Kural Tabanlı): `{ai_alpha:+.4f} {selected_quote}` "
             "(Kısa süreli birkaç işlem istatistiksel kanıt oluşturmaz.)"
         )
 
     with tab_val:
-        st.subheader("86 USDC Küçük Bakiye Komisyon ve Model Maliyet Uygulanabilirliği")
+        st.subheader(f"{cfg.initial_balance_usdc:.2f} {selected_quote} Küçük Bakiye Komisyon ve Model Maliyet Uygulanabilirliği")
         viability = assess_small_balance_viability(
             balance_usdc=cfg.initial_balance_usdc,
             position_size_usdc=settings.max_position_size_usdc,
@@ -607,12 +607,12 @@ def main() -> None:
                             "Kronolojik Dilim": sl.slice_name,
                             "Mum Sayısı": sl.candle_count,
                             "İşlem Sayısı": sl.trade_count,
-                            "Net Getiri (USDC)": f"{sl.net_return_usdc:+.3f}",
+                            f"Net Getiri ({selected_quote})": f"{sl.net_return_usdc:+.3f}",
                             "Net Getiri (%)": f"%{sl.net_return_pct:+.2f}",
                             "Referans Al-Tut (%)": f"%{sl.benchmark_return_pct:+.2f}",
                             "Maks. Düşüş (%)": f"%{sl.max_drawdown_pct:.2f}",
                             "Kazanma Oranı (%)": f"%{sl.win_rate_pct:.1f}",
-                            "Toplam Komisyon (USDC)": f"{sl.total_fees_usdc:.4f}",
+                            f"Toplam Komisyon ({selected_quote})": f"{sl.total_fees_usdc:.4f}",
                             "Değerlendirme": sl.verdict_text,
                         }
                     )
@@ -630,7 +630,7 @@ def main() -> None:
             fc1, fc2 = st.columns(2)
             with fc1:
                 new_max_pos_usdc = st.number_input(
-                    "Pozisyon Üst Sınırı (USDC)",
+                    f"Pozisyon Üst Sınırı ({selected_quote})",
                     min_value=5.0,
                     max_value=float(cfg.initial_balance_usdc),
                     value=float(settings.max_position_size_usdc),
@@ -638,7 +638,7 @@ def main() -> None:
                     help="Minimum borsa emir tutarı bu sınırı aşarsa sınır otomatik büyütülmez; işlem reddedilir.",
                 )
                 new_daily_loss = st.number_input(
-                    "Günlük Zarar Eşiği (USDC — Europe/Istanbul)",
+                    f"Günlük Zarar Eşiği ({selected_quote} — Europe/Istanbul)",
                     min_value=0.5,
                     max_value=50.0,
                     value=float(settings.daily_loss_limit_usdc),
