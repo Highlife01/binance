@@ -679,16 +679,14 @@ def test_live_spot_executor_runs_order_test_first_and_keeps_virtual_isolated(tmp
 # TEST 11: Türkçe Streamlit Paneli Başlatma ve Görsel Bileşen Doğrulaması
 # ---------------------------------------------------------------------------
 def test_streamlit_turkish_dashboard_renders_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from streamlit.testing.v1 import AppTest
+    # Render-only harness: no .env, no external requests, no Windows socketpair.
+    from test_operations_safety import _dashboard
 
-    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "ui_test.db"))
-    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
-
-    app_file = Path(__file__).resolve().parents[1] / "app.py"
-    at = AppTest.from_file(str(app_file), default_timeout=20)
+    at, _cfg = _dashboard(tmp_path, monkeypatch)
     at.run()
 
     assert not at.exception
+    assert not at._blocked_network_calls
     metrics_labels = [m.label for m in at.metric]
     assert "Kullanılabilir Nakit" in metrics_labels
     assert "Toplam Portföy Değeri" in metrics_labels
@@ -1006,11 +1004,16 @@ def test_multi_coin_parallel_trading_paper_and_live(tmp_path: Path) -> None:
 
     # 14a: Temkinli profilde (max_open_positions=1) ilk alımdan sonra diğer coinler atlanır
     stub_single = _StubEngine("MAIN")
-    loop_counter = {"n": 0}
+    loop_counter = {"n": 0, "waited": 0.0}
 
-    def _sleep(_s):
-        loop_counter["n"] += 1
-        stub_single.loop_no = loop_counter["n"]
+    def _sleep(seconds):
+        # Runner waits in interruptible chunks; advance the fake cycle only
+        # after the full 60-second Temkinli wait has elapsed.
+        loop_counter["waited"] += seconds
+        if loop_counter["waited"] >= 60:
+            loop_counter["n"] += 1
+            stub_single.loop_no = loop_counter["n"]
+            loop_counter["waited"] = 0.0
 
     cfg = AppConfig(sqlite_db_path=tmp_path / "t14.db", default_symbol="BTCUSDT", quote_asset="USDT")
     rc = run_bot(
@@ -1338,3 +1341,220 @@ def test_engine_simultaneous_multi_coin_entries_without_duplicate_coin(tmp_path:
     ok_close, _ = eng.manual_close_open_position(settings, execution_mode="PAPER")
     assert ok_close is True
     assert eng.storage.get_open_positions(track="MAIN") == []
+
+
+# ---------------------------------------------------------------------------
+# TEST 17: 2x Sanal Kaldıraç + Üç Kilitli Gerçek Çapraz Marjin (Cross Margin) Doğrulaması
+# ---------------------------------------------------------------------------
+def test_paper_leverage_2x_and_live_cross_margin_executor(tmp_path: Path) -> None:
+    import time
+    import httpx
+    from datetime import timedelta
+    from binance_ai_bot.live_executor import LiveExecutionError
+    from binance_ai_bot.margin_executor import BinanceLiveMarginExecutor
+    from binance_ai_bot.security import LiveOrderBlockedError, assert_live_margin_request
+
+    # 17a: 2x Sanal Kaldıraç (10 USDT teminat -> ~20 USDT pozisyon, 10 USDT borç, likidasyon ve saatlik faiz)
+    storage = SQLiteStorage(tmp_path / "t17_paper.db", initial_balance_usdc=Decimal("86.00"))
+    risk_mgr = RiskManager(storage)
+    sim = VirtualExecutionSimulator(storage)
+    btc_filters = parse_symbol_filters(
+        {
+            "symbol": "BTCUSDT",
+            "baseAsset": "BTC",
+            "quoteAsset": "USDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+            "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000.00", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "100.0", "stepSize": "0.00001"},
+                {"filterType": "NOTIONAL", "minNotional": "5.00"},
+            ],
+        }
+    )
+    t0 = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+    book_buy = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(price=Decimal("100000.00"), quantity=Decimal("1.0"))],
+        asks=[OrderBookLevel(price=Decimal("100000.00"), quantity=Decimal("1.0"))],
+        fetched_at_utc=t0,
+        source_url="https://api.binance.me",
+    )
+    lev_settings = RiskSettings(
+        max_position_size_usdc=Decimal("10.00"),
+        leverage=2,
+        estimated_fee_rate=Decimal("0.001"),
+        extra_slippage_bps=Decimal("0"),
+        hourly_margin_interest_rate=Decimal("0.0001"),  # saatte %0.01 test faizi
+    )
+    chk = risk_mgr.check_buy_entry(
+        filters=btc_filters,
+        order_book=book_buy,
+        settings=lev_settings,
+        now_utc=t0,
+        track="MAIN",
+    )
+    assert chk.allowed is True
+    # 10 USDT teminat x 2 = 20 USDT brüt alım -> 0.00020 BTC
+    assert chk.approved_quantity == Decimal("0.00020")
+
+    buy_res = sim.execute_buy(
+        filters=btc_filters,
+        order_book=book_buy,
+        requested_qty=chk.approved_quantity,
+        signal_key="LEV2_BUY_1",
+        strategy_source="TEST_2X",
+        settings=lev_settings,
+        now_utc=t0,
+        track="MAIN",
+    )
+    assert buy_res.status == "FILLED"
+    assert buy_res.gross_quote_usdc == Decimal("20.00")
+    open_pos = storage.get_open_positions(track="MAIN")[0]
+    assert open_pos.leverage == 2
+    assert open_pos.borrowed_usdc == Decimal("10.00")
+    assert open_pos.liquidation_price == Decimal("55000.00")  # 1.10 * 10 / 0.00020
+    # Kasadan yalnızca 10 USDT öz teminat + 0.02 USDT giriş komisyonu düşmeli (75.98 USDT kalmalı)
+    assert storage.get_cash_balance(track="MAIN") == Decimal("75.98")
+
+    # 2 saat sonra BTC %5 yükselirse (105,000 USDT): 20 USDT pozisyonda +1.00 USDT brüt kazanç (teminata göre ~%10!)
+    t_sell = t0 + timedelta(hours=1, minutes=30)  # 2 başlayan saat -> 10 * 0.0001 * 2 = 0.002 USDT faiz
+    book_sell = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(price=Decimal("105000.00"), quantity=Decimal("1.0"))],
+        asks=[OrderBookLevel(price=Decimal("105010.00"), quantity=Decimal("1.0"))],
+        fetched_at_utc=t_sell,
+        source_url="https://api.binance.me",
+    )
+    sell_res = sim.execute_sell_position(
+        position=open_pos,
+        filters=btc_filters,
+        order_book=book_sell,
+        signal_key="LEV2_SELL_1",
+        strategy_source="TEST_2X",
+        close_reason="KAR_AL",
+        settings=lev_settings,
+        now_utc=t_sell,
+        track="MAIN",
+    )
+    assert sell_res.status == "FILLED"
+    # Brüt satış = 21.00, çıkış komisyonu = 0.021, faiz = 0.002, giriş komisyonu = 0.020 -> Net K/Z = +0.957 USDT
+    assert sell_res.realized_pnl_usdc == Decimal("0.957")
+    # Kasa = 86.00 + 0.957 = 86.957 USDT
+    assert storage.get_cash_balance(track="MAIN") == Decimal("86.957")
+
+    # 17b: Üçlü Marjin Güvenlik Kilidi (para çekme ve futures hâlâ koşulsuz engelli!)
+    with pytest.raises(LiveOrderBlockedError):
+        assert_live_margin_request(
+            "POST",
+            "https://api.binance.me/sapi/v1/margin/order",
+            config_live_enabled=True,
+            ui_live_confirmed=True,
+            ui_margin_confirmed=False,
+        )
+    with pytest.raises(LiveOrderBlockedError):
+        assert_live_margin_request(
+            "POST",
+            "https://api.binance.me/sapi/v1/capital/withdraw/apply",
+            config_live_enabled=True,
+            ui_live_confirmed=True,
+            ui_margin_confirmed=True,
+        )
+    with pytest.raises(LiveOrderBlockedError):
+        assert_live_margin_request(
+            "POST",
+            "https://fapi.binance.com/fapi/v1/order",
+            config_live_enabled=True,
+            ui_live_confirmed=True,
+            ui_margin_confirmed=True,
+        )
+
+    # 17c: Gerçek Çapraz Marjin Yürütücüsü (-3003 cüzdan kapalı uyarısı + MARGIN_BUY & AUTO_REPAY akışı)
+    state = {"wallet_open": False, "last_order_params": {}}
+
+    def margin_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v3/time":
+            return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
+        if req.url.path == "/sapi/v1/margin/account":
+            if not state["wallet_open"]:
+                return httpx.Response(400, json={"code": -3003, "msg": "Margin account does not exist."})
+            return httpx.Response(
+                200,
+                json={
+                    "tradeEnabled": True,
+                    "borrowEnabled": True,
+                    "marginLevel": "2.40",
+                    "userAssets": [
+                        {"asset": "USDT", "free": "30.00", "borrowed": "0.00", "interest": "0.00", "netAsset": "30.00"},
+                        {"asset": "BTC", "free": "0.00020", "borrowed": "0.00", "interest": "0.00", "netAsset": "0.00020"},
+                    ],
+                },
+            )
+        if req.url.path == "/api/v3/order/test":
+            return httpx.Response(200, json={})
+        if req.url.path == "/sapi/v1/margin/maxBorrowable":
+            return httpx.Response(200, json={"amount": "60.00", "borrowLimit": "1000"})
+        if req.url.path == "/sapi/v1/margin/order" and req.method == "POST":
+            state["last_order_params"] = dict(req.url.params)
+            side = req.url.params.get("side")
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": 777001 if side == "BUY" else 777002,
+                    "status": "FILLED",
+                    "executedQty": "0.00020",
+                    "cummulativeQuoteQty": "20.00" if side == "BUY" else "20.60",
+                    "fills": [{"price": "100000.00", "qty": "0.00020", "commission": "0.02", "commissionAsset": "USDT"}],
+                },
+            )
+        return httpx.Response(404, json={})
+
+    m_cfg = AppConfig(
+        sqlite_db_path=tmp_path / "t17_margin.db",
+        quote_asset="USDT",
+        default_symbol="BTCUSDT",
+        enable_live_trading=True,
+        binance_api_key="mk_test",
+        binance_api_secret="ms_test",
+    )
+    m_store = SQLiteStorage(tmp_path / "t17_margin.db", initial_balance_usdc=Decimal("86.00"))
+    m_exec = BinanceLiveMarginExecutor(
+        m_cfg, m_store, http_client=httpx.Client(transport=httpx.MockTransport(margin_handler))
+    )
+
+    # Cüzdan henüz açılmamışsa (-3003) anlaşılır Türkçe yönerge vermeli
+    with pytest.raises(LiveExecutionError, match="Çapraz Marjin"):
+        m_exec.fetch_live_margin_balances(ui_live_confirmed=True, ui_margin_confirmed=True, quote_asset="USDT")
+
+    # Cüzdan açıldıktan sonra MARGIN_BUY ile alım ve AUTO_REPAY ile satış
+    state["wallet_open"] = True
+    m_buy = m_exec.execute_live_margin_buy(
+        filters=btc_filters,
+        approved_qty=Decimal("0.00020"),
+        signal_key="MARG_SIG_BUY_1",
+        strategy_source="TEST_MARGIN",
+        settings=lev_settings,
+        ui_live_confirmed=True,
+        ui_margin_confirmed=True,
+    )
+    assert m_buy.status == "FILLED"
+    assert state["last_order_params"]["isIsolated"] == "FALSE"
+    assert state["last_order_params"]["sideEffectType"] == "MARGIN_BUY"
+    m_positions = m_store.get_open_positions(track="LIVE_MARGIN")
+    assert len(m_positions) == 1 and m_positions[0].leverage == 2
+    assert m_store.get_open_positions(track="MAIN") == []
+    assert m_store.get_open_positions(track="LIVE_SPOT") == []
+
+    m_sell = m_exec.execute_live_margin_sell(
+        position=m_positions[0],
+        filters=btc_filters,
+        signal_key="MARG_SIG_SELL_1",
+        strategy_source="TEST_MARGIN",
+        close_reason="KAR_AL",
+        ui_live_confirmed=True,
+        ui_margin_confirmed=True,
+    )
+    assert m_sell.status == "FILLED"
+    assert state["last_order_params"]["sideEffectType"] == "AUTO_REPAY"
+    assert m_store.get_open_positions(track="LIVE_MARGIN") == []
+

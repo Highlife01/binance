@@ -29,7 +29,9 @@ from .domain import (
     SymbolFilters,
     quantize_down,
 )
+from .risk import compute_accrued_margin_interest, compute_liquidation_price
 from .storage import SQLiteStorage
+from .execution_safety import atomic_execution
 
 # Limit emirlerde fiyata yalnızca dokunulduğunda (delip geçmediğinde) varsayılan kuyruk dolum payı
 TOUCH_QUEUE_FILL_RATIO = Decimal("0.40")
@@ -113,6 +115,7 @@ class VirtualExecutionSimulator:
     def __init__(self, storage: SQLiteStorage) -> None:
         self.storage = storage
 
+    @atomic_execution
     def execute_buy(
         self,
         *,
@@ -132,6 +135,19 @@ class VirtualExecutionSimulator:
         now_iso = ref_now.isoformat()
         ist_date = self.storage.istanbul_date_str(ref_now)
         order_id = _new_order_id()
+        self.storage.ensure_quote_asset(track, filters.quote_asset)
+        if any(p.symbol == filters.symbol for p in self.storage.get_open_positions(track=track)):
+            return SimulatedOrderResult(
+                order_id=order_id, symbol=filters.symbol, side="BUY", order_type=order_type,
+                status="REJECTED", requested_qty=requested_qty, filled_qty=Decimal("0"),
+                avg_fill_price=Decimal("0"), gross_quote_usdc=Decimal("0"), fee_usdc=Decimal("0"),
+                slippage_bps=Decimal("0"), signal_key=signal_key, strategy_source=strategy_source,
+                explanation=(
+                    f"Mükerrer sinyal engellendi ({signal_key} daha önce işlendi)."
+                    if self.storage.has_processed_signal(signal_key, track=track)
+                    else "Bu paritede zaten açık pozisyon var; ek alım engellendi."
+                ), created_at_iso=now_iso,
+            )
 
         # Güncel veri yokken hayalî dolum oluşturma!
         if order_book is None or not order_book.asks or order_book.best_ask is None:
@@ -247,15 +263,20 @@ class VirtualExecutionSimulator:
             self.storage.record_order(unfilled_notional, ist_date, track=track)
             return unfilled_notional
 
+        lev = max(1, min(5, int(getattr(settings, "leverage", 1))))
+        max_notional_limit = settings.max_position_size_usdc * Decimal(lev)
         fee_usdc = gross_usdc * settings.estimated_fee_rate
-        total_cash_needed = gross_usdc + fee_usdc
+        collateral_usdc = gross_usdc / Decimal(lev)
+        borrowed_usdc = gross_usdc - collateral_usdc
+        total_cash_needed = collateral_usdc + fee_usdc
         cash_balance = self.storage.get_cash_balance(track=track)
 
-        # Kayma sonrası nakit veya pozisyon üst sınırı aşılırsa miktarı 1 adım aşağı çek
-        if total_cash_needed > cash_balance or gross_usdc > settings.max_position_size_usdc * Decimal("1.005"):
+        # Kayma sonrası nakit teminat veya kaldıraçlı pozisyon üst sınırı aşılırsa miktarı 1 adım aşağı çek
+        if total_cash_needed > cash_balance or gross_usdc > max_notional_limit * Decimal("1.005"):
+            cash_per_gross_unit = (Decimal("1") / Decimal(lev)) + settings.estimated_fee_rate
             max_gross = min(
-                settings.max_position_size_usdc,
-                cash_balance / (Decimal("1") + settings.estimated_fee_rate),
+                max_notional_limit,
+                cash_balance / cash_per_gross_unit,
             )
             adjusted_qty = quantize_down(max_gross / exec_price, eff_step)
             if adjusted_qty < eff_min_qty or (adjusted_qty * exec_price) < filters.min_notional:
@@ -281,7 +302,9 @@ class VirtualExecutionSimulator:
             filled_qty = adjusted_qty
             gross_usdc = filled_qty * exec_price
             fee_usdc = gross_usdc * settings.estimated_fee_rate
-            total_cash_needed = gross_usdc + fee_usdc
+            collateral_usdc = gross_usdc / Decimal(lev)
+            borrowed_usdc = gross_usdc - collateral_usdc
+            total_cash_needed = collateral_usdc + fee_usdc
 
         best_ask = order_book.best_ask
         slippage_bps = ((exec_price - best_ask) / best_ask) * Decimal("10000") if best_ask > 0 else Decimal("0")
@@ -292,6 +315,7 @@ class VirtualExecutionSimulator:
 
         stop_price = exec_price * (Decimal("1") - settings.stop_loss_pct) if settings.stop_loss_pct > 0 else None
         tp_price = exec_price * (Decimal("1") + settings.take_profit_pct) if settings.take_profit_pct > 0 else None
+        liq_price = compute_liquidation_price(quantity=filled_qty, borrowed_usdc=borrowed_usdc)
 
         pos = Position(
             position_id=_new_position_id(),
@@ -306,12 +330,20 @@ class VirtualExecutionSimulator:
             stop_loss_price=stop_price,
             take_profit_price=tp_price,
             status="OPEN",
+            leverage=lev,
+            borrowed_usdc=borrowed_usdc,
+            liquidation_price=liq_price,
         )
         self.storage.insert_position(pos, track=track)
         self.storage.mark_signal_processed(signal_key, order_id, now_iso, track=track)
 
+        lev_tag = (
+            f" [{lev}x Kaldıraç | Teminat: {collateral_usdc:.2f} {filters.quote_asset}, Borç: {borrowed_usdc:.2f} {filters.quote_asset}]"
+            if lev > 1
+            else ""
+        )
         explanation = (
-            f"Sanal ALIM ({order_status}): {filled_qty} {filters.base_asset} @ {exec_price:.6f} {filters.quote_asset} "
+            f"Sanal ALIM ({order_status}){lev_tag}: {filled_qty} {filters.base_asset} @ {exec_price:.6f} {filters.quote_asset} "
             f"(Tutar: {gross_usdc:.2f} {filters.quote_asset}, Komisyon: {fee_usdc:.4f} {filters.quote_asset}, Kayma: {slippage_bps:.2f} bps)."
         )
         res = SimulatedOrderResult(
@@ -334,6 +366,7 @@ class VirtualExecutionSimulator:
         self.storage.record_order(res, ist_date, track=track)
         return res
 
+    @atomic_execution
     def execute_sell_position(
         self,
         *,
@@ -349,11 +382,22 @@ class VirtualExecutionSimulator:
         now_utc: datetime | None = None,
         track: str = "MAIN",
     ) -> SimulatedOrderResult:
-        """Açık sanal Spot pozisyonu emir defteri alış (`bids`) likiditesine satarak kapatır."""
+        """Açık sanal pozisyonu emir defteri alış (`bids`) likiditesine satarak (ve varsa borcu ödeyerek) kapatır."""
         ref_now = now_utc or datetime.now(timezone.utc)
         now_iso = ref_now.isoformat()
         ist_date = self.storage.istanbul_date_str(ref_now)
         order_id = _new_order_id()
+
+        current = self.storage.get_position(position.position_id, track=track)
+        if current is None or current.status != "OPEN":
+            return SimulatedOrderResult(
+                order_id=order_id, symbol=position.symbol, side="SELL", order_type=order_type,
+                status="REJECTED", requested_qty=position.quantity, filled_qty=Decimal("0"),
+                avg_fill_price=Decimal("0"), gross_quote_usdc=Decimal("0"), fee_usdc=Decimal("0"),
+                slippage_bps=Decimal("0"), signal_key=signal_key, strategy_source=strategy_source,
+                explanation="Pozisyon zaten kapalı; ikinci satış engellendi.", created_at_iso=now_iso,
+            )
+        position = current
 
         if order_book is None or not order_book.bids or order_book.best_bid is None:
             rej = SimulatedOrderResult(
@@ -396,6 +440,20 @@ class VirtualExecutionSimulator:
             )
 
         eff_step = filters.market_step_size if order_type == "MARKET" else filters.step_size
+        min_qty = max(filters.min_qty, filters.market_min_qty) if order_type == "MARKET" else filters.min_qty
+        requested = quantize_down(position.quantity, eff_step)
+        min_notional = filters.min_notional if order_type != "MARKET" or filters.apply_min_to_market else Decimal("0")
+        if requested < min_qty or requested * order_book.best_bid < min_notional:
+            rejected = SimulatedOrderResult(
+                order_id=order_id, symbol=position.symbol, side="SELL", order_type=order_type,
+                status="REJECTED", requested_qty=position.quantity, filled_qty=Decimal("0"),
+                avg_fill_price=Decimal("0"), gross_quote_usdc=Decimal("0"), fee_usdc=Decimal("0"),
+                slippage_bps=Decimal("0"), signal_key=signal_key, strategy_source=strategy_source,
+                explanation="Satış miktarı/tutarı borsa minimumunun altında; kalan varlık açık tutuluyor.",
+                created_at_iso=now_iso,
+            )
+            self.storage.record_order(rejected, ist_date, track=track)
+            return rejected
         filled_qty, raw_quote_usdc = _simulate_book_walk(
             order_book.bids,
             position.quantity,
@@ -439,29 +497,47 @@ class VirtualExecutionSimulator:
         best_bid = order_book.best_bid
         slippage_bps = ((best_bid - exec_price) / best_bid) * Decimal("10000") if best_bid > 0 else Decimal("0")
 
-        # Kısmi satış gerçekleştiyse pozisyonun orantılı maliyetini kapat, kalanı yeni açık pozisyon olarak tut
+        # Kısmi satış gerçekleştiyse pozisyonun orantılı maliyet ve borcunu kapat, kalanı açık tut
         fill_ratio = filled_qty / position.quantity
         allocated_cost = position.cost_basis_usdc * fill_ratio
         allocated_entry_fee = position.entry_fee_usdc * fill_ratio
-        realized_pnl = net_proceeds_usdc - allocated_cost - allocated_entry_fee
+        pos_borrowed = getattr(position, "borrowed_usdc", Decimal("0"))
+        pos_lev = int(getattr(position, "leverage", 1))
+        allocated_borrowed = pos_borrowed * fill_ratio
+        hourly_rate = getattr(settings, "hourly_margin_interest_rate", Decimal("0.000005"))
+        interest_usdc = (
+            compute_accrued_margin_interest(position, now_utc=ref_now, hourly_rate=hourly_rate)
+            * fill_ratio
+        )
+        realized_pnl = net_proceeds_usdc - allocated_cost - allocated_entry_fee - interest_usdc
 
         cash_balance = self.storage.get_cash_balance(track=track)
-        self.storage.set_cash_balance(cash_balance + net_proceeds_usdc, track=track)
+        net_cash_returned = net_proceeds_usdc - allocated_borrowed - interest_usdc
+        self.storage.set_cash_balance(max(Decimal("0"), cash_balance + net_cash_returned), track=track)
 
+        remaining_qty = position.quantity - filled_qty
+        if remaining_qty > 0:
+            # The closed lot describes only what was sold, not the original whole lot.
+            self.storage.update_position_remaining(
+                position.position_id, quantity=filled_qty,
+                cost_basis_usdc=allocated_cost, entry_fee_usdc=allocated_entry_fee,
+                borrowed_usdc=allocated_borrowed,
+            )
         self.storage.update_position_closed(
             position.position_id,
             closed_at_iso=now_iso,
             closed_istanbul_date=ist_date,
             exit_price=exec_price,
-            exit_fee_usdc=exit_fee_usdc,
+            exit_fee_usdc=exit_fee_usdc + interest_usdc,
             realized_pnl_usdc=realized_pnl,
             close_reason=close_reason,
         )
 
-        remaining_qty = quantize_down(position.quantity - filled_qty, eff_step)
+        # Even sub-step dust is an asset: never silently discard it.
         order_status = "FILLED"
         if remaining_qty > Decimal("0"):
             order_status = "PARTIALLY_FILLED"
+            rem_borrowed = max(Decimal("0"), pos_borrowed - allocated_borrowed)
             rem_pos = Position(
                 position_id=_new_position_id(),
                 symbol=position.symbol,
@@ -475,13 +551,23 @@ class VirtualExecutionSimulator:
                 stop_loss_price=position.stop_loss_price,
                 take_profit_price=position.take_profit_price,
                 status="OPEN",
+                leverage=pos_lev,
+                borrowed_usdc=rem_borrowed,
+                liquidation_price=compute_liquidation_price(
+                    quantity=remaining_qty, borrowed_usdc=rem_borrowed
+                ),
             )
             self.storage.insert_position(rem_pos, track=track)
 
         self.storage.mark_signal_processed(signal_key, order_id, now_iso, track=track)
 
+        lev_note = (
+            f" [{pos_lev}x | Borç Geri Ödeme: {allocated_borrowed:.2f}, Faiz: {interest_usdc:.5f}]"
+            if pos_lev > 1 or allocated_borrowed > 0
+            else ""
+        )
         explanation = (
-            f"Sanal SATIŞ ({order_status} - {close_reason}): {filled_qty} {filters.base_asset} "
+            f"Sanal SATIŞ ({order_status} - {close_reason}){lev_note}: {filled_qty} {filters.base_asset} "
             f"@ {exec_price:.6f} {filters.quote_asset} (Net Hasılat: {net_proceeds_usdc:.2f} {filters.quote_asset}, "
             f"Çıkış Komisyonu: {exit_fee_usdc:.4f} {filters.quote_asset}, Gerçekleşmiş K/Z: {realized_pnl:+.4f} {filters.quote_asset})."
         )

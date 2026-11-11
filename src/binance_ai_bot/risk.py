@@ -44,22 +44,68 @@ EXIT_POLICY_DESCRIPTIONS_TR: dict[str, str] = {
 }
 
 
+def compute_accrued_margin_interest(
+    pos: Position,
+    now_utc: datetime | None = None,
+    hourly_rate: Decimal = Decimal("0.000005"),
+) -> Decimal:
+    """
+    Kaldıraçlı pozisyonda kullanılan borç (`borrowed_usdc`) için biriken saatlik marjin faizini hesaplar.
+    Binance Marjin kuralına uygun olarak borç alındığı anda ilk 1 saatlik faiz işler, ardından her
+    başlayan saat için 1 saat eklenir. Kaldıraçsız (`borrowed_usdc == 0`) pozisyonda 0 döner.
+    """
+    if pos.borrowed_usdc <= Decimal("0") or hourly_rate <= Decimal("0"):
+        return Decimal("0")
+    ref_now = now_utc or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+    try:
+        opened_dt = datetime.fromisoformat(pos.opened_at_iso)
+        if opened_dt.tzinfo is None:
+            opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+        elapsed_sec = max(0.0, (ref_now - opened_dt).total_seconds())
+    except Exception:
+        elapsed_sec = 0.0
+    hours_billed = Decimal(max(1, int(elapsed_sec // 3600) + 1))
+    return pos.borrowed_usdc * hourly_rate * hours_billed
+
+
+def compute_liquidation_price(
+    *,
+    quantity: Decimal,
+    borrowed_usdc: Decimal,
+    maintenance_margin_ratio: Decimal = Decimal("1.10"),
+) -> Decimal | None:
+    """
+    Çapraz/İzole Marjin tahmini likidasyon fiyatı (`marginLevel <= 1.10` noktası).
+    Borç yoksa (`1x` Spot) `None` döner.
+    """
+    if borrowed_usdc <= Decimal("0") or quantity <= Decimal("0"):
+        return None
+    return (borrowed_usdc * maintenance_margin_ratio) / quantity
+
+
 def compute_open_position_unrealized_net_pnl(
     pos: Position,
     current_bid: Decimal,
     estimated_fee_rate: Decimal,
+    *,
+    hourly_interest_rate: Decimal = Decimal("0.000005"),
+    now_utc: datetime | None = None,
 ) -> tuple[Decimal, Decimal]:
     """
     Açık pozisyonun:
-    1) Anlık brüt piyasa değerini (`quantity * current_bid`),
-    2) Giriş komisyonu ve tahmini çıkış komisyonu düşülmüş net gerçekleşmemiş kâr/zararını döndürür.
+    1) Borç ve faiz düşülmüş anlık net özkaynak değerini (`1x` Spot'ta `quantity * current_bid`),
+    2) Giriş komisyonu, biriken marjin faizi ve tahmini çıkış komisyonu düşülmüş net gerçekleşmemiş K/Z'sini döndürür.
     """
     gross_market_val = pos.quantity * current_bid
+    interest_usdc = compute_accrued_margin_interest(pos, now_utc=now_utc, hourly_rate=hourly_interest_rate)
     est_exit_fee = gross_market_val * estimated_fee_rate
-    net_liquidation_val = gross_market_val - est_exit_fee
+    net_liquidation_val = gross_market_val - est_exit_fee - interest_usdc
     total_entry_outflow = pos.cost_basis_usdc + pos.entry_fee_usdc
     unrealized_net_pnl = net_liquidation_val - total_entry_outflow
-    return gross_market_val, unrealized_net_pnl
+    net_equity_val = gross_market_val - pos.borrowed_usdc - interest_usdc
+    return net_equity_val, unrealized_net_pnl
 
 
 class RiskManager:
@@ -134,6 +180,7 @@ class RiskManager:
         limit_price: Decimal | None = None,
         now_utc: datetime | None = None,
         track: str = "MAIN",
+        bid_prices_by_symbol: dict[str, Decimal] | None = None,
     ) -> RiskCheckResult:
         """
         Yeni bir Spot ALIM emrini tüm risk ve borsa filtrelerinden geçirir.
@@ -141,6 +188,10 @@ class RiskManager:
         """
         ref_now = now_utc or datetime.now(timezone.utc)
         ist_date = self.storage.istanbul_date_str(ref_now)
+        try:
+            self.storage.ensure_quote_asset(track, filters.quote_asset)
+        except ValueError as exc:
+            return RiskCheckResult(allowed=False, reason=str(exc))
 
         # 0. Yalnızca aktif Spot USDT/USDC çiftleri ve izinsiz stabilcoin dönüşüm engeli
         if not filters.is_tradable_spot_for_quote():
@@ -156,8 +207,8 @@ class RiskManager:
             )
 
         # 1. Kullanıcı veya sistem duraklatması (yalnızca ana portföy için kullanıcı kilidi)
-        if track == "MAIN":
-            paused, pause_reason = self.storage.is_new_entries_paused()
+        if track in {"MAIN", "LIVE_SPOT", "LIVE_MARGIN"}:
+            paused, pause_reason = self.storage.is_new_entries_paused(track=track)
             if paused:
                 return RiskCheckResult(
                     allowed=False,
@@ -174,7 +225,13 @@ class RiskManager:
             )
 
         # 2. Günlük zarar eşiği kontrolü (Europe/Istanbul)
-        bid_map = {pos.symbol: (best_bid if pos.symbol == filters.symbol else pos.entry_price) for pos in open_positions}
+        bid_map = dict(bid_prices_by_symbol or {})
+        bid_map[filters.symbol] = best_bid
+        if any(pos.symbol not in bid_map for pos in open_positions):
+            return RiskCheckResult(
+                allowed=False,
+                reason="Tüm açık pozisyonların güncel fiyatı doğrulanamadı; yeni alım bekletildi.",
+            )
         breached, daily_loss, auto_close = self.evaluate_daily_loss_guard(
             settings=settings,
             open_positions=open_positions,
@@ -188,8 +245,8 @@ class RiskManager:
                 f"(güncel günlük kayıp: {daily_loss:.2f} USDC, Europe/Istanbul). "
                 "Yeni pozisyon açılışı durduruldu."
             )
-            if track == "MAIN":
-                self.storage.set_new_entries_paused(True, msg)
+            if track in {"MAIN", "LIVE_SPOT", "LIVE_MARGIN"}:
+                self.storage.set_new_entries_paused(True, msg, track=track, until_date=ist_date)
             return RiskCheckResult(
                 allowed=False,
                 reason=msg,
@@ -231,28 +288,33 @@ class RiskManager:
                 daily_total_loss_usdc=daily_loss,
             )
 
-        # 5. Kaldıraçsız nakit bakiye ve pozisyon üst sınırı hesabı
+        # 5. Nakit teminat ve kaldıraçlı pozisyon büyüklüğü hesabı (teminat üst sınırı ASLA büyütülmez)
         cash_usdc = self.storage.get_cash_balance(track=track)
         if cash_usdc <= Decimal("0"):
             return RiskCheckResult(
                 allowed=False,
-                reason="Kullanılabilir sanal USDC bakiyesi yetersiz (0.00 USDC).",
+                reason=f"Kullanılabilir {filters.quote_asset} teminat/nakit bakiyesi yetersiz (0.00 {filters.quote_asset}).",
                 daily_total_loss_usdc=daily_loss,
             )
 
-        # Komisyon ve ekstra kayma payı dahil nakit bütçe asla aşılmaz, sınır büyütülmez
-        slip_factor = Decimal("1") + (settings.extra_slippage_bps / Decimal("10000"))
-        fee_factor = Decimal("1") + settings.estimated_fee_rate
-        max_affordable_gross = cash_usdc / fee_factor
-        target_gross_usdc = min(settings.max_position_size_usdc, max_affordable_gross)
+        lev = max(1, min(5, int(getattr(settings, "leverage", 1))))
+        if track == "LIVE_SPOT":
+            lev = 1  # Spot izi her zaman borçsuz 1x çalışır
 
-        # Binance minimum notional ile çelişki kontrolü (sınırları ASLA otomatik büyütme!)
-        if filters.min_notional > settings.max_position_size_usdc:
+        slip_factor = Decimal("1") + (settings.extra_slippage_bps / Decimal("10000"))
+        # Kendi nakdimizden çıkan tutar = (gross / lev) + (gross * fee_rate)
+        cash_per_gross_unit = (Decimal("1") / Decimal(lev)) + settings.estimated_fee_rate
+        max_affordable_gross = cash_usdc / cash_per_gross_unit
+        max_notional_limit = settings.max_position_size_usdc * Decimal(lev)
+        target_gross_usdc = min(max_notional_limit, max_affordable_gross)
+
+        # Binance minimum notional ile çelişki kontrolü (teminat sınırını ASLA otomatik büyütme!)
+        if filters.min_notional > max_notional_limit:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
-                    f"{filters.symbol} minimum emir tutarı ({filters.min_notional:.2f} USDC), "
-                    f"belirlenen pozisyon üst sınırını ({settings.max_position_size_usdc:.2f} USDC) aşıyor. "
+                    f"{filters.symbol} minimum emir tutarı ({filters.min_notional:.2f} {filters.quote_asset}), "
+                    f"belirlenen pozisyon üst sınırını ({max_notional_limit:.2f} {filters.quote_asset}) aşıyor. "
                     "Risk sınırı otomatik büyütülmedi; işlem açılmadı."
                 ),
                 daily_total_loss_usdc=daily_loss,
@@ -262,9 +324,9 @@ class RiskManager:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
-                    f"Kullanılabilir bakiye ({cash_usdc:.2f} USDC, komisyon sonrası en çok "
-                    f"{max_affordable_gross:.2f} USDC), {filters.symbol} minimum emir tutarını "
-                    f"({filters.min_notional:.2f} USDC) karşılamıyor."
+                    f"Kullanılabilir teminat/bakiye ({cash_usdc:.2f} {filters.quote_asset}, komisyon sonrası en çok "
+                    f"{max_affordable_gross:.2f} {filters.quote_asset} işlem gücü), {filters.symbol} minimum emir tutarını "
+                    f"({filters.min_notional:.2f} {filters.quote_asset}) karşılamıyor."
                 ),
                 daily_total_loss_usdc=daily_loss,
             )

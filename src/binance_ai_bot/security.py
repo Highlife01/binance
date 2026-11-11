@@ -42,8 +42,24 @@ ALLOWED_LIVE_SPOT_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v3/account"),
         ("POST", "/api/v3/order/test"),
         ("POST", "/api/v3/order"),
+        ("GET", "/api/v3/order"),
+        ("GET", "/api/v3/myTrades"),
         ("GET", "/api/v3/openOrders"),
         ("DELETE", "/api/v3/order"),
+    }
+)
+
+# Üç kilitli Canlı Çapraz Marjin (Cross Margin) modunda izin verilen TEK uç noktalar
+# (Para çekme / transfer / vadeli işlemler yine KESİNLİKLE YASAKTIR)
+ALLOWED_LIVE_MARGIN_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/api/v3/time"),
+        ("POST", "/api/v3/order/test"),
+        ("GET", "/sapi/v1/margin/account"),
+        ("GET", "/sapi/v1/margin/maxBorrowable"),
+        ("POST", "/sapi/v1/margin/order"),
+        ("GET", "/sapi/v1/margin/openOrders"),
+        ("DELETE", "/sapi/v1/margin/order"),
     }
 )
 
@@ -152,6 +168,45 @@ def assert_live_spot_request(
         raise LiveOrderBlockedError(
             f"Güvenlik Kilidi: ({norm_method} {parsed.path}) uç noktası yasaktır! "
             "Para çekme (withdraw), marjin ve vadeli (futures) işlemler mimari olarak engellenmiştir."
+        )
+
+
+def assert_live_margin_request(
+    method: str,
+    url: str,
+    *,
+    config_live_enabled: bool,
+    ui_live_confirmed: bool,
+    ui_margin_confirmed: bool,
+) -> None:
+    """
+    Canlı Çapraz Marjin (Cross Margin) emir modülü için 3 aşamalı güvenlik kilidi:
+    1. `.env` içinde `ENABLE_LIVE_TRADING=true` olmalı,
+    2. Arayüzde `ui_live_confirmed=True` VE `ui_margin_confirmed=True` birlikte açık olmalı,
+    3. Yalnızca HTTPS resmi Binance sunucuları ve beyaz listedeki Çapraz Marjin uç noktaları kullanılabilir;
+       para çekme (withdraw), iç transfer ve vadeli (futures) uç noktaları koşulsuz yasaktır.
+    """
+    if not config_live_enabled:
+        raise LiveOrderBlockedError(
+            "Güvenlik Kilidi: .env dosyasında ENABLE_LIVE_TRADING=true ayarlanmadan canlı marjin işlemi yapılamaz."
+        )
+    if not ui_live_confirmed or not ui_margin_confirmed:
+        raise LiveOrderBlockedError(
+            "Güvenlik Kilidi: Hem Canlı İşlem Kilidi hem de Marjin Kaldıraç Onay Kilidi "
+            "açık olmadan gerçek marjin emri gönderilemez."
+        )
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_BINANCE_HOSTS:
+        raise LiveOrderBlockedError(
+            f"Güvenlik Kilidi: Geçersiz canlı marjin sunucu adresi: '{url}'."
+        )
+
+    norm_method = method.strip().upper()
+    if (norm_method, parsed.path) not in ALLOWED_LIVE_MARGIN_ENDPOINTS:
+        raise LiveOrderBlockedError(
+            f"Güvenlik Kilidi: ({norm_method} {parsed.path}) uç noktası yasaktır! "
+            "Para çekme (withdraw), cüzdan transferi ve vadeli (futures) işlemler kesinlikle engellenmiştir."
         )
 
 

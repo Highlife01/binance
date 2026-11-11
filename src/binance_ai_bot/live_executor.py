@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
-import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -42,6 +43,11 @@ from .storage import SQLiteStorage
 
 class LiveExecutionError(RuntimeError):
     """Canlı Spot bağlantı, yetki veya emir doğrulama hatası."""
+
+    def __init__(self, message: str, *, api_code: int | None = None, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.api_code = api_code
+        self.ambiguous = ambiguous
 
 
 def _format_decimal_clean(val: Decimal) -> str:
@@ -130,14 +136,33 @@ class BinanceLiveSpotExecutor:
             try:
                 resp = client.request(method.upper(), req_url, headers=headers)
             except Exception as exc:
-                raise LiveExecutionError(_friendly_network_error(exc, full_url)) from exc
+                raise LiveExecutionError(
+                    _friendly_network_error(exc, full_url),
+                    ambiguous=method.upper() == "POST" and path == "/api/v3/order",
+                ) from exc
 
             if resp.status_code != 200:
                 safe_body = redact_secrets(resp.text[:240])
+                try:
+                    api_code = int(resp.json().get("code", 0))
+                except (ValueError, TypeError, AttributeError):
+                    api_code = None
                 raise LiveExecutionError(
-                    f"Binance Canlı Spot API hatası (HTTP {resp.status_code}): {safe_body}"
+                    f"Binance Canlı Spot API hatası (HTTP {resp.status_code}): {safe_body}",
+                    api_code=api_code,
+                    ambiguous=(
+                        resp.status_code >= 500 or resp.status_code == 408
+                        or api_code in {-1000, -1001, -1006, -1007}
+                        or (api_code == -2010 and "duplicate" in resp.text.lower())
+                    ),
                 )
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise LiveExecutionError(
+                    "Binance yanıtı çözümlenemedi; emir sonucu doğrulanmalıdır.",
+                    ambiguous=method.upper() == "POST" and path == "/api/v3/order",
+                ) from exc
         finally:
             if close_after:
                 client.close()
@@ -146,7 +171,14 @@ class BinanceLiveSpotExecutor:
         self, *, ui_live_confirmed: bool, quote_asset: str = "USDC"
     ) -> dict[str, Decimal]:
         """Gerçek Binance Spot hesabındaki serbest (`free`) varlık bakiyelerini okur ve SQLite'ta günceller."""
+        with self.storage.execution_lock():
+            return self._fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=quote_asset)
+
+    def _fetch_live_spot_balances(
+        self, *, ui_live_confirmed: bool, quote_asset: str,
+    ) -> dict[str, Decimal]:
         q_norm = quote_asset.strip().upper() if quote_asset.strip().upper() in {"USDT", "USDC"} else "USDC"
+        self.storage.ensure_quote_asset("LIVE_SPOT", q_norm)
         earn_key = f"LD{q_norm}"
 
         data = self._request_signed("GET", "/api/v3/account", ui_live_confirmed=ui_live_confirmed)
@@ -166,210 +198,390 @@ class BinanceLiveSpotExecutor:
         earn_free = balances.get(earn_key, Decimal("0"))
         self.storage.set_state("live_spot_cash_usdc", f"{quote_free:.8f}")
         self.storage.set_state("live_earn_ldusdc", f"{earn_free:.8f}")
+        self.storage.set_state("live_balance_refresh_required", "0")
 
         perms = {str(p).upper() for p in data.get("permissions", [])}
         spot_perm = ("SPOT" in perms) or any(p.startswith("TRD_GRP_") for p in perms)
         self.storage.set_state("live_spot_permission_ok", "1" if spot_perm else "0")
         return balances
 
-    def execute_live_market_buy(
-        self,
-        *,
-        filters: SymbolFilters,
-        approved_qty: Decimal,
-        signal_key: str,
-        strategy_source: str,
-        settings: RiskSettings,
-        ui_live_confirmed: bool,
-    ) -> SimulatedOrderResult:
-        """
-        Önce `/api/v3/order/test` ile doğrular, ardından gerçek Spot MARKET BUY emrini gönderir.
-        """
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()
-        ist_date = self.storage.istanbul_date_str(now_utc)
+    @staticmethod
+    def _client_order_id(signal_key: str, side: str) -> str:
+        # The same persisted signal must never turn into a second exchange order.
+        digest = hashlib.sha256(f"LIVE_SPOT:{side}:{signal_key}".encode()).hexdigest()[:27]
+        return f"BSP{side[0]}{digest}"
 
-        if self.storage.has_processed_signal(signal_key, track="LIVE_SPOT"):
+    def _new_intent(
+        self, *, filters: SymbolFilters, quantity: Decimal, signal_key: str,
+        side: str, strategy_source: str, **extra: Any,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        client_id = self._client_order_id(signal_key, side)
+        return {
+            "signal_key": signal_key, "client_order_id": client_id,
+            "symbol": filters.symbol, "side": side, "status": "PREPARED",
+            "base_asset": filters.base_asset, "quote_asset": filters.quote_asset,
+            "strategy_source": strategy_source, "created_at_iso": now,
+            "requested_qty": str(quantity), "applied_qty": "0", "applied_quote": "0",
+            "applied_commissions": {},
+            "order_params": {
+                "symbol": filters.symbol, "side": side, "type": "MARKET",
+                "quantity": _format_decimal_clean(quantity),
+                "newClientOrderId": client_id, "newOrderRespType": "FULL",
+            },
+            **extra,
+        }
+
+    def reconcile_pending_orders(self, *, ui_live_confirmed: bool) -> list[SimulatedOrderResult]:
+        """Recover persisted submissions without ever issuing another POST order.
+
+        Call on startup and before an analysis cycle. An unresolved exchange response
+        remains pending; new entries stay blocked until its outcome is established.
+        """
+        results: list[SimulatedOrderResult] = []
+        with self.storage.execution_lock():
+            for intent in self.storage.list_pending_live_intents():
+                try:
+                    result = self._reconcile_intent(intent, ui_live_confirmed=ui_live_confirmed)
+                    if result is not None:
+                        results.append(result)
+                except (LiveExecutionError, LiveOrderBlockedError) as exc:
+                    self.storage.update_live_intent(
+                        intent["signal_key"], status="UNKNOWN", error=redact_secrets(str(exc)),
+                    )
+        return results
+
+    def _reconcile_intent(
+        self, intent: dict[str, Any], *, ui_live_confirmed: bool,
+    ) -> SimulatedOrderResult | None:
+        try:
+            response = self._request_signed(
+                "GET", "/api/v3/order",
+                {"symbol": intent["symbol"], "origClientOrderId": intent["client_order_id"]},
+                ui_live_confirmed=ui_live_confirmed,
+            )
+        except LiveExecutionError as exc:
+            # PREPARED is persisted before test; SUBMITTED is committed before POST.
+            # Only PREPARED can be proven never to have been sent. A temporary
+            # -2013 after an uncertain POST is not permission to submit again.
+            if exc.api_code == -2013 and intent["status"] == "PREPARED":
+                self.storage.update_live_intent(intent["signal_key"], status="REJECTED", error=str(exc))
+                return None
+            raise
+        return self._apply_response(intent, response, ui_live_confirmed=ui_live_confirmed)
+
+    def _submit_intent(
+        self, intent: dict[str, Any], *, ui_live_confirmed: bool,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> SimulatedOrderResult:
+        key = intent["signal_key"]
+        # Each operation commits independently: neither this nor the POST belongs
+        # inside the inventory transaction. A crash can always be reconciled.
+        self.storage.save_live_intent(key, intent)
+        def check_stop() -> None:
+            if stop_requested is not None and stop_requested():
+                # This helper is used only before THIS fresh intent's first POST.
+                # Never reject an old uncertain submission merely because stopped.
+                self.storage.update_live_intent(key, status="REJECTED", error="Kullanıcı durdurdu; gerçek emir gönderilmedi.")
+                raise LiveExecutionError("Durdurma isteği alındı; gerçek emir gönderilmedi.")
+
+        check_stop()
+        try:
+            self._request_signed(
+                "POST", "/api/v3/order/test", intent["order_params"],
+                ui_live_confirmed=ui_live_confirmed,
+            )
+        except (LiveExecutionError, LiveOrderBlockedError) as exc:
+            self.storage.update_live_intent(key, status="REJECTED", error=redact_secrets(str(exc)))
+            raise
+        self.storage.update_live_intent(key, status="SUBMITTED")
+        check_stop()
+        try:
+            response = self._request_signed(
+                "POST", "/api/v3/order", intent["order_params"],
+                ui_live_confirmed=ui_live_confirmed,
+            )
+        except LiveExecutionError as exc:
+            if not exc.ambiguous:
+                self.storage.update_live_intent(key, status="REJECTED", error=redact_secrets(str(exc)))
+                raise
+            self.storage.update_live_intent(key, status="UNKNOWN", error=redact_secrets(str(exc)))
+            current = self.storage.get_live_intent(key)
+            try:
+                result = self._reconcile_intent(current, ui_live_confirmed=ui_live_confirmed)
+                if result is not None:
+                    return result
+            except (LiveExecutionError, LiveOrderBlockedError):
+                pass
+            raise LiveExecutionError(
+                "Emir sonucu belirsiz. Kimliği kalıcı olarak kaydedildi; "
+                "borsada doğrulanana kadar yeni alımlar durduruldu.", ambiguous=True,
+            ) from exc
+        return self._apply_response(intent, response, ui_live_confirmed=ui_live_confirmed)
+
+    def _complete_fills(
+        self, intent: dict[str, Any], response: dict[str, Any], *, ui_live_confirmed: bool,
+    ) -> list[dict[str, Any]]:
+        executed = Decimal(str(response.get("executedQty", "0")))
+        if executed == 0:
+            return []
+        fills = response.get("fills")
+        if fills is None:
+            if not response.get("orderId"):
+                raise LiveExecutionError("Gerçekleşen emrin kimliği yok; muhasebe uzlaştırma bekliyor.", ambiguous=True)
+            fills = self._request_signed(
+                "GET", "/api/v3/myTrades",
+                {"symbol": intent["symbol"], "orderId": response["orderId"], "limit": 1000},
+                ui_live_confirmed=ui_live_confirmed,
+            )
+        if not isinstance(fills, list) or sum((Decimal(str(f.get("qty", "0"))) for f in fills), Decimal(0)) != executed:
+            raise LiveExecutionError(
+                "Emir dolumları ve komisyonları henüz tam doğrulanamadı; yeni alımlar durduruldu.", ambiguous=True,
+            )
+        return fills
+
+    def _apply_response(
+        self, intent: dict[str, Any], response: dict[str, Any], *, ui_live_confirmed: bool,
+    ) -> SimulatedOrderResult:
+        key = intent["signal_key"]
+        self.storage.update_live_intent(key, response=response)
+        try:
+            status = str(response.get("status", "")).upper()
+            terminal = status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}
+            if not terminal and status not in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW", "PENDING_CANCEL"}:
+                raise ValueError("Bilinmeyen emir durumu")
+            executed = Decimal(str(response.get("executedQty", "0")))
+            quote = Decimal(str(response.get("cummulativeQuoteQty", "0")))
+            requested = Decimal(intent["requested_qty"])
+            if response.get("symbol") is not None and response["symbol"] != intent["symbol"]:
+                raise ValueError("Yanıt sembolü kayıtlı emirle uyuşmuyor")
+            if response.get("clientOrderId") is not None and response["clientOrderId"] != intent["client_order_id"]:
+                raise ValueError("Yanıt müşteri emir kimliği kayıtlı emirle uyuşmuyor")
+            if not executed.is_finite() or not quote.is_finite() or executed < 0 or quote < 0:
+                raise ValueError("Geçersiz gerçekleşen miktar/tutar")
+            if "quote_budget" in intent:
+                if quote > Decimal(intent["quote_budget"]):
+                    raise ValueError("Gerçekleşen tutar onaylı harcama tavanını aşıyor")
+            elif executed > requested:
+                raise ValueError("Gerçekleşen miktar istenen miktarı aşıyor")
+            if executed > 0 and quote <= 0:
+                raise ValueError("Gerçekleşen tutar eksik")
+            fills = self._complete_fills(intent, response, ui_live_confirmed=ui_live_confirmed)
+            commissions: dict[str, Decimal] = {}
+            base_fee_value = Decimal(0)
+            for fill in fills:
+                asset = str(fill.get("commissionAsset", "")).upper()
+                amount = Decimal(str(fill.get("commission", "0")))
+                fill_price = Decimal(str(fill["price"]))
+                fill_qty = Decimal(str(fill["qty"]))
+                if not amount.is_finite() or amount < 0 or (amount > 0 and not asset):
+                    raise ValueError("Geçersiz komisyon")
+                if not fill_price.is_finite() or fill_price <= 0 or not fill_qty.is_finite() or fill_qty <= 0:
+                    raise ValueError("Geçersiz dolum fiyatı veya miktarı")
+                commissions[asset] = commissions.get(asset, Decimal(0)) + amount
+                if asset == intent["base_asset"]:
+                    base_fee_value += amount * fill_price
+        except (ValueError, KeyError, TypeError, AttributeError, ArithmeticError, LiveExecutionError) as exc:
+            self.storage.update_live_intent(key, status="UNKNOWN", error=redact_secrets(str(exc)))
+            if isinstance(exc, LiveExecutionError):
+                raise
+            raise LiveExecutionError("Emir yanıtı doğrulanamadı; uzlaştırma gerekiyor.", ambiguous=True) from exc
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        date = self.storage.istanbul_date_str(now)
+        with self.storage.atomic():
+            current = self.storage.get_live_intent(key)
+            previous_qty = Decimal(current.get("applied_qty", "0"))
+            previous_quote = Decimal(current.get("applied_quote", "0"))
+            previous_fees = {a: Decimal(v) for a, v in current.get("applied_commissions", {}).items()}
+            delta_qty, delta_quote = executed - previous_qty, quote - previous_quote
+            delta_fees = {
+                a: commissions.get(a, Decimal(0)) - previous_fees.get(a, Decimal(0))
+                for a in commissions.keys() | previous_fees.keys()
+            }
+            if delta_qty < 0 or delta_quote < 0 or any(v < 0 for v in delta_fees.values()):
+                raise LiveExecutionError("Borsa dolumları geriye gitti; otomatik işlem durduruldu.", ambiguous=True)
+            base_fee = delta_fees.get(intent["base_asset"], Decimal(0))
+            quote_fee = delta_fees.get(intent["quote_asset"], Decimal(0))
+            unknown = {a: str(v) for a, v in commissions.items() if a not in {intent["base_asset"], intent["quote_asset"]} and v > 0}
+            if unknown:
+                raw = self.storage.get_state("live_unvalued_commissions", "{}") or "{}"
+                unvalued = json.loads(raw)
+                unvalued[intent["client_order_id"]] = unknown
+                self.storage.set_state("live_unvalued_commissions", json.dumps(unvalued, sort_keys=True))
+            avg = delta_quote / delta_qty if delta_qty > 0 else Decimal(0)
+            pnl = Decimal(0)
+            net_qty = delta_qty
+            if delta_qty > 0:
+                if intent["side"] == "BUY":
+                    net_qty = delta_qty - base_fee
+                    if net_qty <= 0:
+                        raise LiveExecutionError("Alış komisyonu net miktarı aşıyor; uzlaştırma gerekiyor.", ambiguous=True)
+                    pos = self.storage.get_position(intent["position_id"], track="LIVE_SPOT")
+                    if pos is None:
+                        entry = quote / executed
+                        self.storage.insert_position(
+                            Position(
+                                position_id=intent["position_id"], symbol=intent["symbol"],
+                                quantity=net_qty, entry_price=entry, cost_basis_usdc=delta_quote,
+                                # Base-asset fees already reduced inventory. Adding them here
+                                # as a cash expense would count the very same fee twice.
+                                entry_fee_usdc=quote_fee, opened_at_iso=intent["created_at_iso"],
+                                signal_key=key, strategy_source=intent["strategy_source"],
+                                stop_loss_price=entry * (1 - Decimal(intent["stop_loss_pct"])) if Decimal(intent["stop_loss_pct"]) > 0 else None,
+                                take_profit_price=entry * (1 + Decimal(intent["take_profit_pct"])) if Decimal(intent["take_profit_pct"]) > 0 else None,
+                            ), track="LIVE_SPOT",
+                        )
+                    elif pos.status == "OPEN":
+                        self.storage.update_position_remaining(
+                            pos.position_id, quantity=pos.quantity + net_qty,
+                            cost_basis_usdc=pos.cost_basis_usdc + delta_quote,
+                            entry_fee_usdc=pos.entry_fee_usdc + quote_fee, entry_price=quote / executed,
+                        )
+                    else:
+                        raise LiveExecutionError("Devam eden alışın yerel pozisyonu kapalı; uzlaştırma gerekiyor.")
+                else:
+                    pos = self.storage.get_position(intent["position_id"], track="LIVE_SPOT")
+                    debit_qty = delta_qty + base_fee
+                    if pos is None or pos.status != "OPEN" or debit_qty > pos.quantity:
+                        raise LiveExecutionError("Satış miktarı yerel açık pozisyonla uyuşmuyor; uzlaştırma gerekiyor.")
+                    ratio = debit_qty / pos.quantity
+                    sold_cost, sold_entry_fee = pos.cost_basis_usdc * ratio, pos.entry_fee_usdc * ratio
+                    pnl = delta_quote - quote_fee - sold_cost - sold_entry_fee
+                    if debit_qty == pos.quantity:
+                        self.storage.update_position_closed(
+                            pos.position_id, closed_at_iso=now_iso, closed_istanbul_date=date,
+                            exit_price=avg, exit_fee_usdc=quote_fee, realized_pnl_usdc=pnl,
+                            close_reason=intent["close_reason"],
+                        )
+                    else:
+                        # Keep even a sub-step residual visible: dust still belongs to the account.
+                        self.storage.update_position_remaining(
+                            pos.position_id, quantity=pos.quantity - debit_qty,
+                            cost_basis_usdc=pos.cost_basis_usdc - sold_cost,
+                            entry_fee_usdc=pos.entry_fee_usdc - sold_entry_fee,
+                        )
+                        suffix = hashlib.sha256(f"{key}:{executed}".encode()).hexdigest()[:16]
+                        self.storage.insert_position(
+                            replace(pos, position_id=f"LIVE-CLOSED-{suffix}", quantity=debit_qty,
+                                    cost_basis_usdc=sold_cost, entry_fee_usdc=sold_entry_fee),
+                            track="LIVE_SPOT",
+                        )
+                        self.storage.update_position_closed(
+                            f"LIVE-CLOSED-{suffix}", closed_at_iso=now_iso, closed_istanbul_date=date,
+                            exit_price=avg, exit_fee_usdc=quote_fee, realized_pnl_usdc=pnl,
+                            close_reason=intent["close_reason"],
+                        )
+                self.storage.mark_signal_processed(key, str(response.get("orderId", intent["client_order_id"])), now_iso, track="LIVE_SPOT")
+                # Account reads may already include this fill (especially after a
+                # restart). Applying a local cash delta would count it twice.
+                self.storage.set_state("live_balance_refresh_required", "1")
+            mapped = "PARTIALLY_FILLED" if executed > 0 and (not terminal or (status != "FILLED" and executed < requested)) else ("FILLED" if executed > 0 else "EXPIRED_UNFILLED")
+            fee_value = quote_fee + base_fee_value - Decimal(current.get("applied_base_fee_value", "0"))
+            warning = " Üçüncü varlık komisyonunun değeri bilinmiyor; K/Z geçicidir, yeni alımlar durduruldu." if unknown else ""
+            result = SimulatedOrderResult(
+                order_id=f"LIVE-{response.get('orderId', intent['client_order_id'])}-{_format_decimal_clean(executed)}",
+                symbol=intent["symbol"], side=intent["side"], order_type="MARKET", status=mapped,
+                requested_qty=requested, filled_qty=net_qty, avg_fill_price=avg,
+                gross_quote_usdc=delta_quote, fee_usdc=fee_value, slippage_bps=Decimal(0),
+                signal_key=key, strategy_source=intent["strategy_source"], created_at_iso=now_iso,
+                realized_pnl_usdc=pnl,
+                explanation=f"GERÇEK SPOT {intent['side']} ({status}): {net_qty} {intent['base_asset']} @ {avg:.8f} {intent['quote_asset']}." + warning,
+            )
+            if delta_qty > 0 or (terminal and not current.get("zero_result_recorded") and previous_qty == 0):
+                self.storage.record_order(result, date, track="LIVE_SPOT")
+            self.storage.update_live_intent(
+                key, status="APPLIED" if terminal else "SUBMITTED", response=response,
+                applied_qty=str(executed), applied_quote=str(quote),
+                applied_commissions={a: str(v) for a, v in commissions.items()},
+                applied_base_fee_value=str(base_fee_value), unknown_commissions=unknown,
+                zero_result_recorded=terminal and executed == 0,
+            )
+        if delta_qty > 0:
+            try:
+                self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=intent["quote_asset"])
+            except Exception:
+                # Inventory and the exchange result are already committed. Keep
+                # the refresh-required flag; every new BUY must successfully read
+                # the authoritative account before it can submit another order.
+                result = replace(result, explanation=result.explanation + " Bakiye yenilenemedi; yeni alım öncesi hesap tekrar doğrulanacak.")
+        return result
+
+    def _check_signal_available(self, signal_key: str) -> None:
+        if self.storage.get_live_intent(signal_key) is not None or self.storage.has_processed_signal(signal_key, track="LIVE_SPOT"):
             raise LiveExecutionError(f"Mükerrer canlı sinyal engellendi: {signal_key}")
 
-        qty = quantize_down(approved_qty, filters.market_step_size)
-        client_oid = f"BSPOT{uuid.uuid4().hex[:18].upper()}"
-        order_params = {
-            "symbol": filters.symbol,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": _format_decimal_clean(qty),
-            "newClientOrderId": client_oid,
-            "newOrderRespType": "FULL",
-        }
-
-        # 1. Ön-doğrulama testi (gerçek bakiye kilitlemeden filtre/imza doğrulaması)
-        self._request_signed(
-            "POST", "/api/v3/order/test", order_params, ui_live_confirmed=ui_live_confirmed
-        )
-
-        # 2. Gerçek Spot emir gönderimi
-        resp = self._request_signed(
-            "POST", "/api/v3/order", order_params, ui_live_confirmed=ui_live_confirmed
-        )
-
-        executed_qty = Decimal(str(resp.get("executedQty", "0")))
-        cumm_quote = Decimal(str(resp.get("cummulativeQuoteQty", "0")))
-        avg_price = (cumm_quote / executed_qty) if executed_qty > 0 else Decimal("0")
-
-        # Fills dizisinden gerçek kesilen komisyonu hesapla
-        q_ccy = filters.quote_asset
-        fee_usdc = Decimal("0")
-        for fill in resp.get("fills", []):
-            comm = Decimal(str(fill.get("commission", "0")))
-            comm_asset = str(fill.get("commissionAsset", "")).upper()
-            if comm_asset == q_ccy:
-                fee_usdc += comm
-            elif comm_asset == filters.base_asset and avg_price > 0:
-                fee_usdc += comm * avg_price
-                # Komisyon baz varlıktan kesildiyse net eldeki miktarı düşür
-                executed_qty = max(Decimal("0"), executed_qty - comm)
-
-        eff_qty = quantize_down(executed_qty, filters.market_step_size)
-        order_id = f"LIVE-{resp.get('orderId', client_oid)}"
-        raw_status = str(resp.get("status", "FILLED")).upper()
-        mapped_status = "PARTIALLY_FILLED" if raw_status == "PARTIALLY_FILLED" else "FILLED"
-
-        if eff_qty > 0:
-            stop_px = avg_price * (Decimal("1") - settings.stop_loss_pct) if settings.stop_loss_pct > 0 else None
-            tp_px = avg_price * (Decimal("1") + settings.take_profit_pct) if settings.take_profit_pct > 0 else None
-            pos = Position(
-                position_id=f"LIVE-POS-{uuid.uuid4().hex[:10].upper()}",
-                symbol=filters.symbol,
-                quantity=eff_qty,
-                entry_price=avg_price,
-                cost_basis_usdc=cumm_quote,
-                entry_fee_usdc=fee_usdc,
-                opened_at_iso=now_iso,
-                signal_key=signal_key,
+    def execute_live_market_buy(
+        self, *, filters: SymbolFilters, approved_qty: Decimal, signal_key: str,
+        strategy_source: str, settings: RiskSettings, ui_live_confirmed: bool,
+        approved_notional: Decimal | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> SimulatedOrderResult:
+        """Persist one order identity before sending, then apply its fills atomically."""
+        with self.storage.execution_lock():
+            if settings.leverage != 1:
+                raise LiveExecutionError("Canlı Spot yalnızca kaldıraçsız (1x) çalışır.")
+            self.storage.ensure_quote_asset("LIVE_SPOT", filters.quote_asset)
+            self.reconcile_pending_orders(ui_live_confirmed=ui_live_confirmed)
+            self._check_signal_available(signal_key)
+            if self.storage.list_pending_live_intents():
+                raise LiveExecutionError("Sonucu doğrulanmamış canlı emir var; yeni alımlar durduruldu.")
+            if self.storage.get_state("live_unvalued_commissions", "{}") not in {"", "{}", None}:
+                raise LiveExecutionError("Üçüncü varlık komisyonları değerlenmeden yeni canlı alım yapılamaz.")
+            opened = self.storage.get_open_positions(track="LIVE_SPOT")
+            if any(p.symbol == filters.symbol for p in opened) or len(opened) >= settings.max_open_positions:
+                raise LiveExecutionError("Açık pozisyon veya aynı coin sınırı nedeniyle yeni alım engellendi.")
+            qty = quantize_down(approved_qty, filters.market_step_size)
+            if not qty.is_finite() or qty <= 0 or qty < max(filters.min_qty, filters.market_min_qty):
+                raise LiveExecutionError("Canlı alış miktarı geçerli minimum miktarı karşılamıyor.")
+            balances = self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=filters.quote_asset)
+            free_quote = balances.get(filters.quote_asset, Decimal(0))
+            if free_quote <= 0:
+                raise LiveExecutionError("Gerçek serbest Spot bakiyesi yetersiz; alım yapılmadı.")
+            intent = self._new_intent(
+                filters=filters, quantity=qty, signal_key=signal_key, side="BUY",
                 strategy_source=strategy_source,
-                stop_loss_price=stop_px,
-                take_profit_price=tp_px,
-                status="OPEN",
+                position_id=f"LIVE-POS-{hashlib.sha256(signal_key.encode()).hexdigest()[:20]}",
+                stop_loss_pct=str(settings.stop_loss_pct), take_profit_pct=str(settings.take_profit_pct),
             )
-            self.storage.insert_position(pos, track="LIVE_SPOT")
-            self.storage.mark_signal_processed(signal_key, order_id, now_iso, track="LIVE_SPOT")
-
-        res = SimulatedOrderResult(
-            order_id=order_id,
-            symbol=filters.symbol,
-            side="BUY",
-            order_type="MARKET",
-            status=mapped_status,  # type: ignore[arg-type]
-            requested_qty=qty,
-            filled_qty=eff_qty,
-            avg_fill_price=avg_price,
-            gross_quote_usdc=cumm_quote,
-            fee_usdc=fee_usdc,
-            slippage_bps=Decimal("0"),
-            signal_key=signal_key,
-            strategy_source=strategy_source,
-            explanation=(
-                f"GERÇEK SPOT ALIM ({mapped_status}): {eff_qty} {filters.base_asset} "
-                f"@ {avg_price:.6f} {q_ccy} (Toplam: {cumm_quote:.2f} {q_ccy}, Komisyon: {fee_usdc:.4f} {q_ccy})."
-            ),
-            created_at_iso=now_iso,
-        )
-        self.storage.record_order(res, ist_date, track="LIVE_SPOT")
-        return res
+            if approved_notional is not None:
+                if not approved_notional.is_finite() or approved_notional <= 0:
+                    raise LiveExecutionError("Onaylı canlı alış bütçesi geçersiz.")
+                budget = quantize_down(
+                    min(approved_notional, settings.max_position_size_usdc,
+                        free_quote / (1 + settings.estimated_fee_rate)), Decimal("0.00000001"),
+                )
+                if budget < filters.min_notional:
+                    raise LiveExecutionError("Güncel bakiye ve komisyon payıyla minimum emir tutarı karşılanamıyor.")
+                intent["quote_budget"] = str(budget)
+                del intent["order_params"]["quantity"]
+                intent["order_params"]["quoteOrderQty"] = _format_decimal_clean(budget)
+            return self._submit_intent(intent, ui_live_confirmed=ui_live_confirmed, stop_requested=stop_requested)
 
     def execute_live_market_sell(
-        self,
-        *,
-        position: Position,
-        filters: SymbolFilters,
-        signal_key: str,
-        strategy_source: str,
-        close_reason: str,
-        ui_live_confirmed: bool,
+        self, *, position: Position, filters: SymbolFilters, signal_key: str,
+        strategy_source: str, close_reason: str, ui_live_confirmed: bool,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> SimulatedOrderResult:
-        """Gerçek açık Spot pozisyonu Binance üzerinde MARKET SELL ile kapatır."""
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()
-        ist_date = self.storage.istanbul_date_str(now_utc)
-        q_ccy = filters.quote_asset
-
-        # Hesaptaki gerçek serbest baz varlık miktarını doğrula (dust farkı nedeniyle -2010 hatasını önler)
-        balances = self.fetch_live_spot_balances(
-            ui_live_confirmed=ui_live_confirmed, quote_asset=q_ccy
-        )
-        free_base = balances.get(filters.base_asset, Decimal("0"))
-        sell_qty = quantize_down(min(position.quantity, free_base), filters.market_step_size)
-        if sell_qty < max(filters.min_qty, filters.market_min_qty) or sell_qty <= Decimal("0"):
-            raise LiveExecutionError(
-                f"Gerçek hesapta satılabilir yeterli {filters.base_asset} miktarı bulunamadı "
-                f"(serbest: {free_base}, gereken min: {filters.min_qty})."
+        """Sell only currently tracked inventory, retaining every unfilled residual."""
+        with self.storage.execution_lock():
+            self.storage.ensure_quote_asset("LIVE_SPOT", filters.quote_asset)
+            self.reconcile_pending_orders(ui_live_confirmed=ui_live_confirmed)
+            self._check_signal_available(signal_key)
+            if any(i["symbol"] == filters.symbol for i in self.storage.list_pending_live_intents()):
+                raise LiveExecutionError("Bu coin için sonucu belirsiz emir var; satış önce uzlaştırılmalı.")
+            current = self.storage.get_position(position.position_id, track="LIVE_SPOT")
+            if current is None or current.status != "OPEN" or current.symbol != filters.symbol:
+                raise LiveExecutionError("Pozisyon artık açık değil; eski satış isteği engellendi.")
+            if current.leverage != 1:
+                raise LiveExecutionError("Kaldıraçlı pozisyon Spot yürütücüsünde satılamaz.")
+            balances = self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=filters.quote_asset)
+            qty = quantize_down(min(current.quantity, balances.get(filters.base_asset, Decimal(0))), filters.market_step_size)
+            if qty <= 0 or qty < max(filters.min_qty, filters.market_min_qty):
+                raise LiveExecutionError(f"Satılabilir {filters.base_asset} minimumun altında; kalan miktar açık kayıtta korunuyor.")
+            intent = self._new_intent(
+                filters=filters, quantity=qty, signal_key=signal_key, side="SELL",
+                strategy_source=strategy_source, position_id=current.position_id, close_reason=close_reason,
             )
-
-        client_oid = f"SSELL{uuid.uuid4().hex[:18].upper()}"
-        order_params = {
-            "symbol": filters.symbol,
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": _format_decimal_clean(sell_qty),
-            "newClientOrderId": client_oid,
-            "newOrderRespType": "FULL",
-        }
-
-        self._request_signed(
-            "POST", "/api/v3/order/test", order_params, ui_live_confirmed=ui_live_confirmed
-        )
-        resp = self._request_signed(
-            "POST", "/api/v3/order", order_params, ui_live_confirmed=ui_live_confirmed
-        )
-
-        executed_qty = Decimal(str(resp.get("executedQty", "0")))
-        cumm_quote = Decimal(str(resp.get("cummulativeQuoteQty", "0")))
-        avg_price = (cumm_quote / executed_qty) if executed_qty > 0 else Decimal("0")
-
-        exit_fee_usdc = Decimal("0")
-        for fill in resp.get("fills", []):
-            comm = Decimal(str(fill.get("commission", "0")))
-            comm_asset = str(fill.get("commissionAsset", "")).upper()
-            if comm_asset == q_ccy:
-                exit_fee_usdc += comm
-
-        net_proceeds = cumm_quote - exit_fee_usdc
-        realized_pnl = net_proceeds - position.cost_basis_usdc - position.entry_fee_usdc
-        order_id = f"LIVE-{resp.get('orderId', client_oid)}"
-
-        self.storage.update_position_closed(
-            position.position_id,
-            closed_at_iso=now_iso,
-            closed_istanbul_date=ist_date,
-            exit_price=avg_price,
-            exit_fee_usdc=exit_fee_usdc,
-            realized_pnl_usdc=realized_pnl,
-            close_reason=close_reason,
-        )
-        self.storage.mark_signal_processed(signal_key, order_id, now_iso, track="LIVE_SPOT")
-        self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=q_ccy)
-
-        res = SimulatedOrderResult(
-            order_id=order_id,
-            symbol=filters.symbol,
-            side="SELL",
-            order_type="MARKET",
-            status="FILLED",
-            requested_qty=sell_qty,
-            filled_qty=executed_qty,
-            avg_fill_price=avg_price,
-            gross_quote_usdc=cumm_quote,
-            fee_usdc=exit_fee_usdc,
-            slippage_bps=Decimal("0"),
-            signal_key=signal_key,
-            strategy_source=strategy_source,
-            explanation=(
-                f"GERÇEK SPOT SATIŞ ({close_reason}): {executed_qty} {filters.base_asset} "
-                f"@ {avg_price:.6f} {q_ccy} (Net: {net_proceeds:.2f} {q_ccy}, K/Z: {realized_pnl:+.4f} {q_ccy})."
-            ),
-            created_at_iso=now_iso,
-            realized_pnl_usdc=realized_pnl,
-        )
-        self.storage.record_order(res, ist_date, track="LIVE_SPOT")
-        return res
+            return self._submit_intent(intent, ui_live_confirmed=ui_live_confirmed, stop_requested=stop_requested)

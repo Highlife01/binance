@@ -10,7 +10,7 @@ Güvenlik:
   başlangıçta konsola elle "EVET" yazılarak onay verilmesi gerekir.
 - Aynı anda yalnızca TEK bir arka plan botu çalışabilir (dosya kilidi).
 - Panel bu bot çalışırken kendi otomatik döngüsünü ve analiz düğmesini kilitler (çift emir önlemi).
-- Pozisyon üst sınırı, günlük zarar eşiği ve 1 açık pozisyon kuralı profillerden bağımsız korunur.
+- Pozisyon büyüklüğü ve günlük zarar eşiği profillerden bağımsız korunur.
 - Bot çalıştığı sürece Windows'un uykuya geçmesi engellenir (ekran kapanabilir).
 """
 
@@ -62,6 +62,24 @@ def is_runner_alive(storage, now_utc: datetime | None = None) -> tuple[bool, dic
         info = {}
     info["heartbeat_iso"] = raw_hb
     return alive, info
+
+
+def _stop_requested(storage) -> bool:
+    return storage.get_state(RUNNER_STOP_KEY, "0") == "1"
+
+
+def _wait_with_heartbeat(storage, seconds: float, sleep_fn=time.sleep) -> bool:
+    """Beklerken canlılık kaydını yeniler; durdurma isteğinde en geç 5 sn'de döner."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
+        if _stop_requested(storage):
+            return False
+        chunk = min(remaining, 5.0)
+        sleep_fn(chunk)
+        remaining -= chunk
+    storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
+    return not _stop_requested(storage)
 
 
 def _keep_windows_awake(enable: bool) -> None:
@@ -136,19 +154,23 @@ def _setup_logger() -> logging.Logger:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Kesintisiz Binance Spot arka plan botu")
-    ap.add_argument("--mod", choices=["sanal", "canli"], default="sanal")
+    ap = argparse.ArgumentParser(description="Kesintisiz Binance Spot / Çapraz Marjin arka plan botu")
+    ap.add_argument("--mod", choices=["sanal", "canli", "marjin"], default="sanal")
     ap.add_argument("--profil", choices=["hizli_30sn", "aktif", "temkinli"], default="hizli_30sn")
     ap.add_argument("--parite", default="", help="Örn. BTCUSDT (boşsa .env DEFAULT_SYMBOL)")
     ap.add_argument(
         "--pariteler",
         default="",
         help=(
-            "Çoklu coin taraması (yalnızca SANAL mod): virgülle ayrılmış liste veya 'varsayilan' "
+            "Çoklu coin taraması: virgülle ayrılmış liste veya 'varsayilan' "
             f"({','.join(DEFAULT_SCAN_SYMBOLS)})."
         ),
     )
     ap.add_argument("--ai", choices=["acik", "kapali", "zorla"], default="acik")
+    ap.add_argument(
+        "--kaldirac", type=int, choices=range(1, 6), default=None,
+        help="Sanal veya Çapraz Marjin kaldıracı (1-5). Canlı Spot yalnızca 1x çalışır.",
+    )
     ap.add_argument("--max-dongu", type=int, default=0, help="Test amaçlı: 0 = sınırsız")
     ap.add_argument(
         "--onay",
@@ -190,9 +212,17 @@ def run_bot(
     cfg = config or load_config()
     profile: TradingProfile = get_profile(args.profil)
     symbol = (args.parite or cfg.default_symbol).strip().upper()
-    is_live = args.mod == "canli"
-    execution_mode = "LIVE_SPOT" if is_live else "PAPER"
-    track = "LIVE_SPOT" if is_live else "MAIN"
+    is_live_spot = args.mod == "canli"
+    is_live_margin = args.mod == "marjin"
+    is_any_live = is_live_spot or is_live_margin
+    execution_mode = "LIVE_MARGIN" if is_live_margin else ("LIVE_SPOT" if is_live_spot else "PAPER")
+    track = "LIVE_MARGIN" if is_live_margin else ("LIVE_SPOT" if is_live_spot else "MAIN")
+    if is_live_margin:
+        log.error("Canli marjin henuz bu guvenlik dogrulamasina dahil degil; hesap istegi veya emir gonderilmedi.")
+        return 2
+    if is_live_spot and args.kaldirac not in {None, 1}:
+        log.error("Canli Spot yalnizca kaldiracsiz (1x) calisir; kaldiracli deneme icin yalnizca --mod sanal kullanin.")
+        return 2
 
     raw_list = args.pariteler.strip()
     if raw_list.lower() in {"varsayilan", "default", "hepsi"}:
@@ -207,12 +237,24 @@ def run_bot(
     if multi_scan:
         eng.lock_benchmark_symbol = True
 
-    base_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+    leverage_override = (
+        1
+        if is_live_spot
+        else (args.kaldirac if args.kaldirac is not None else (2 if is_live_margin else None))
+    )
+    base_settings = profile.apply_to_risk_settings(
+        eng.default_risk_settings(), leverage=leverage_override
+    )
 
+    mode_banner = (
+        f"CANLI CAPRAZ MARJIN ({base_settings.leverage}x KALDIRAC)"
+        if is_live_margin
+        else ("CANLI SPOT (1x GERCEK PARA)" if is_live_spot else f"SANAL DENEME ({base_settings.leverage}x)")
+    )
     log.info("=" * 78)
     log.info(
         "ARKA PLAN BOTU | Mod=%s | Profil=%s | Parite(ler)=%s | Mum=%s | Dongu=%ss | MaksAcik=%s | AI=%s",
-        "CANLI SPOT (GERCEK PARA)" if is_live else "SANAL DENEME",
+        mode_banner,
         profile.key,
         ",".join(scan_symbols),
         profile.interval,
@@ -231,29 +273,51 @@ def run_bot(
         )
 
     quote = "USDT" if scan_symbols[0].endswith("USDT") else "USDC"
-    if is_live:
+    if is_any_live:
         if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
             log.error(
                 "Canli mod kilitli: .env icinde ENABLE_LIVE_TRADING=true ve BINANCE_API_KEY/SECRET gerekli."
             )
             return 2
         try:
-            bals = eng.live_executor.fetch_live_spot_balances(
-                ui_live_confirmed=True, quote_asset=quote
-            )
-            log.info("Gercek Spot serbest bakiye: %s %s", bals.get(quote, 0), quote)
+            if is_live_margin:
+                minfo = eng.live_margin_executor.fetch_live_margin_balances(
+                    ui_live_confirmed=True, ui_margin_confirmed=True, quote_asset=quote
+                )
+                log.info(
+                    "Gercek Capraz Marjin serbest teminat: %.2f %s | Borc: %.2f %s | Marjin Seviyesi: %.2f",
+                    minfo["available_collateral"],
+                    quote,
+                    minfo["quote_borrowed"],
+                    quote,
+                    minfo["margin_level"],
+                )
+            else:
+                bals = eng.live_executor.fetch_live_spot_balances(
+                    ui_live_confirmed=True, quote_asset=quote
+                )
+                log.info("Gercek Spot serbest bakiye: %s %s", bals.get(quote, 0), quote)
         except Exception as exc:
             log.error("Gercek hesap okunamadi, bot baslatilmadi: %s", exc)
             return 3
         print()
         print("!" * 78)
-        print("  DIKKAT: GERCEK PARA ILE OTOMATIK SPOT ALIM-SATIM BASLAYACAK.")
-        print(
-            f"  Islem basina en fazla {base_settings.max_position_size_usdc:.2f} {quote}, "
-            f"ayni anda en fazla {base_settings.max_open_positions} farkli coin, "
-            f"gunluk zarar esigi {base_settings.daily_loss_limit_usdc:.2f} {quote}, "
-            f"gunde en fazla {base_settings.max_daily_new_positions} yeni pozisyon."
-        )
+        if is_live_margin:
+            print(f"  DIKKAT: GERCEK CAPRAZ MARJIN ({base_settings.leverage}x KALDIRAC) OTOMATIK ISLEM BASLAYACAK.")
+            print(
+                f"  Islem basina en fazla {base_settings.max_position_size_usdc:.2f} {quote} teminat "
+                f"(~{base_settings.max_position_size_usdc * Decimal(base_settings.leverage):.2f} {quote} pozisyon buyuklugu), "
+                f"ayni anda en fazla {base_settings.max_open_positions} farkli coin, "
+                f"gunluk zarar esigi {base_settings.daily_loss_limit_usdc:.2f} {quote}."
+            )
+        else:
+            print("  DIKKAT: GERCEK PARA ILE OTOMATIK SPOT ALIM-SATIM BASLAYACAK.")
+            print(
+                f"  Islem basina en fazla {base_settings.max_position_size_usdc:.2f} {quote}, "
+                f"ayni anda en fazla {base_settings.max_open_positions} farkli coin, "
+                f"gunluk zarar esigi {base_settings.daily_loss_limit_usdc:.2f} {quote}, "
+                f"gunde en fazla {base_settings.max_daily_new_positions} yeni pozisyon."
+            )
         print("  Kar garantisi yoktur. Durdurmak icin bu pencerede Ctrl+C yapin veya pencereyi kapatin.")
         print("!" * 78)
         answer = args.onay or input_fn("  Onayliyorsaniz buyuk harflerle EVET yazip Enter'a basin: ")
@@ -277,6 +341,7 @@ def run_bot(
                 "profile": profile.key,
                 "symbol": ",".join(scan_symbols) if multi_scan else symbol,
                 "interval": profile.interval,
+                "leverage": base_settings.leverage,
                 "pid": os.getpid(),
                 "started_iso": started_iso,
             }
@@ -295,15 +360,17 @@ def run_bot(
             now_iso = datetime.now(timezone.utc).isoformat()
             storage.set_state(RUNNER_HEARTBEAT_KEY, now_iso)
 
-            if storage.get_state(RUNNER_STOP_KEY, "0") == "1":
+            if _stop_requested(storage):
                 log.info("Panelden durdurma istegi alindi; bot guvenli sekilde kapatiliyor.")
                 break
 
-            settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+            settings = profile.apply_to_risk_settings(
+                eng.default_risk_settings(), leverage=leverage_override
+            )
 
             # Canlı modda döngü başında bakiyeyi 1 kez senkronize et (10 paritede 10 ayrı hesap çağrısını önler)
             prefetched_live = False
-            if is_live and getattr(eng, "live_executor", None) is not None:
+            if is_live_spot and getattr(eng, "live_executor", None) is not None:
                 try:
                     eng.live_executor.fetch_live_spot_balances(
                         ui_live_confirmed=True, quote_asset=quote
@@ -311,6 +378,14 @@ def run_bot(
                     prefetched_live = True
                 except Exception as exc:
                     log.warning("Canli bakiye on-okuma uyarisi: %s", exc)
+            elif is_live_margin and getattr(eng, "live_margin_executor", None) is not None:
+                try:
+                    eng.live_margin_executor.fetch_live_margin_balances(
+                        ui_live_confirmed=True, ui_margin_confirmed=True, quote_asset=quote
+                    )
+                    prefetched_live = True
+                except Exception as exc:
+                    log.warning("Canli marjin bakiye on-okuma uyarisi: %s", exc)
 
             # Önce tüm açık pozisyonları kontrol et (zarar-kes / kâr-al / SAT), boş yer varsa diğer coinleri tara
             open_now = storage.get_open_positions(track=track)
@@ -324,6 +399,8 @@ def run_bot(
             cycle_summaries: list[str] = []
             for sym in cycle_symbols:
                 storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
+                if _stop_requested(storage):
+                    break
                 # Açık olmayan bir adaya bakarken kapasite dolduysa yeni alım aramayı kes
                 cur_open = storage.get_open_positions(track=track)
                 cur_open_syms = {p.symbol for p in cur_open}
@@ -335,7 +412,7 @@ def run_bot(
                         if args.ai == "zorla"
                         else (False if (args.ai == "kapali" or profile.direct_rule_execution) else True)
                     )
-                    res = eng.run_analysis_step(
+                    step_kwargs = dict(
                         symbol=sym,
                         interval=profile.interval,
                         settings=settings,
@@ -343,11 +420,15 @@ def run_bot(
                         daily_ai_limit_override=profile.ai_daily_call_limit,
                         min_ai_interval_override=profile.ai_min_call_interval_seconds,
                         execution_mode=execution_mode,
-                        ui_live_confirmed=is_live,
+                        ui_live_confirmed=is_any_live,
                         strategy_params=profile.strategy,
                         ai_only_on_rule_signal=multi_scan,
                         skip_balance_prefetch=prefetched_live,
+                        stop_requested=lambda: _stop_requested(storage),
                     )
+                    if is_live_margin:
+                        step_kwargs["ui_margin_confirmed"] = True
+                    res = eng.run_analysis_step(**step_kwargs)
                 except Exception as exc:  # Ağ/geçici hata: botu çökertme, bekle ve yeniden dene
                     cycle_ok = False
                     log.exception("Dongu hatasi (%s): %s", sym, exc)
@@ -379,12 +460,20 @@ def run_bot(
                 ):
                     break
 
+            if _stop_requested(storage):
+                log.info("Durdurma istegi alindi; kalan coinler taranmadan bot kapatiliyor.")
+                break
+
             # Açık pozisyonların tamamı için her döngüde anlık Kâr/Zarar durumunu yazdır
             open_after = storage.get_open_positions(track=track)
             mc = getattr(eng, "market_client", None)
             if open_after and mc is not None:
-                est_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+                est_settings = profile.apply_to_risk_settings(
+                    eng.default_risk_settings(), leverage=leverage_override
+                )
                 for p_open in open_after:
+                    if _stop_requested(storage):
+                        break
                     try:
                         ob = mc.fetch_order_book(p_open.symbol, depth_limit=5)
                         if ob.best_bid is not None:
@@ -424,7 +513,9 @@ def run_bot(
             if consecutive_errors >= 3:
                 delay = min(profile.loop_seconds * (2 ** min(consecutive_errors - 2, 4)), 600)
                 log.warning("Ust uste %s hatali dongu; %s sn beklenecek.", consecutive_errors, delay)
-            sleep_fn(delay)
+            if not _wait_with_heartbeat(storage, delay, sleep_fn):
+                log.info("Bekleme sirasinda durdurma istegi alindi; bot kapatiliyor.")
+                break
     except KeyboardInterrupt:
         log.info("Ctrl+C alindi; bot durduruluyor. (Acik pozisyon varsa panelden yonetebilirsiniz.)")
         exit_code = 0
@@ -433,7 +524,7 @@ def run_bot(
         storage.set_state(RUNNER_STOP_KEY, "0")
         _keep_windows_awake(False)
         lock.release()
-        open_pos = storage.get_open_positions(track="LIVE_SPOT" if is_live else "MAIN")
+        open_pos = storage.get_open_positions(track=track)
         if open_pos:
             pos_desc = ", ".join(f"{p.symbol} ({p.quantity} @ {p.entry_price})" for p in open_pos)
             log.warning(

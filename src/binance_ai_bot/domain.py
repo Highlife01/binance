@@ -214,6 +214,8 @@ class RiskSettings:
     stop_loss_pct: Decimal = Decimal("0.025")
     take_profit_pct: Decimal = Decimal("0.045")
     allow_stablecoin_conversion: bool = False
+    leverage: int = 1  # 1 = Kaldıraçsız Spot, 2..5 = Çapraz Marjin / Sanal Kaldıraç çarpanı
+    hourly_margin_interest_rate: Decimal = Decimal("0.000005")  # ~%0.0005/saat (~%0.012/gün)
 
 
 @dataclass(frozen=True)
@@ -233,7 +235,7 @@ class Position:
     symbol: str
     quantity: Decimal
     entry_price: Decimal
-    cost_basis_usdc: Decimal       # Komisyon hariç net varlık maliyeti
+    cost_basis_usdc: Decimal       # Komisyon hariç toplam pozisyon büyüklüğü (teminat + borç)
     entry_fee_usdc: Decimal        # Girişte ödenen komisyon
     opened_at_iso: str
     signal_key: str
@@ -246,6 +248,9 @@ class Position:
     exit_fee_usdc: Decimal = Decimal("0")
     realized_pnl_usdc: Decimal = Decimal("0")
     close_reason: str | None = None
+    leverage: int = 1
+    borrowed_usdc: Decimal = Decimal("0")
+    liquidation_price: Decimal | None = None
 
 
 @dataclass(frozen=True)

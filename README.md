@@ -14,7 +14,7 @@ Windows 10/11 bilgisayarınızda yerel olarak (`127.0.0.1`) çalışan, Türkçe
 Yönetici yetkisi gerekmez. Windows Güvenlik Duvarı veya antivirüs yazılımınızı **kapatmayın**.
 
 1. Klasördeki **`kurulum.bat`** dosyasına çift tıklayın.
-   - Otomatik olarak `.venv` sanal ortamını oluşturur, sabitlenmiş kütüphaneleri yükler, `.env` dosyasını hazırlar ve 11 adet güvenlik/doğrulama testini çalıştırır.
+   - Otomatik olarak `.venv` sanal ortamını oluşturur, sabitlenmiş kütüphaneleri yükler, `.env` dosyasını hazırlar ve güvenlik/doğrulama testlerini çalıştırır.
 2. Kurulum tamamlandıktan sonra **`baslat.bat`** dosyasına çift tıklayın.
    - Tarayıcınızda yalnızca sizin bilgisayarınızdan erişilebilen `http://127.0.0.1:8501` adresinde Türkçe kontrol paneli açılır.
 3. Testleri istediğiniz zaman doğrulamak için **`testleri_calistir.bat`** dosyasına çift tıklayabilir veya terminalde şu komutu çalıştırabilirsiniz:
@@ -84,8 +84,9 @@ kesintisiz çalışma için:
 
 | Dosya | Ne yapar |
 |---|---|
-| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan **Hızlı Aktif (`30 sn` döngü, `1m` mum)** profili ile 10 coini tarar, aynı anda en fazla 5 farklı coinde pozisyon tutar ve anlık K/Z gösterir |
-| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile 10 coini **30 sn döngüyle** tarar; aynı anda en fazla 5 farklı coinde (`5 × 10 USDT = maks 50 USDT`) canlı Spot alım-satım yapar |
+| `bot_sanal.bat` | **Sanal Deneme (`2x` Kaldıraç)** — gerçek bakiyeye dokunmadan **Hızlı Aktif (`30 sn` döngü, `1m` mum, `2x` kaldıraç)** profili ile 10 coini tarar, aynı anda en fazla 5 farklı coinde pozisyon tutar ve anlık K/Z + likidasyon mesafesi gösterir |
+| `bot_canli.bat` | **Gerçek Para (`1x` Spot)** — `.env` kilidi + konsolda `EVET` onayı ile 10 coini **30 sn döngüyle** tarar; aynı anda en fazla 5 farklı coinde (`5 × 10 USDT = maks 50 USDT`) borçsuz canlı Spot alım-satım yapar |
+| `bot_marjin.bat` | **Gerçek Çapraz Marjin (`2x` Kaldıraç)** — 3 güvenlik kilidi + konsolda `EVET` onayı ile yalnızca Cross Margin cüzdanınıza ayırdığınız teminat üzerinden `MARGIN_BUY` / `AUTO_REPAY` ile `2x` kaldıraçlı alım-satım yapar (`marginLevel >= 1.50` korumalı) |
 
 - Çoklu coin taraması hem **Sanal** hem **Canlı Spot** modunda ve web panelinde aktiftir: her 30 saniyede önce tüm açık pozisyonların zarar-kes / kâr-al / SAT çıkışı denetlenir, ardından boş slot varsa diğer coinler taranır. Aynı coine üst üste ekleme (Martingale) kesinlikle yapılmaz.
 
@@ -98,3 +99,24 @@ kesintisiz çalışma için:
 - Bot çalıştığı sürece Windows uykuya geçmez. Durdurmak için `Ctrl+C`, pencereyi kapatmak veya paneldeki **Arka Plan Botunu Durdur**.
 - Kayıtlar: `logs/bot_YYYY-MM-DD.log`.
 - Daha sık işlem daha fazla komisyon demektir; kâr garantisi yoktur.
+
+## Emir Güvenliği ve Sonuçların Doğrulanması
+
+- Panel, arka plan botu ve manuel kapatma aynı portföy emir kilidini paylaşır. Sanal işlemde nakit, pozisyon, emir ve sinyal kaydı birlikte tamamlanır; kayıt hatasında tamamı geri alınır.
+- Canlı emir gönderilmeden önce sabit kimlikli emir niyeti kalıcı olarak kaydedilir. Yanıt kaybolursa veya program kapanırsa aynı emir yeniden gönderilmez: `GET /api/v3/order` ve gerektiğinde `GET /api/v3/myTrades` ile borsadaki durum doğrulanır. Belirsizlik çözülene kadar yeni alım bekletilir. Bu davranış Binance'in [zaman aşımı açıklamasıyla](https://developers.binance.com/en/docs/products/spot/rest-api) uyumludur.
+- Kısmi satış yalnızca gerçekleşen miktarı kapatır. Kalan miktar ve minimum satış tutarının altındaki küçük bakiye kayıtta korunur. Baz varlıktan kesilen alış komisyonu iki kez maliyete eklenmez.
+- Canlı alışlarda motor, onaylı para tutarını `quoteOrderQty` olarak gönderir. Emir sonrası kullanılabilir nakit yeniden hesaplanmak yerine borsadan okunur; yeniden başlatma aynı emri bakiyeden ikinci kez düşmez.
+- BNB gibi üçüncü bir varlıkta kesilen komisyonun USDT/USDC değeri doğrulanamıyorsa ham varlık ve tutar saklanır, kâr/zararın geçici olduğu belirtilir ve yeni canlı alımlar bekletilir. `live_unvalued_commissions` kaydını silmek bir değerleme çözümü değildir; doğrulanmış değerleme olmadan kilit kaldırılmamalıdır. Mevcut pozisyonların koruyucu satışları devam edebilir.
+- Günlük zarar ve yeni alım kontrollerinde bütün açık coinlerin güncel fiyatı kullanılır. Bir fiyat alınamazsa yeni alım yapılmaz. Mevcut coinin geçerli fiyatla zarar-kes/kâr-al denetimi devam eder. Günlük otomatik durdurma ertesi İstanbul gününde kaldırılır; kullanıcı durdurması ayrıca korunur.
+- Her portföy izi tek para birimine bağlanır. USDT geçmişi USDC bakiyesiyle birleştirilemez; diğer para birimi için ayrı veritabanı kullanılır. Eski geçmişte iki para birimi zaten karışmışsa yeni alım engellenir. Modu bilinmeyen eski grafik/karar satırları yeni sanal veya canlı eğriye eklenmez.
+- Durdurma isteği her coin öncesinde ve canlı emrin gönderiminden hemen önce kontrol edilir. Uzun hata beklemeleri 5 saniyelik aralıklarla kesilebilir; botun canlılık bilgisi bu sırada güncellenir. Başlamış bir ağ isteğinin sonucu ayrıca doğrulanır.
+
+Geçmiş test artık seçilen profilin aynı strateji parametrelerini, günlük giriş/zarar sınırlarını ve gerçek veri seçildiğinde paritenin güncel borsa filtrelerini kullanır. Mum içindeki sıralama bilinmediğinde zarar-kes önce gerçekleşmiş sayılır; fiyat boşluğunda erişilemeyen hedef fiyattan dolum yazılmaz. Bu, tek parite için muhafazakâr bir OHLC modelidir; 30 saniyelik gerçek piyasa akışının veya eşzamanlı çoklu coin portföyünün birebir tekrarı değildir. Güncel borsa filtreleri geçmişteki kurallarla farklı olabilir. Sentetik seri yalnızca motor gösterimidir. Kaldıraçlı geçmiş test bu Spot doğrulama yolunda desteklenmez.
+
+Test paketi gerçek Binance/Gemini hesabına bağlanmadan sahte yanıtlar ve geçici veritabanlarıyla çalışır:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Panel testleri ekran bileşenlerini doğrular; Windows test ortamındaki yerel socket kurulumundan bağımsız bir çizim adaptörü kullanır. Gerçek sunucu bağlantısını veya gerçek emir gönderimini doğruladıkları anlamına gelmez. Kod güncellemeleri çalışan eski bot sürecine kendiliğinden yüklenmez; güncel kodu kullanmak için süreç yeniden başlatılmalıdır.

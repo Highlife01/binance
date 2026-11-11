@@ -24,10 +24,13 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.lock
+*.execution.lock
 logs/
 exports/*.csv
 
-# Isletim sistemi gecici dosyalari
+# Isletim sistemi ve araclari gecici dosyalari
 Thumbs.db
 Desktop.ini
 .DS_Store
+firebase-debug.log
+.firebase/

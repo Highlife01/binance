@@ -12,6 +12,8 @@ Güvenlik ve tasarım ilkeleri:
 from __future__ import annotations
 
 import json
+import hashlib
+from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
@@ -140,9 +142,13 @@ class GeminiDecisionAdvisor:
             )
 
         model_name = self.config.gemini_model
+        rule_context = hashlib.sha256(json.dumps(
+            {"signal": asdict(tech_signal), "external_notes": external_notes or []},
+            sort_keys=True, ensure_ascii=False, default=str,
+        ).encode("utf-8")).hexdigest()[:20]
         cache_key = (
             f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:"
-            f"{model_name}:pos={int(has_open_position)}"
+            f"{model_name}:pos={int(has_open_position)}:rule={rule_context}"
         )
 
         # 3. Önbellek kontrolü: Aynı kapanmış mum için tekrar API çağrısı yapma
@@ -177,7 +183,8 @@ class GeminiDecisionAdvisor:
                 pass
 
         # 4. Günlük kullanım sınırı kontrolü (Europe/Istanbul gününe göre)
-        daily_limit = daily_call_limit_override or self.config.ai_daily_call_limit
+        daily_limit = (daily_call_limit_override if daily_call_limit_override is not None
+                       else self.config.ai_daily_call_limit)
         used_today = self.storage.count_daily_ai_network_calls(istanbul_date)
         if used_today >= daily_limit:
             return AIDecisionRecord(
@@ -243,6 +250,9 @@ class GeminiDecisionAdvisor:
         prompt_json = json.dumps(safe_payload, ensure_ascii=False)
 
         # 7. Gemini API çağrısı ve katı şema doğrulaması
+        prompt_toks = 0
+        output_toks = 0
+        est_cost = Decimal("0")
         try:
             raw_text, prompt_toks, output_toks = self._invoke_gemini_sdk(
                 prompt_json, model_name, self.config.ai_timeout_seconds
@@ -295,9 +305,9 @@ class GeminiDecisionAdvisor:
                 cache_key=cache_key,
                 model_name=model_name,
                 from_cache=False,
-                prompt_tokens=0,
-                output_tokens=0,
-                estimated_cost_usd=Decimal("0"),
+                prompt_tokens=prompt_toks,
+                output_tokens=output_toks,
+                estimated_cost_usd=est_cost,
                 response_payload=None,
                 status=f"ERROR:{type(exc).__name__}",
             )
@@ -310,6 +320,9 @@ class GeminiDecisionAdvisor:
                 mode_label="GEMINI_HATA_BEKLE",
                 model_name=model_name,
                 from_cache=False,
+                prompt_tokens=prompt_toks,
+                output_tokens=output_toks,
+                estimated_cost_usd=est_cost,
                 pricing_verified=self.config.ai_pricing_verified,
                 error_detail=safe_err,
             )

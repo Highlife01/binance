@@ -13,9 +13,12 @@ Kronolojik Doğrulama (Backtest) ve Küçük Bakiye Maliyet Uygulanabilirlik Mod
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
-from .domain import Candle, RiskSettings
+from .domain import Candle, RiskSettings, SymbolFilters, quantize_down
+from .security import STABLECOIN_OR_FIAT_ASSETS
 from .strategy import (
     StrategyParams,
     compute_indicator_frame,
@@ -24,6 +27,25 @@ from .strategy import (
 
 MIN_CANDLES_FOR_SPLIT = 120
 MIN_TRADES_FOR_STATISTICAL_NOTE = 15
+
+
+def _validate_candles(candles: list[Candle]) -> None:
+    """Reject ambiguous historical input instead of silently changing its chronology."""
+    previous_close = -1
+    for candle in candles:
+        values = (candle.open, candle.high, candle.low, candle.close)
+        if not candle.is_closed:
+            raise ValueError("Geçmiş test yalnızca kapanmış mumları kabul eder.")
+        if (candle.open_time_ms <= previous_close
+                or candle.close_time_ms < candle.open_time_ms):
+            raise ValueError("Mumlar kronolojik, benzersiz ve çakışmasız olmalıdır.")
+        if (any(not value.is_finite() or value <= 0 for value in values)
+                or candle.high < max(candle.open, candle.close)
+                or candle.low > min(candle.open, candle.close)
+                or candle.low > candle.high
+                or not candle.volume.is_finite() or candle.volume < 0):
+            raise ValueError("Geçmiş test verisinde geçersiz OHLC/hacim değeri var.")
+        previous_close = candle.close_time_ms
 
 
 @dataclass(frozen=True)
@@ -87,12 +109,23 @@ def run_no_lookahead_slice_simulation(
     initial_balance_usdc: Decimal = Decimal("86.00"),
     half_spread_bps: Decimal = Decimal("1.5"),
     estimated_cost_per_ai_eval_usd: Decimal = Decimal("0"),
+    symbol_filters: SymbolFilters | None = None,
 ) -> SliceBacktestMetrics:
     """
     Nedensel (event-driven, lookahead-free) dilim simülasyonu:
     - Sinyal `t` indeksinde YALNIZCA `candles[:t+1]` kullanılarak hesaplanır.
-    - İşlem dolumu `t+1` mumunun açılış fiyatında (`candles[t+1].open`) gerçekleşir!
+    - Giriş/sinyal çıkışı t+1 açılışında; koruyucu çıkışlar OHLC temas modeliyle uygulanır.
+    - Mum içindeki sıra bilinmediğinden uzun pozisyonda olumsuz temas önce işlenir.
     """
+    _validate_candles(candles)
+    if settings.leverage != 1:
+        raise ValueError("Bu geçmiş test yalnızca kaldıraçsız Spot işlemleri doğrular.")
+    if not 0 <= eval_start_idx <= eval_end_idx <= len(candles):
+        raise ValueError("Geçmiş test dilim sınırları geçersiz.")
+    if not initial_balance_usdc.is_finite() or initial_balance_usdc <= 0:
+        raise ValueError("Başlangıç bakiyesi sonlu ve pozitif olmalıdır.")
+    if symbol_filters is not None and symbol_filters.symbol != symbol:
+        raise ValueError("Borsa filtrelerinin paritesi test edilen pariteyle eşleşmiyor.")
     slice_candles = candles[eval_start_idx:eval_end_idx]
     if len(slice_candles) < 10 or eval_end_idx - eval_start_idx < 10:
         return SliceBacktestMetrics(
@@ -127,6 +160,11 @@ def run_no_lookahead_slice_simulation(
     trade_count = 0
     winning_trades = 0
     ai_cost_total = Decimal("0")
+    daily_entries = 0
+    daily_realized = Decimal("0")
+    current_day = ""
+    entries_paused = False
+    istanbul = ZoneInfo("Europe/Istanbul")
 
     peak_equity = initial_balance_usdc
     max_dd_usdc = Decimal("0")
@@ -135,6 +173,69 @@ def run_no_lookahead_slice_simulation(
     friction_bps = half_spread_bps + settings.extra_slippage_bps
     buy_mult = Decimal("1") + (friction_bps / Decimal("10000"))
     sell_mult = Decimal("1") - (friction_bps / Decimal("10000"))
+    if not 0 < sell_mult <= 1 or not 0 <= settings.estimated_fee_rate < 1:
+        raise ValueError("Komisyon/kayma varsayımları geçersiz.")
+
+    def mark_equity(raw_price: Decimal) -> None:
+        nonlocal peak_equity, max_dd_usdc, max_dd_pct
+        value = cash + open_qty * raw_price * sell_mult * (Decimal("1") - settings.estimated_fee_rate)
+        peak_equity = max(peak_equity, value)
+        drawdown = peak_equity - value
+        max_dd_usdc = max(max_dd_usdc, drawdown)
+        if peak_equity > 0:
+            max_dd_pct = max(max_dd_pct, drawdown / peak_equity * Decimal("100"))
+
+    def check_daily_guard(raw_price: Decimal) -> bool:
+        nonlocal entries_paused
+        unrealized = (
+            open_qty * raw_price * sell_mult * (Decimal("1") - settings.estimated_fee_rate)
+            - entry_total_outflow if open_qty > 0 else Decimal("0")
+        )
+        breached = max(Decimal("0"), -(daily_realized + unrealized)) >= settings.daily_loss_limit_usdc
+        entries_paused = entries_paused or breached
+        return breached
+
+    def permitted_quantity(qty: Decimal, price: Decimal) -> Decimal:
+        if symbol_filters is None:
+            return qty
+        filt = symbol_filters
+        step = filt.market_step_size if filt.market_step_size > 0 else filt.step_size
+        positive_caps = [value for value in (filt.max_qty, filt.market_max_qty) if value > 0]
+        if positive_caps:
+            qty = min(qty, min(positive_caps))
+        qty = quantize_down(qty, step)
+        minimum = max(filt.min_qty, filt.market_min_qty)
+        notional = qty * price
+        if (qty <= 0 or qty < minimum
+                or (filt.apply_min_to_market and notional < filt.min_notional)
+                or (filt.max_notional > 0 and notional > filt.max_notional)):
+            return Decimal("0")
+        return qty
+
+    def close_position(raw_price: Decimal) -> bool:
+        nonlocal cash, open_qty, entry_total_outflow, entry_price
+        nonlocal total_fees, trade_count, winning_trades, daily_realized
+        execution_price = raw_price * sell_mult
+        quantity = permitted_quantity(open_qty, execution_price)
+        # A partial/dust remainder stays open; historical fills cannot bypass exchange rules.
+        if quantity <= 0:
+            return False
+        allocated_cost = entry_total_outflow * quantity / open_qty
+        gross = quantity * execution_price
+        fee = gross * settings.estimated_fee_rate
+        pnl = gross - fee - allocated_cost
+        cash += gross - fee
+        total_fees += fee
+        daily_realized += pnl
+        trade_count += 1
+        winning_trades += int(pnl > 0)
+        open_qty -= quantity
+        entry_total_outflow -= allocated_cost
+        if open_qty <= 0:
+            entry_price = Decimal("0")
+            entry_total_outflow = Decimal("0")
+        check_daily_guard(raw_price)
+        return True
 
     # t mumunun kapanışında sinyal üretilir -> t+1 mumunun açılışında uygulanır (eval_end_idx - 1 son uygulanabilir t'dir)
     start_t = max(eval_start_idx, 35)
@@ -144,10 +245,17 @@ def run_no_lookahead_slice_simulation(
         )
         ai_cost_total += estimated_cost_per_ai_eval_usd
         next_bar = candles[t + 1]
+        bar_day = datetime.fromtimestamp(next_bar.open_time_ms / 1000, tz=timezone.utc).astimezone(istanbul).date().isoformat()
+        if bar_day != current_day:
+            current_day = bar_day
+            daily_entries = 0
+            daily_realized = Decimal("0")
+            entries_paused = False
 
-        # Açık pozisyon varsa önce t+1 açılışında zarar-kes / kâr-al / SAT kontrolü
+        # Existing positions are protected even when new entries have been paused.
+        breached_at_open = check_daily_guard(next_bar.open)
+        exited_at_open = False
         if open_qty > Decimal("0"):
-            exec_sell_price = next_bar.open * sell_mult
             stop_hit = (
                 settings.stop_loss_pct > 0
                 and next_bar.open <= entry_price * (Decimal("1") - settings.stop_loss_pct)
@@ -156,49 +264,72 @@ def run_no_lookahead_slice_simulation(
                 settings.take_profit_pct > 0
                 and next_bar.open >= entry_price * (Decimal("1") + settings.take_profit_pct)
             )
-            if sig.action == "SAT" or stop_hit or tp_hit:
-                gross_proceeds = open_qty * exec_sell_price
-                exit_fee = gross_proceeds * settings.estimated_fee_rate
-                net_proceeds = gross_proceeds - exit_fee
-                pnl = net_proceeds - entry_total_outflow
-                cash += net_proceeds
-                total_fees += exit_fee
-                trade_count += 1
-                if pnl > Decimal("0"):
-                    winning_trades += 1
-                open_qty = Decimal("0")
-                entry_total_outflow = Decimal("0")
-                entry_price = Decimal("0")
+            if (sig.action == "SAT" or stop_hit or tp_hit
+                    or (breached_at_open and settings.daily_limit_exit_policy == "AUTO_CLOSE")):
+                mark_equity(next_bar.open)
+                exited_at_open = close_position(next_bar.open)
 
-        elif sig.action == "AL":
+        elif (sig.action == "AL" and not entries_paused
+                and daily_entries < settings.max_daily_new_positions
+                and settings.max_open_positions >= 1):
             exec_buy_price = next_bar.open * buy_mult
             max_gross = min(
                 settings.max_position_size_usdc,
                 cash / (Decimal("1") + settings.estimated_fee_rate),
             )
-            if max_gross >= Decimal("5.0") and exec_buy_price > Decimal("0"):
-                qty = max_gross / exec_buy_price
+            filters_allow = (
+                symbol_filters is None or (
+                    symbol_filters.is_tradable_spot_for_quote()
+                    and (settings.allow_stablecoin_conversion
+                         or symbol_filters.base_asset not in STABLECOIN_OR_FIAT_ASSETS)
+                )
+            )
+            if max_gross > 0 and exec_buy_price > 0 and filters_allow:
+                qty = permitted_quantity(max_gross / exec_buy_price, exec_buy_price)
                 gross_cost = qty * exec_buy_price
                 entry_fee = gross_cost * settings.estimated_fee_rate
                 total_out = gross_cost + entry_fee
-                if total_out <= cash:
+                if qty > 0 and total_out <= cash:
                     cash -= total_out
                     open_qty = qty
                     entry_price = exec_buy_price
                     entry_total_outflow = total_out
                     total_fees += entry_fee
+                    daily_entries += 1
 
-        # t+1 kapanışında anlık özsermaye ve maksimum düşüş (drawdown) takibi
-        mark_val = open_qty * (next_bar.close * sell_mult) * (Decimal("1") - settings.estimated_fee_rate)
-        equity = cash + mark_val
-        if equity > peak_equity:
-            peak_equity = equity
-        dd_usdc = peak_equity - equity
-        dd_pct = (dd_usdc / peak_equity) * Decimal("100") if peak_equity > 0 else Decimal("0")
-        if dd_usdc > max_dd_usdc:
-            max_dd_usdc = dd_usdc
-        if dd_pct > max_dd_pct:
-            max_dd_pct = dd_pct
+        if open_qty > 0 and not exited_at_open:
+            # Model the adverse excursion first. A gap fills at the open, not at an
+            # unavailable stop price; simultaneous stop/target touches choose the stop.
+            adverse_levels: list[Decimal] = []
+            if settings.stop_loss_pct > 0:
+                stop_level = entry_price * (Decimal("1") - settings.stop_loss_pct)
+                if next_bar.low <= stop_level:
+                    adverse_levels.append(min(next_bar.open, stop_level))
+            if settings.daily_limit_exit_policy == "AUTO_CLOSE":
+                loss_level = (entry_total_outflow - daily_realized - settings.daily_loss_limit_usdc) / (
+                    open_qty * sell_mult * (Decimal("1") - settings.estimated_fee_rate)
+                )
+                if loss_level > 0 and next_bar.low <= loss_level:
+                    adverse_levels.append(min(next_bar.open, loss_level))
+            if adverse_levels:
+                exit_reference = max(adverse_levels)
+                check_daily_guard(exit_reference)
+                mark_equity(exit_reference)
+                if not close_position(exit_reference):
+                    check_daily_guard(next_bar.low)
+                    mark_equity(next_bar.low)
+            else:
+                check_daily_guard(next_bar.low)
+                target = entry_price * (Decimal("1") + settings.take_profit_pct)
+                if settings.take_profit_pct > 0 and next_bar.high >= target:
+                    mark_equity(next_bar.low)
+                    close_position(max(next_bar.open, target))
+                elif open_qty > 0:
+                    # With no target exit, high-before-low gives the conservative
+                    # drawdown bound for an OHLC bar whose event order is unknown.
+                    mark_equity(next_bar.high)
+                    mark_equity(next_bar.low)
+        mark_equity(next_bar.close)
 
     # Dilim sonunda açık pozisyon kaldıysa son kapanış alış değerinden değerle
     last_close = slice_candles[-1].close
@@ -240,6 +371,14 @@ def run_no_lookahead_slice_simulation(
             f"%{net_ret_pct:+.2f}, Maks. Düşüş: %{max_dd_pct:.2f}, Komisyon: {total_fees:.3f} USDC). "
             "Geçmiş performans gelecekteki getiriyi garanti etmez."
         )
+    verdict += (
+        " Tek parite Spot simülasyonu; mum içi temaslarda zarar-kes önce uygulanır."
+        " Günlük giriş/risk kilidi İstanbul gününde sıfırlanır; manuel duraklatmalar modellenmez."
+    )
+    if symbol_filters is None:
+        verdict += " Borsa filtreleri sağlanmadı; minimum tutar/miktar ve adım uygunluğu doğrulanmadı."
+    else:
+        verdict += " Sağlanan borsa filtreleri uygulanır; geçmiş dönemdeki filtre değişiklikleri modellenmez."
 
     return SliceBacktestMetrics(
         slice_name=slice_name,
@@ -270,12 +409,18 @@ def run_chronological_validation(
     interval: str,
     settings: RiskSettings,
     initial_balance_usdc: Decimal = Decimal("86.00"),
+    strategy_params: StrategyParams | None = None,
+    symbol_filters: SymbolFilters | None = None,
 ) -> ChronologicalValidationReport:
     """
     Veriyi kronolojik olarak %60 Eğitim / %20 Doğrulama / %20 Test dilimlerine böler.
-    Parametre seçimi yalnızca Eğitim+Doğrulama diliminde yapılır; Test dilimi el değmemiş kalır.
+    strategy_params verilirse seçili strateji değiştirilmeden üç dilimde doğrulanır.
+    Verilmezse parametre seçimi Eğitim+Doğrulama dilimindedir; Test dilimi el değmemiş kalır.
     """
-    clean_candles = sorted([c for c in closed_candles if c.is_closed], key=lambda c: c.open_time_ms)
+    _validate_candles(closed_candles)
+    if settings.leverage != 1:
+        raise ValueError("Bu geçmiş test yalnızca kaldıraçsız Spot işlemleri doğrular.")
+    clean_candles = list(closed_candles)
     n = len(clean_candles)
 
     if n < MIN_CANDLES_FOR_SPLIT:
@@ -306,7 +451,7 @@ def run_chronological_validation(
             symbol=symbol,
             interval=interval,
             total_candles=n,
-            selected_params=StrategyParams(),
+            selected_params=strategy_params or StrategyParams(),
             train_metrics=empty_m,
             validation_metrics=empty_m,
             test_metrics=empty_m,
@@ -317,7 +462,7 @@ def run_chronological_validation(
     train_end = int(n * 0.60)
     val_end = int(n * 0.80)
 
-    candidates = [
+    candidates = [strategy_params] if strategy_params is not None else [
         StrategyParams(ema_fast_span=9, ema_slow_span=21, rsi_buy_min=44.0, rsi_buy_max=68.0),
         StrategyParams(ema_fast_span=12, ema_slow_span=26, rsi_buy_min=46.0, rsi_buy_max=66.0),
         StrategyParams(ema_fast_span=8, ema_slow_span=24, rsi_buy_min=45.0, rsi_buy_max=70.0),
@@ -339,6 +484,7 @@ def run_chronological_validation(
             params=cand,
             settings=settings,
             initial_balance_usdc=initial_balance_usdc,
+            symbol_filters=symbol_filters,
         )
         va_m = run_no_lookahead_slice_simulation(
             clean_candles,
@@ -350,6 +496,7 @@ def run_chronological_validation(
             params=cand,
             settings=settings,
             initial_balance_usdc=initial_balance_usdc,
+            symbol_filters=symbol_filters,
         )
         # Doğrulama diliminde düşüş cezalı net getiri skoru (Test dilimine ASLA bakılmaz!)
         score = (tr_m.net_return_usdc * Decimal("0.4")) + (va_m.net_return_usdc * Decimal("0.6")) - va_m.max_drawdown_usdc
@@ -371,6 +518,7 @@ def run_chronological_validation(
         params=best_params,
         settings=settings,
         initial_balance_usdc=initial_balance_usdc,
+        symbol_filters=symbol_filters,
     )
 
     overall_insufficient = test_m.insufficient_data
@@ -386,6 +534,14 @@ def run_chronological_validation(
             f"(%{test_m.net_return_pct:+.2f}), Referans Al-Tut: %{test_m.benchmark_return_pct:+.2f}, "
             f"Maksimum Düşüş: %{test_m.max_drawdown_pct:.2f}, Toplam Komisyon: {test_m.total_fees_usdc:.3f} USDC."
         )
+    overall_verdict += (
+        " Seçili profil sabit tutularak doğrulandı; alternatif parametre seçilmedi."
+        if strategy_params is not None
+        else " Parametreler eğitim/doğrulama dilimlerinde seçildi; test dilimi seçime katılmadı."
+    )
+    overall_verdict += " Tek parite Spot testi; OHLC temas sırası belirsizse zarar-kes önce gelir."
+    if symbol_filters is None:
+        overall_verdict += " Borsa filtreleri sağlanmadığından emir uygunluğu doğrulanmadı."
 
     return ChronologicalValidationReport(
         symbol=symbol,

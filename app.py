@@ -1,5 +1,5 @@
 """
-Binance Global Spot (USDT / USDC) — Türkçe Yerel Web Kontrol Paneli (Streamlit, 127.0.0.1).
+Binance Global Spot & Çapraz Marjin (USDT / USDC) — Türkçe Yerel Web Kontrol Paneli (Streamlit, 127.0.0.1).
 
 Çalıştırma:
     baslat.bat
@@ -9,18 +9,59 @@ veya:
 
 from __future__ import annotations
 
+import dataclasses
+import importlib
 import os
 import sys
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 # Yerel paket yolunu ekle
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+ENGINE_STATE_VERSION = "1.9.0"
+
+
+def _ensure_fresh_backend_modules() -> None:
+    """Açık çalışan Streamlit sürecinde src/binance_ai_bot alt modülleri güncellendiğinde belleği tazeler."""
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    import binance_ai_bot
+
+    if getattr(binance_ai_bot, "_reloaded_version", None) == ENGINE_STATE_VERSION:
+        return
+    submodules = [
+        "binance_ai_bot.domain",
+        "binance_ai_bot.security",
+        "binance_ai_bot.config",
+        "binance_ai_bot.execution_safety",
+        "binance_ai_bot.storage",
+        "binance_ai_bot.market_data",
+        "binance_ai_bot.strategy",
+        "binance_ai_bot.profiles",
+        "binance_ai_bot.risk",
+        "binance_ai_bot.simulator",
+        "binance_ai_bot.live_executor",
+        "binance_ai_bot.margin_executor",
+        "binance_ai_bot.ai_advisor",
+        "binance_ai_bot.validation",
+        "binance_ai_bot.runner",
+        "binance_ai_bot.engine",
+    ]
+    for mod_name in submodules:
+        mod = importlib.import_module(mod_name)
+        importlib.reload(mod)
+    importlib.reload(binance_ai_bot)
+    setattr(binance_ai_bot, "_reloaded_version", ENGINE_STATE_VERSION)
+
+
+_ensure_fresh_backend_modules()
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -30,7 +71,7 @@ from binance_ai_bot import SIMULATION_MODE_LABEL
 from binance_ai_bot.config import AppConfig, load_config
 from binance_ai_bot.domain import Candle, RiskSettings
 from binance_ai_bot.engine import TradingSystemEngine
-from binance_ai_bot.market_data import MarketDataError
+from binance_ai_bot.market_data import INTERVAL_TO_MS, MarketDataError
 from binance_ai_bot.profiles import TRADING_PROFILES, get_profile
 from binance_ai_bot.risk import (
     EXIT_POLICY_DESCRIPTIONS_TR,
@@ -46,14 +87,14 @@ from binance_ai_bot.validation import (
 )
 
 st.set_page_config(
-    page_title="Binance Spot Kontrol Paneli",
+    page_title="Binance Spot & Marjin Kontrol Paneli",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
-def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
+def _generate_offline_demo_candles(count: int = 180, *, interval: str = "15m") -> list[Candle]:
     """
     Yalnızca 'Doğrulama / Backtest' sekmesinde ağ engeli varken kronolojik test motorunu
     incelemek için kullanılan deterministik örnek seri. Sanal veya canlı portföye DOKUNMAZ.
@@ -62,7 +103,7 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
 
     candles: list[Candle] = []
     base_ts = 1_760_000_000_000
-    step_ms = 900_000  # 15dk
+    step_ms = INTERVAL_TO_MS[interval]
     price = 92000.0
     for i in range(count):
         wave = math.sin(i / 7.5) * 420.0 + math.cos(i / 17.0) * 280.0
@@ -90,17 +131,24 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.7.0"
-
-
-def _fetch_live_bids(engine: TradingSystemEngine, symbols: list[str]) -> dict[str, Decimal]:
-    """Açık pozisyonların anlık en iyi alış (bid) fiyatlarını çeker; hata olursa o pariteyi atlar."""
+def _fetch_live_bids(
+    engine: TradingSystemEngine, symbols: list[str], *, refresh: bool = False
+) -> dict[str, Decimal]:
+    """Normal çizimde önbelleği kullanır; yalnızca açık yenileme isteğinde ağa gider."""
+    cache = st.session_state.setdefault("live_bid_cache", {})
     bids: dict[str, Decimal] = {}
     for sym in dict.fromkeys(symbols):
+        cached = cache.get(sym)
+        if cached and time.monotonic() - cached[0] <= 8:
+            bids[sym] = cached[1]
+            continue
+        if not refresh:
+            continue
         try:
             book = engine.market_client.fetch_order_book(sym, depth_limit=5)
             if book.best_bid is not None:
                 bids[sym] = book.best_bid
+                cache[sym] = (time.monotonic(), book.best_bid)
         except Exception:
             continue
     return bids
@@ -112,43 +160,77 @@ def _render_live_pnl(
     track: str,
     quote: str,
     tz,
+    *,
+    refresh: bool = False,
 ) -> None:
     """Anlık Kâr/Zarar bölümü (st.fragment ile yalnızca bu kısım periyodik yenilenir)."""
     storage = engine.storage
     open_positions = storage.get_open_positions(track=track)
     track_label = {
-        "LIVE_SPOT": "🔴 Gerçek Canlı Spot",
+        "LIVE_SPOT": "🔴 Gerçek Canlı Spot (1x)",
+        "LIVE_MARGIN": "⚡ Gerçek Canlı Çapraz Marjin",
         "MAIN": "🟢 Sanal Deneme",
     }.get(track, track)
     st.subheader(f"📈 Anlık Kâr / Zarar — {track_label}")
 
-    bids = _fetch_live_bids(engine, [p.symbol for p in open_positions])
+    bids = _fetch_live_bids(engine, [p.symbol for p in open_positions], refresh=refresh)
     summ = engine.get_portfolio_summary(settings, live_bid_by_symbol=bids, track=track)
+    valuation_complete = summ["valuation_complete"]
     total_pnl = summ["realized_pnl_usdc"] + summ["unrealized_pnl_usdc"]
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
         "Açık Pozisyon Anlık K/Z",
-        f"{summ['unrealized_pnl_usdc']:+.4f} {quote}",
-        help="Anlık alış fiyatı ile; giriş komisyonu ve tahmini çıkış komisyonu düşülmüş net değer.",
+        f"{summ['unrealized_pnl_usdc']:+.4f} {quote}" if valuation_complete else "—",
+        help="Anlık alış fiyatı ile; giriş komisyonu, tahmini çıkış komisyonu ve varsa marjin faizi düşülmüş net değer.",
     )
-    c2.metric("Bugünkü Net K/Z (İstanbul)", f"{summ['daily_net_pnl_usdc']:+.4f} {quote}")
-    c3.metric("Toplam Net K/Z (Gerçekleşen + Açık)", f"{total_pnl:+.4f} {quote}")
-    c4.metric("Anlık Portföy Değeri", f"{summ['total_equity_usdc']:.2f} {quote}")
+    c2.metric(
+        "Bugünkü Net K/Z (İstanbul)",
+        f"{summ['daily_net_pnl_usdc']:+.4f} {quote}" if valuation_complete else "—",
+    )
+    c3.metric(
+        "Toplam Net K/Z (Gerçekleşen + Açık)",
+        f"{total_pnl:+.4f} {quote}" if valuation_complete else "—",
+    )
+    c4.metric(
+        "Anlık Portföy Değeri",
+        f"{summ['total_equity_usdc']:.2f} {quote}" if valuation_complete else "—",
+    )
 
     if open_positions:
         rows = []
+        hourly_rate = getattr(settings, "hourly_margin_interest_rate", Decimal("0.000005"))
         for p in open_positions:
             bid = bids.get(p.symbol)
+            p_lev = getattr(p, "leverage", 1)
+            p_borrowed = getattr(p, "borrowed_usdc", Decimal("0"))
+            p_liq = getattr(p, "liquidation_price", None)
             if bid is None:
-                rows.append({"Parite": p.symbol, "Durum": "Anlık fiyat alınamadı"})
+                rows.append(
+                    {
+                        "Parite": p.symbol,
+                        "Kaldıraç": f"{p_lev}x",
+                        "Durum": "Anlık fiyat alınamadı",
+                    }
+                )
                 continue
-            gross_val, pnl = compute_open_position_unrealized_net_pnl(
-                p, current_bid=bid, estimated_fee_rate=settings.estimated_fee_rate
+            net_eq_val, pnl = compute_open_position_unrealized_net_pnl(
+                p,
+                current_bid=bid,
+                estimated_fee_rate=settings.estimated_fee_rate,
+                hourly_interest_rate=hourly_rate,
             )
-            cost = p.cost_basis_usdc + p.entry_fee_usdc
-            pnl_pct = (pnl / cost * Decimal("100")) if cost > 0 else Decimal("0")
-            move_pct = (bid - p.entry_price) / p.entry_price * Decimal("100") if p.entry_price > 0 else Decimal("0")
+            collateral_cost = (p.cost_basis_usdc - p_borrowed) + p.entry_fee_usdc
+            pnl_pct = (
+                (pnl / collateral_cost * Decimal("100"))
+                if collateral_cost > 0
+                else Decimal("0")
+            )
+            move_pct = (
+                (bid - p.entry_price) / p.entry_price * Decimal("100")
+                if p.entry_price > 0
+                else Decimal("0")
+            )
             sl_dist = (
                 f"%{(bid - p.stop_loss_price) / bid * Decimal('100'):.2f}"
                 if p.stop_loss_price
@@ -162,14 +244,17 @@ def _render_live_pnl(
             rows.append(
                 {
                     "Parite": p.symbol,
+                    "Kaldıraç": f"{p_lev}x",
                     "Durum": "🟢 Kârda" if pnl > 0 else "🔴 Zararda",
                     "Miktar": f"{p.quantity:.8f}",
                     "Giriş Fiyatı": f"{p.entry_price:.6g}",
                     "Anlık Fiyat": f"{bid:.6g}",
                     "Fiyat Değişimi": f"%{move_pct:+.2f}",
-                    f"Anlık Değer ({quote})": f"{gross_val:.4f}",
+                    f"Öz Değer ({quote})": f"{net_eq_val:.4f}",
+                    f"Borç ({quote})": f"{p_borrowed:.2f}" if p_borrowed > 0 else "-",
+                    "Likidasyon": f"{p_liq:.6g}" if p_liq else "-",
                     f"Net K/Z ({quote})": f"{pnl:+.4f}",
-                    "Net K/Z (%)": f"%{pnl_pct:+.2f}",
+                    "Teminata Göre (%)": f"%{pnl_pct:+.2f}",
                     "Zarar-Kes'e Uzaklık": sl_dist,
                     "Kâr-Al'a Uzaklık": tp_dist,
                 }
@@ -177,10 +262,15 @@ def _render_live_pnl(
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.caption("Şu anda açık pozisyon yok; yeni alım sinyali bekleniyor.")
+    if any(p.symbol not in bids for p in open_positions):
+        st.warning(
+            "Bazı açık pozisyonların güncel fiyatı yok. Güncel fiyatlar alınamadı; "
+            "toplam değer ve açık kâr/zarar gösterilmiyor. Anlık Fiyatları Şimdi Güncelle düğmesini kullanın."
+        )
 
     st.caption(
         f"Son güncelleme (İstanbul): {datetime.now(timezone.utc).astimezone(tz).strftime('%H:%M:%S')} "
-        "— Net K/Z, komisyonlar düşülerek hesaplanır."
+        "— Net K/Z, komisyonlar ve varsa saatlik marjin faizi düşülerek hesaplanır."
     )
 
 
@@ -192,7 +282,7 @@ def _render_live_pnl_fragment(
     quote: str,
     tz,
 ) -> None:
-    _render_live_pnl(engine, settings, track, quote, tz)
+    _render_live_pnl(engine, settings, track, quote, tz, refresh=True)
 
 
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
@@ -208,9 +298,12 @@ def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
         cfg.gemini_model,
         cfg.quote_asset,
     )
+    cur_eng = st.session_state.get("engine")
     if (
-        "engine" not in st.session_state
+        cur_eng is None
         or st.session_state.get("engine_fingerprint") != cfg_fingerprint
+        or not isinstance(cur_eng, TradingSystemEngine)
+        or not hasattr(cur_eng, "live_margin_executor")
     ):
         st.session_state["engine"] = TradingSystemEngine(cfg)
         st.session_state["engine_fingerprint"] = cfg_fingerprint
@@ -223,24 +316,29 @@ def main() -> None:
     settings = engine.default_risk_settings()
     ist_today = storage.istanbul_date_str()
 
-    # --- Yan Menü: Mod Seçimi, Parite ve Kontroller ---
+    # --- Yan Menü: Mod Seçimi, Kaldıraç, Parite ve Kontroller ---
     with st.sidebar:
         st.header("⚙️ Çalışma Ayarları")
 
         quote_options = ["USDT", "USDC"]
         default_quote_idx = quote_options.index(cfg.quote_asset) if cfg.quote_asset in quote_options else 0
         selected_quote = st.radio(
-            "Baz Para Birimi (Spot Cüzdan)",
+            "Baz Para Birimi (Spot / Marjin)",
             options=quote_options,
             index=default_quote_idx,
             horizontal=True,
-            help="Spot cüzdanınızda bulundurduğunuz ana bakiye para birimi (USDT veya USDC).",
+            help="Cüzdanınızda bulundurduğunuz ana bakiye para birimi (USDT veya USDC).",
         )
 
         # --- Kesintisiz Arka Plan Botu Durumu ---
         runner_alive, runner_info = is_runner_alive(storage)
         if runner_alive:
-            r_mode = "🔴 CANLI SPOT" if runner_info.get("mode") == "LIVE_SPOT" else "🟢 SANAL"
+            r_raw = runner_info.get("mode", "PAPER")
+            r_lev = runner_info.get("leverage", 1)
+            r_mode = {
+                "LIVE_MARGIN": f"⚡ CANLI ÇAPRAZ MARJİN ({r_lev}x)",
+                "LIVE_SPOT": "🔴 CANLI SPOT (1x)",
+            }.get(r_raw, f"🟢 SANAL ({r_lev}x)")
             st.success(
                 f"🤖 **Arka Plan Botu Çalışıyor** — {r_mode} | "
                 f"Profil: `{runner_info.get('profile', '?')}` | "
@@ -253,7 +351,8 @@ def main() -> None:
         else:
             st.caption(
                 "🤖 Arka plan botu kapalı. Kesintisiz alım-satım için proje klasöründeki "
-                "`bot_sanal.bat` (deneme) veya `bot_canli.bat` (gerçek para) dosyasını çalıştırın."
+                "`bot_sanal.bat` (2x sanal), `bot_canli.bat` (1x spot) veya `bot_marjin.bat` "
+                "(2x gerçek çapraz marjin) dosyasını çalıştırın."
             )
 
         profile_keys = list(TRADING_PROFILES.keys())
@@ -268,20 +367,44 @@ def main() -> None:
 
         mode_choice = st.radio(
             "İşlem Yürütme Modu",
-            options=["PAPER", "LIVE_SPOT"],
-            format_func=lambda m: (
-                f"🟢 Sanal Deneme ({cfg.initial_balance_usdc:.0f} {selected_quote} Sanal)"
-                if m == "PAPER"
-                else "🔴 Gerçek Para — Canlı Spot (Çift Kilitli)"
-            ),
+            options=["PAPER", "LIVE_SPOT", "LIVE_MARGIN"],
+            format_func=lambda m: {
+                "PAPER": f"🟢 Sanal Deneme ({cfg.initial_balance_usdc:.0f} {selected_quote} — 1x–5x Kaldıraç)",
+                "LIVE_SPOT": "🔴 Gerçek Para — Canlı Spot (1x Kaldıraçsız)",
+                "LIVE_MARGIN": "⚡ Gerçek Para — Canlı Çapraz Marjin (2x–5x Kaldıraçlı)",
+            }[m],
             index=0,
-            help="Varsayılan ve önerilen mod Sanal Deneme'dir. Gerçek bakiyenize dokunmaz.",
+            help=(
+                "Sanal Deneme gerçek bakiyenize dokunmaz. Canlı Spot borçsuz 1x çalışır. "
+                "Canlı Çapraz Marjin yalnızca Marjin cüzdanına aktardığınız teminatla 2x–5x kaldıraç kullanır."
+            ),
         )
 
+        # --- Kaldıraç Seçici (Varsayılan 2x: Sanal ve Çapraz Marjin'de aktif, Canlı Spot'ta 1x kilitli) ---
+        leverage_choices = [1, 2, 3, 5]
+        if mode_choice == "LIVE_SPOT":
+            selected_leverage = 1
+            st.caption("🔒 **Kaldıraç:** `1x` (Canlı Spot modunda borçlanma kapalıdır; kaldıraç için Sanal veya Çapraz Marjin seçin).")
+        else:
+            saved_lev = int(getattr(settings, "leverage", 2))
+            default_lev = saved_lev if saved_lev in leverage_choices and saved_lev > 1 else 2
+            selected_leverage = st.radio(
+                "⚡ Kaldıraç Çarpanı",
+                options=leverage_choices,
+                index=leverage_choices.index(default_lev),
+                horizontal=True,
+                format_func=lambda x: f"{x}x" + (" (Önerilen)" if x == 2 else ""),
+                help=(
+                    "Örn. 2x kaldıraçta 10 USDT kendi teminatınızla 20 USDT büyüklüğünde işlem açılır "
+                    "(kalan 10 USDT borçlanır ve satışta AUTO_REPAY ile otomatik kapatılır)."
+                ),
+            )
+
         ui_live_confirmed = False
+        ui_margin_confirmed = False
         if mode_choice == "LIVE_SPOT":
             st.warning(
-                f"Gerçek Spot modunda işlemler gerçek Binance Global {selected_quote} bakiyenizle yapılır. "
+                f"Gerçek Spot modunda işlemler gerçek Binance Global {selected_quote} bakiyenizle (1x) yapılır. "
                 "Kâr garantisi yoktur ve bilgisayar uykuya geçtiğinde bot durur."
             )
             if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
@@ -298,7 +421,7 @@ def main() -> None:
                 )
                 unlock_switch = st.toggle("Canlı Spot Emir Kilidini Aç", value=False)
                 ui_live_confirmed = bool(ack_risk and unlock_switch)
-                if ui_live_confirmed:
+                if ui_live_confirmed and storage.get_portfolio_quote("LIVE_SPOT") in {None, selected_quote}:
                     sync_now = st.button("🔄 Gerçek Binance Bakiyesini Sorgula", width="stretch")
                     last_synced_quote = st.session_state.get("live_balance_quote")
                     if sync_now or not st.session_state.get("live_balance_synced") or last_synced_quote != selected_quote:
@@ -332,13 +455,68 @@ def main() -> None:
                         except Exception as exc:
                             st.error(f"Canlı hesap okuma uyarısı: {exc}")
 
+        elif mode_choice == "LIVE_MARGIN":
+            st.warning(
+                f"⚡ **Gerçek Çapraz Marjin ({selected_leverage}x Kaldıraç):** Yalnızca Çapraz Marjin (Cross Margin) "
+                f"cüzdanınıza aktardığınız {selected_quote} teminatı kullanılır; Spot cüzdanınıza otomatik dokunulmaz. "
+                "Kaldıraç hem kârı hem zararı büyütür ve ters harekette likidasyon riski taşır."
+            )
+            if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
+                st.error(
+                    "🔒 Canlı Marjin Kilitli: `.env` dosyasında `ENABLE_LIVE_TRADING=true`, "
+                    "`BINANCE_API_KEY` ve `BINANCE_API_SECRET` tanımlı olmalıdır."
+                )
+            else:
+                ack_margin_risk = st.checkbox(
+                    f"Kaldıraçlı Çapraz Marjin ({selected_leverage}x) işlemde borçlanma, saatlik faiz ve "
+                    "likidasyon riskini okudum, onaylıyorum.",
+                    value=False,
+                )
+                unlock_margin = st.toggle("Canlı Çapraz Marjin Kilidini Aç", value=False)
+                if ack_margin_risk and unlock_margin:
+                    ui_live_confirmed = True
+                    ui_margin_confirmed = True
+                if ui_margin_confirmed and storage.get_portfolio_quote("LIVE_MARGIN") in {None, selected_quote}:
+                    sync_margin = st.button("🔄 Gerçek Marjin Cüzdanını Sorgula", width="stretch")
+                    last_m_quote = st.session_state.get("live_margin_quote")
+                    if sync_margin or not st.session_state.get("live_margin_synced") or last_m_quote != selected_quote:
+                        try:
+                            m_info = engine.live_margin_executor.fetch_live_margin_balances(
+                                ui_live_confirmed=True,
+                                ui_margin_confirmed=True,
+                                quote_asset=selected_quote,
+                            )
+                            st.session_state["live_margin_synced"] = True
+                            st.session_state["live_margin_quote"] = selected_quote
+                            st.success(
+                                f"Çapraz Marjin Cüzdanı Aktif — Serbest Teminat: "
+                                f"{m_info['available_collateral']:.2f} {selected_quote} | "
+                                f"Borç: {m_info['quote_borrowed']:.2f} {selected_quote} | "
+                                f"Marjin Seviyesi: {m_info['margin_level']:.2f}"
+                            )
+                            if m_info["available_collateral"] < Decimal("5.0"):
+                                st.info(
+                                    f"💡 Marjin cüzdanınızda henüz `{m_info['available_collateral']:.2f} {selected_quote}` var. "
+                                    f"Binance uygulamasından **Cüzdanlar -> Transfer -> Spot'tan Cross Margin'e** "
+                                    f"istediğiniz tutarda (ör. 30 {selected_quote}) aktarım yapabilirsiniz."
+                                )
+                        except Exception as exc:
+                            st.error(f"Marjin cüzdanı uyarısı: {exc}")
+                            st.info(
+                                "📌 **Binance Çapraz Marjin Nasıl Açılır? (1 Dakika):**\n"
+                                "1. Binance mobil uygulamasında **Cüzdanlar (Wallets) -> Marjin (Margin / Cross)** sekmesine girin.\n"
+                                "2. Karşınıza çıkan kısa Marjin bilgilendirme testini onaylayarak cüzdanı etkinleştirin.\n"
+                                f"3. **Transfer** düğmesiyle **Spot Cüzdanı -> Cross Margin** yönünde ayırmak istediğiniz "
+                                f"teminatı (ör. `30 {selected_quote}`) aktarın; kalan paranız Spot'ta güvende kalır."
+                            )
+
         st.divider()
         base_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "LINK", "SUI"]
         symbol_options = [f"{coin}{selected_quote}" for coin in base_coins]
         if cfg.default_symbol.endswith(selected_quote) and cfg.default_symbol not in symbol_options:
             symbol_options.insert(0, cfg.default_symbol)
         selected_symbol = st.selectbox(
-            f"Spot {selected_quote} İşlem Çifti", options=symbol_options, index=0
+            f"Spot / Marjin {selected_quote} İşlem Çifti", options=symbol_options, index=0
         )
         scan_all_coins = st.toggle(
             f"🌐 Çoklu Coin Eşzamanlı Al-Sat ({len(symbol_options)} Coin)",
@@ -389,7 +567,7 @@ def main() -> None:
             disabled=runner_alive,
             help=(
                 "Yalnızca bu tarayıcı sekmesi açıkken çalışır. Sekmeden bağımsız kesintisiz çalışma için "
-                "bot_sanal.bat / bot_canli.bat kullanın."
+                "bot_sanal.bat / bot_canli.bat / bot_marjin.bat kullanın."
             ),
         )
         if runner_alive:
@@ -400,8 +578,40 @@ def main() -> None:
             help="Açık pozisyonun anlık kâr/zararını her 10 saniyede bir canlı günceller.",
         )
 
-    effective_mode = "LIVE_SPOT" if (mode_choice == "LIVE_SPOT" and ui_live_confirmed) else "PAPER"
-    active_track = "LIVE_SPOT" if effective_mode == "LIVE_SPOT" else "MAIN"
+    if mode_choice == "LIVE_MARGIN" and ui_live_confirmed and ui_margin_confirmed:
+        effective_mode = "LIVE_MARGIN"
+    elif mode_choice == "LIVE_SPOT" and ui_live_confirmed:
+        effective_mode = "LIVE_SPOT"
+    else:
+        effective_mode = "PAPER"
+
+    eff_leverage = 1 if effective_mode == "LIVE_SPOT" else selected_leverage
+    eff_settings = active_profile.apply_to_risk_settings(settings, leverage=eff_leverage)
+
+    active_track = (
+        "LIVE_MARGIN"
+        if effective_mode == "LIVE_MARGIN"
+        else ("LIVE_SPOT" if effective_mode == "LIVE_SPOT" else "MAIN")
+    )
+    portfolio_quote = storage.get_portfolio_quote(active_track) or selected_quote
+    quote_mismatch = portfolio_quote != selected_quote
+    if quote_mismatch:
+        auto_loop = False
+        st.warning(
+            f"Bu portföy {portfolio_quote} ile tutuluyor. Aşağıdaki bakiye ve geçmiş {portfolio_quote} "
+            f"cinsindedir. İşlem yapmak için sol menüden {portfolio_quote} seçin; "
+            "USDT ve USDC aynı kasada birleştirilmez."
+        )
+    if active_track == "LIVE_SPOT" and storage.get_state("live_unvalued_commissions", "") not in {"", "{}", "[]"}:
+        st.warning(
+            "Bazı komisyonların portföy para birimindeki değeri doğrulanamadı. "
+            "Yeni alımlar bekletiliyor; gösterilen net kâr/zarar bu komisyonları henüz içermeyebilir."
+        )
+    if active_track == "LIVE_SPOT" and storage.get_state("live_balance_refresh_required", "0") == "1":
+        st.warning(
+            "Emir sonucu işlendi; gerçek nakit bakiye yeniden sorgulanmayı bekliyor. "
+            "Bakiye ve portföy değeri doğrulanana kadar geçicidir."
+        )
 
     # --- Üst Güvenlik Etiketi (Banner) ---
     if effective_mode == "PAPER":
@@ -409,7 +619,17 @@ def main() -> None:
             f"""
             <div style="background-color:#0F766E;color:#FFFFFF;padding:14px 20px;border-radius:10px;
                         font-size:18px;font-weight:700;margin-bottom:14px;border-left:8px solid #99F6E4;">
-                🛡️ {SIMULATION_MODE_LABEL} — Gerçek Binance Bakiyenize Dokunulmaz (Başlangıç Sanal Kasa: {cfg.initial_balance_usdc:.2f} {selected_quote})
+                🛡️ {SIMULATION_MODE_LABEL} ({eff_settings.leverage}x Kaldıraç) — Gerçek Binance Bakiyenize Dokunulmaz (Başlangıç Sanal Kasa: {cfg.initial_balance_usdc:.2f} {portfolio_quote})
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif effective_mode == "LIVE_MARGIN":
+        st.markdown(
+            f"""
+            <div style="background-color:#7C2D12;color:#FFFFFF;padding:14px 20px;border-radius:10px;
+                        font-size:18px;font-weight:700;margin-bottom:14px;border-left:8px solid #FDBA74;">
+                ⚡ DİKKAT: CANLI ÇAPRAZ MARJİN ({eff_settings.leverage}x KALDIRAÇ) AKTİF — GERÇEK MARJİN {portfolio_quote} TEMİNATI VE BORÇLANMA KULLANILMAKTADIR
             </div>
             """,
             unsafe_allow_html=True,
@@ -419,14 +639,14 @@ def main() -> None:
             f"""
             <div style="background-color:#991B1B;color:#FFFFFF;padding:14px 20px;border-radius:10px;
                         font-size:18px;font-weight:700;margin-bottom:14px;border-left:8px solid #FCA5A5;">
-                ⚠️ DİKKAT: CANLI SPOT İŞLEM MODU AKTİF — GERÇEK BINANCE GLOBAL {selected_quote} BAKİYESİ KULLANILMAKTADIR
+                ⚠️ DİKKAT: CANLI SPOT İŞLEM MODU (1x) AKTİF — GERÇEK BINANCE GLOBAL {portfolio_quote} BAKİYESİ KULLANILMAKTADIR
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     # --- Hızlı Eylem Düğmeleri ---
-    paused, pause_reason = storage.is_new_entries_paused()
+    paused, pause_reason = storage.is_new_entries_paused(track=active_track)
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1.4, 1.4, 1.4, 2.0])
 
     with btn_col1:
@@ -434,30 +654,33 @@ def main() -> None:
             "▶️ Analiz Adımını Şimdi Çalıştır",
             type="primary",
             width="stretch",
-            disabled=runner_alive,
+            disabled=runner_alive or quote_mismatch,
         )
 
     with btn_col2:
         if paused:
             if st.button("🟢 Yeni İşlemlere İzin Ver", width="stretch"):
-                storage.set_new_entries_paused(False, "")
+                storage.set_new_entries_paused(False, "", track=active_track)
                 st.rerun()
         else:
             if st.button("⏸️ Yeni İşlemleri Durdur", width="stretch"):
-                storage.set_new_entries_paused(True, "Kullanıcı panelden yeni alımları durdurdu")
+                storage.set_new_entries_paused(
+                    True, "Kullanıcı panelden yeni alımları durdurdu", track=active_track
+                )
                 st.rerun()
 
     with btn_col3:
-        close_btn_label = (
-            "🛑 Açık Canlı Pozisyonları Sat"
-            if effective_mode == "LIVE_SPOT"
-            else "🛑 Açık Sanal Pozisyonları Kapat"
-        )
-        if st.button(close_btn_label, width="stretch"):
+        close_btn_label = {
+            "LIVE_MARGIN": "🛑 Açık Canlı Marjin Pozisyonları Kapat",
+            "LIVE_SPOT": "🛑 Açık Canlı Pozisyonları Kapat",
+            "PAPER": "🛑 Açık Sanal Pozisyonları Kapat",
+        }[effective_mode]
+        if st.button(close_btn_label, width="stretch", disabled=runner_alive or quote_mismatch):
             ok_close, close_msg = engine.manual_close_open_position(
-                settings,
+                eff_settings,
                 execution_mode=effective_mode,
                 ui_live_confirmed=ui_live_confirmed,
+                ui_margin_confirmed=ui_margin_confirmed,
             )
             if ok_close:
                 st.success(close_msg)
@@ -465,28 +688,43 @@ def main() -> None:
                 st.warning(close_msg)
 
     with btn_col4:
-        eff_settings = active_profile.apply_to_risk_settings(settings)
+        notional_per_pos = eff_settings.max_position_size_usdc * Decimal(eff_settings.leverage)
         if paused:
             st.warning(f"Yeni Alımlar Durduruldu: {pause_reason or 'Kullanıcı kilidi'}")
         elif scan_all_coins:
             st.success(
-                f"Çoklu Coin Aktif: {len(symbol_options)} coin taranır (Eşzamanlı en fazla {eff_settings.max_open_positions} coin)"
+                f"Çoklu Coin ({eff_settings.leverage}x): {len(symbol_options)} coin | "
+                f"Eşzamanlı maks {eff_settings.max_open_positions} coin "
+                f"({eff_settings.max_position_size_usdc:.0f} {portfolio_quote} teminat -> ~{notional_per_pos:.0f} {portfolio_quote} işlem)"
             )
         else:
-            st.success("Sistem Durumu: Yeni sinyal denetimine hazır (Yalnızca Kaldıraçsız Spot)")
+            st.success(
+                f"Sistem Hazır ({eff_settings.leverage}x): {eff_settings.max_position_size_usdc:.0f} {portfolio_quote} teminat "
+                f"-> ~{notional_per_pos:.0f} {portfolio_quote} pozisyon"
+            )
 
     # Analiz adımı tetiklendiyse çalıştır
-    if run_now or auto_loop:
+    if (run_now or auto_loop) and not quote_mismatch and not is_runner_alive(storage)[0]:
         if scan_all_coins:
             engine.lock_benchmark_symbol = True
             with st.spinner(
-                f"{len(symbol_options)} coin ({selected_interval}) taranıyor; açık pozisyonlar ve yeni alım fırsatları kontrol ediliyor..."
+                f"{len(symbol_options)} coin ({selected_interval}, {eff_settings.leverage}x) taranıyor; açık pozisyonlar ve yeni fırsatlar kontrol ediliyor..."
             ):
                 prefetched_live = False
                 if effective_mode == "LIVE_SPOT":
                     try:
                         engine.live_executor.fetch_live_spot_balances(
                             ui_live_confirmed=ui_live_confirmed, quote_asset=selected_quote
+                        )
+                        prefetched_live = True
+                    except Exception:
+                        prefetched_live = False
+                elif effective_mode == "LIVE_MARGIN":
+                    try:
+                        engine.live_margin_executor.fetch_live_margin_balances(
+                            ui_live_confirmed=ui_live_confirmed,
+                            ui_margin_confirmed=ui_margin_confirmed,
+                            quote_asset=selected_quote,
                         )
                         prefetched_live = True
                     except Exception:
@@ -518,6 +756,7 @@ def main() -> None:
                         min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
                         execution_mode=effective_mode,
                         ui_live_confirmed=ui_live_confirmed,
+                        ui_margin_confirmed=ui_margin_confirmed,
                         strategy_params=active_profile.strategy,
                         ai_only_on_rule_signal=True,
                         skip_balance_prefetch=prefetched_live,
@@ -548,12 +787,12 @@ def main() -> None:
                     or "Yeni işlem yok (uygun sinyal bekleniyor)"
                 )
                 st.session_state["last_multi_scan_note"] = (
-                    f"🌐 **Çoklu Coin Tarama Özeti:** `{scanned_count}` coin kontrol edildi | "
+                    f"🌐 **Çoklu Coin Tarama Özeti ({eff_settings.leverage}x):** `{scanned_count}` coin kontrol edildi | "
                     f"**Açık Pozisyonlar ({len(open_now_list)}/{eff_settings.max_open_positions}):** `{open_names}` | "
                     f"**Bu Döngüdeki İşlemler:** `{exec_names}`"
                 )
         else:
-            with st.spinner(f"{selected_symbol} ({selected_interval}) doğrulanmış piyasa verisi analiz ediliyor..."):
+            with st.spinner(f"{selected_symbol} ({selected_interval}, {eff_settings.leverage}x) doğrulanmış piyasa verisi analiz ediliyor..."):
                 step_res = engine.run_analysis_step(
                     symbol=selected_symbol,
                     interval=selected_interval,
@@ -563,6 +802,7 @@ def main() -> None:
                     min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
                     execution_mode=effective_mode,
                     ui_live_confirmed=ui_live_confirmed,
+                    ui_margin_confirmed=ui_margin_confirmed,
                     strategy_params=active_profile.strategy,
                 )
                 st.session_state["last_step_summary"] = step_res
@@ -584,29 +824,33 @@ def main() -> None:
 
     # --- Portföy ve Maliyet Özeti Kartları ---
     open_for_summary = storage.get_open_positions(track=active_track)
-    live_bids_for_summary = _fetch_live_bids(engine, [p.symbol for p in open_for_summary])
+    refresh_prices = st.button("🔄 Anlık Fiyatları Şimdi Güncelle") if not live_pnl_auto else False
+    live_bids_for_summary = _fetch_live_bids(
+        engine, [p.symbol for p in open_for_summary], refresh=refresh_prices
+    )
     summary = engine.get_portfolio_summary(
-        settings, live_bid_by_symbol=live_bids_for_summary, track=active_track
+        eff_settings, live_bid_by_symbol=live_bids_for_summary, track=active_track
     )
     ai_usage = storage.get_ai_usage_summary(ist_today)
+    valuation_complete = summary["valuation_complete"]
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Kullanılabilir Nakit", f"{summary['cash_usdc']:.2f} {selected_quote}")
-    m2.metric("Toplam Portföy Değeri", f"{summary['total_equity_usdc']:.2f} {selected_quote}")
+    m1.metric("Kullanılabilir Nakit", f"{summary['cash_usdc']:.2f} {portfolio_quote}")
+    m2.metric("Toplam Portföy Değeri", f"{summary['total_equity_usdc']:.2f} {portfolio_quote}" if valuation_complete else "—")
     m3.metric(
         "Gerçekleşmiş Kâr/Zarar",
-        f"{summary['realized_pnl_usdc']:+.3f} {selected_quote}",
-        help="Kapanmış pozisyonların giriş+çıkış komisyonu düşülmüş net sonucu.",
+        f"{summary['realized_pnl_usdc']:+.3f} {portfolio_quote}",
+        help="Kapanmış pozisyonların giriş+çıkış komisyonu ve varsa marjin faizi düşülmüş net sonucu.",
     )
     m4.metric(
         "Açık Pozisyon Net K/Z",
-        f"{summary['unrealized_pnl_usdc']:+.3f} {selected_quote}",
-        help="Anlık alış kotasyonu ve tahmini çıkış komisyonu düşülmüş net değer değişimi.",
+        f"{summary['unrealized_pnl_usdc']:+.3f} {portfolio_quote}" if valuation_complete else "—",
+        help="Anlık alış kotasyonu, tahmini çıkış komisyonu ve marjin faizi düşülmüş net değer değişimi.",
     )
     m5.metric(
         "Toplam İşlem Komisyonu",
-        f"{summary['total_fees_usdc']:.4f} {selected_quote}",
-        help=f"Varsayılan komisyon oranı: %{settings.estimated_fee_rate * Decimal('100'):.2f}",
+        f"{summary['total_fees_usdc']:.4f} {portfolio_quote}",
+        help=f"Varsayılan komisyon oranı: %{eff_settings.estimated_fee_rate * Decimal('100'):.2f}",
     )
     ai_cost_label = (
         f"~{ai_usage['estimated_cost_usd']:.5f} USD"
@@ -622,6 +866,8 @@ def main() -> None:
             "Tarife API'den doğrulanamadığında kesin fatura değil, birim fiyat varsayımına dayalı tahmindir."
         ),
     )
+    if not valuation_complete:
+        st.info("Güncel fiyatlar alınamadı; portföy değeri ve açık kâr/zarar için Anlık Fiyatları Şimdi Güncelle düğmesini kullanın.")
 
     # --- Veri Güncelliği, Bağlantı ve Son Karar Kutusu ---
     info_left, info_right = st.columns([1.2, 1.8])
@@ -641,14 +887,18 @@ def main() -> None:
             else "Yapay Zekâ Kapalı / Kural Tabanlı Deneme"
         )
         st.write(f"- **Karar Modu:** {ai_status_str}")
+        st.write(f"- **Aktif Kaldıraç / Toplam Borç:** `{eff_settings.leverage}x` / `{summary.get('borrowed_usdc', Decimal('0')):.2f} {portfolio_quote}`")
         st.write(
-            f"- **Günlük Net K/Z (İstanbul):** `{summary['daily_net_pnl_usdc']:+.3f} {selected_quote}` "
-            f"(Zarar Eşiği: `-{settings.daily_loss_limit_usdc:.2f} {selected_quote}`)"
+            "- **Günlük Net K/Z (İstanbul):** "
+            + (f"`{summary['daily_net_pnl_usdc']:+.3f} {portfolio_quote}` " if valuation_complete else "`—` ")
+            + f"(Zarar Eşiği: `-{eff_settings.daily_loss_limit_usdc:.2f} {portfolio_quote}`)"
         )
 
     with info_right:
         st.subheader("🧠 Son Karar ve Kısa Gerekçe")
-        recent_decisions = storage.get_recent_decisions(limit=1)
+        recent_decisions = storage.get_recent_decisions(
+            limit=1, track=active_track, quote_asset=portfolio_quote
+        )
         if recent_decisions:
             d = recent_decisions[0]
             badge = {"AL": "🟢 AL", "SAT": "🔴 SAT", "BEKLE": "🟡 BEKLE"}.get(
@@ -672,9 +922,11 @@ def main() -> None:
 
     st.divider()
     if live_pnl_auto:
-        _render_live_pnl_fragment(engine, settings, active_track, selected_quote, cfg.tz)
+        _render_live_pnl_fragment(engine, eff_settings, active_track, portfolio_quote, cfg.tz)
     else:
-        _render_live_pnl(engine, settings, active_track, selected_quote, cfg.tz)
+        _render_live_pnl(
+            engine, eff_settings, active_track, portfolio_quote, cfg.tz
+        )
     st.divider()
 
     # --- Ana Sekmeler ---
@@ -692,20 +944,32 @@ def main() -> None:
         open_pos = summary["open_positions"]
         if open_pos:
             pos_rows = []
+            hourly_rate = getattr(eff_settings, "hourly_margin_interest_rate", Decimal("0.000005"))
             for p in open_pos:
-                cur_bid = live_bids_for_summary.get(p.symbol, p.entry_price)
-                _, cur_pnl = compute_open_position_unrealized_net_pnl(
-                    p, current_bid=cur_bid, estimated_fee_rate=settings.estimated_fee_rate
-                )
+                cur_bid = live_bids_for_summary.get(p.symbol)
+                cur_pnl = None
+                if cur_bid is not None:
+                    _, cur_pnl = compute_open_position_unrealized_net_pnl(
+                        p,
+                        current_bid=cur_bid,
+                        estimated_fee_rate=eff_settings.estimated_fee_rate,
+                        hourly_interest_rate=hourly_rate,
+                    )
+                p_lev = getattr(p, "leverage", 1)
+                p_borrowed = getattr(p, "borrowed_usdc", Decimal("0"))
+                p_liq = getattr(p, "liquidation_price", None)
                 pos_rows.append(
                     {
                         "Pozisyon Kimliği": p.position_id,
                         "Parite": p.symbol,
+                        "Kaldıraç": f"{p_lev}x",
                         "Miktar": f"{p.quantity:.8f}",
-                        f"Giriş Fiyatı ({selected_quote})": f"{p.entry_price:.6f}",
-                        f"Anlık Fiyat ({selected_quote})": f"{cur_bid:.6f}",
-                        f"Anlık Net K/Z ({selected_quote})": f"{cur_pnl:+.4f}",
-                        f"Maliyet ({selected_quote})": f"{p.cost_basis_usdc:.2f}",
+                        f"Giriş Fiyatı ({portfolio_quote})": f"{p.entry_price:.6f}",
+                        f"Anlık Fiyat ({portfolio_quote})": f"{cur_bid:.6f}" if cur_bid is not None else "—",
+                        f"Anlık Net K/Z ({portfolio_quote})": f"{cur_pnl:+.4f}" if cur_pnl is not None else "—",
+                        f"Pozisyon Büyüklüğü ({portfolio_quote})": f"{p.cost_basis_usdc:.2f}",
+                        f"Borç ({portfolio_quote})": f"{p_borrowed:.2f}" if p_borrowed > 0 else "-",
+                        "Likidasyon": f"{p_liq:.6f}" if p_liq else "-",
                         "Giriş Komisyonu": f"{p.entry_fee_usdc:.4f}",
                         "Zarar-Kes": f"{p.stop_loss_price:.6f}" if p.stop_loss_price else "-",
                         "Kâr-Al": f"{p.take_profit_price:.6f}" if p.take_profit_price else "-",
@@ -717,7 +981,9 @@ def main() -> None:
             st.info("Şu anda açık pozisyon bulunmuyor.")
 
         st.subheader("Portföy Bakiye Eğrisi")
-        snaps = storage.get_equity_snapshots(limit=300)
+        snaps = storage.get_equity_snapshots(
+            limit=300, track=active_track, quote_asset=portfolio_quote
+        )
         if snaps:
             snap_df = pd.DataFrame(snaps)
             fig = go.Figure()
@@ -726,7 +992,7 @@ def main() -> None:
                     x=snap_df["created_at_iso"],
                     y=snap_df["main_equity_usdc"].astype(float),
                     mode="lines+markers",
-                    name=f"Aktif Portföy ({selected_quote})",
+                    name=f"Aktif Portföy ({portfolio_quote})",
                 )
             )
             fig.add_trace(
@@ -734,7 +1000,7 @@ def main() -> None:
                     x=snap_df["created_at_iso"],
                     y=snap_df["rule_shadow_equity_usdc"].astype(float),
                     mode="lines",
-                    name=f"Kural Tabanlı Gölge ({selected_quote})",
+                    name=f"Kural Tabanlı Gölge ({portfolio_quote})",
                 )
             )
             fig.add_trace(
@@ -743,13 +1009,13 @@ def main() -> None:
                     y=snap_df["benchmark_equity_usdc"].astype(float),
                     mode="lines",
                     line={"dash": "dot"},
-                    name=f"Pasif Referans ({selected_quote})",
+                    name=f"Pasif Referans ({portfolio_quote})",
                 )
             )
             fig.update_layout(
                 height=340,
                 margin={"l": 20, "r": 20, "t": 20, "b": 20},
-                yaxis_title=f"Toplam Değer ({selected_quote})",
+                yaxis_title=f"Toplam Değer ({portfolio_quote})",
                 xaxis_title="Zaman (UTC)",
             )
             st.plotly_chart(fig, width="stretch")
@@ -771,8 +1037,14 @@ def main() -> None:
             "Aşağıdaki tablo, yapay zekânın ek katkı sağlayıp sağlamadığını ayrı ölçmek için "
             "aynı kapanmış mumlar üzerinde üç yaklaşımı yan yana izler:"
         )
-        shadow_sum = engine.get_portfolio_summary(settings, track="RULE_SHADOW")
-        snaps_latest = storage.get_equity_snapshots(limit=1)
+        shadow_sum = engine.get_portfolio_summary(
+            dataclasses.replace(eff_settings, leverage=1),
+            live_bid_by_symbol=live_bids_for_summary,
+            track=engine._shadow_track(portfolio_quote),
+        )
+        snaps_latest = storage.get_equity_snapshots(
+            limit=1, track=active_track, quote_asset=portfolio_quote
+        )
         bench_val = (
             Decimal(str(snaps_latest[-1]["benchmark_equity_usdc"]))
             if snaps_latest
@@ -782,24 +1054,24 @@ def main() -> None:
         cmp_df = pd.DataFrame(
             [
                 {
-                    "Yaklaşım": "1. Aktif Portföy (Yapay Zekâ veya Seçili Mod)",
-                    f"Toplam Değer ({selected_quote})": f"{summary['total_equity_usdc']:.3f}",
-                    f"Net Fark ({selected_quote})": f"{(summary['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
-                    f"Toplam Komisyon ({selected_quote})": f"{summary['total_fees_usdc']:.4f}",
+                    "Yaklaşım": f"1. Aktif Portföy ({eff_settings.leverage}x Seçili Mod)",
+                    f"Toplam Değer ({portfolio_quote})": f"{summary['total_equity_usdc']:.3f}" if valuation_complete else "—",
+                    f"Net Fark ({portfolio_quote})": f"{(summary['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}" if valuation_complete else "—",
+                    f"Toplam Komisyon ({portfolio_quote})": f"{summary['total_fees_usdc']:.4f}",
                     "Tahmini AI Maliyeti (USD)": f"{ai_usage['estimated_cost_usd']:.5f}",
                 },
                 {
-                    "Yaklaşım": "2. Saf Kural Tabanlı Strateji (EMA/RSI/MACD Gölge)",
-                    f"Toplam Değer ({selected_quote})": f"{shadow_sum['total_equity_usdc']:.3f}",
-                    f"Net Fark ({selected_quote})": f"{(shadow_sum['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}",
-                    f"Toplam Komisyon ({selected_quote})": f"{shadow_sum['total_fees_usdc']:.4f}",
+                    "Yaklaşım": "2. Saf Kural Tabanlı Strateji (1x Spot EMA/RSI/MACD Gölge)",
+                    f"Toplam Değer ({portfolio_quote})": f"{shadow_sum['total_equity_usdc']:.3f}" if shadow_sum["valuation_complete"] else "—",
+                    f"Net Fark ({portfolio_quote})": f"{(shadow_sum['total_equity_usdc'] - cfg.initial_balance_usdc):+.3f}" if shadow_sum["valuation_complete"] else "—",
+                    f"Toplam Komisyon ({portfolio_quote})": f"{shadow_sum['total_fees_usdc']:.4f}",
                     "Tahmini AI Maliyeti (USD)": "0.00000",
                 },
                 {
-                    "Yaklaşım": f"3. Referans ({min(settings.max_position_size_usdc, cfg.initial_balance_usdc):.0f} {selected_quote} {selected_symbol} Al-Tut + Kalan Nakit)",
-                    f"Toplam Değer ({selected_quote})": f"{bench_val:.3f}",
-                    f"Net Fark ({selected_quote})": f"{(bench_val - cfg.initial_balance_usdc):+.3f}",
-                    f"Toplam Komisyon ({selected_quote})": f"{(min(settings.max_position_size_usdc, cfg.initial_balance_usdc) * settings.estimated_fee_rate):.4f}",
+                    "Yaklaşım": f"3. Referans ({min(settings.max_position_size_usdc, cfg.initial_balance_usdc):.0f} {portfolio_quote} {selected_symbol} Al-Tut + Kalan Nakit)",
+                    f"Toplam Değer ({portfolio_quote})": f"{bench_val:.3f}",
+                    f"Net Fark ({portfolio_quote})": f"{(bench_val - cfg.initial_balance_usdc):+.3f}",
+                    f"Toplam Komisyon ({portfolio_quote})": f"{(min(settings.max_position_size_usdc, cfg.initial_balance_usdc) * settings.estimated_fee_rate):.4f}",
                     "Tahmini AI Maliyeti (USD)": "0.00000",
                 },
             ]
@@ -811,16 +1083,19 @@ def main() -> None:
             - Decimal(str(ai_usage["estimated_cost_usd"]))
             - shadow_sum["total_equity_usdc"]
         )
-        st.caption(
-            f"Tahmini AI Maliyeti Düşülmüş Yapay Zekâ Ek Katkısı (vs. Kural Tabanlı): `{ai_alpha:+.4f} {selected_quote}` "
-            "(Kısa süreli birkaç işlem istatistiksel kanıt oluşturmaz.)"
-        )
+        if valuation_complete and shadow_sum["valuation_complete"]:
+            st.caption(
+                f"Tahmini AI Maliyeti Düşülmüş Yapay Zekâ Ek Katkısı (vs. Kural Tabanlı): `{ai_alpha:+.4f} {portfolio_quote}` "
+                "(Kısa süreli birkaç işlem istatistiksel kanıt oluşturmaz.)"
+            )
+        else:
+            st.caption("Yapay zekâ ek katkısı, tüm açık pozisyonların güncel fiyatları doğrulandığında hesaplanır.")
 
     with tab_val:
         st.subheader(f"{cfg.initial_balance_usdc:.2f} {selected_quote} Küçük Bakiye Komisyon ve Model Maliyet Uygulanabilirliği")
         viability = assess_small_balance_viability(
             balance_usdc=cfg.initial_balance_usdc,
-            position_size_usdc=settings.max_position_size_usdc,
+            position_size_usdc=settings.max_position_size_usdc * Decimal(eff_settings.leverage),
             fee_rate=settings.estimated_fee_rate,
             extra_slippage_bps=settings.extra_slippage_bps,
             daily_ai_calls=int(daily_ai_limit) if (cfg.has_gemini_key and ai_enabled) else 0,
@@ -832,19 +1107,20 @@ def main() -> None:
         st.subheader("Kronolojik Eğitim (%60) / Doğrulama (%20) / Test (%20) Analizi")
         st.caption(
             "Gelecek veriyi sızdırmaz (No-Lookahead): `t` mum kapanış sinyali yalnızca `t+1` mum "
-            "açılışında spread + kayma + komisyon eklenerek test edilir."
+            "açılışında spread + kayma + komisyon eklenerek kaldıraçsız Spot (1x) bazda test edilir."
         )
         bcol1, bcol2 = st.columns(2)
         run_live_bt = bcol1.button("🌐 Canlı Binance Geçmiş Mumlarıyla Doğrula (500 Mum)", width="stretch")
         run_demo_bt = bcol2.button(
-            "🧪 Çevrimdışı Örnek Seri ile Doğrulama Motorunu Test Et",
+            "🧪 Sentetik Veriyle Motor Gösterimi",
             width="stretch",
-            help="İnternet/İSS engeli varken doğrulama motorunun nasıl çalıştığını gösterir; portföye dokunmaz.",
+            help="Yapay üretilmiş fiyatlarla motoru gösterir; stratejinin gerçek piyasa başarısını ölçmez.",
         )
 
         if run_live_bt or run_demo_bt:
             candles_for_bt: list[Candle] = []
             bt_label = ""
+            bt_filters = None
             if run_live_bt:
                 try:
                     bundle = engine.market_client.fetch_verified_market_bundle(
@@ -854,20 +1130,24 @@ def main() -> None:
                         allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
                     )
                     candles_for_bt = bundle.closed_candles
+                    bt_filters = bundle.filters
                     bt_label = f"{selected_symbol} ({selected_interval}) — Gerçek Binance Verisi"
                 except MarketDataError as exc:
                     st.error(f"Canlı geçmiş mum verisi alınamadı: {exc}")
             else:
-                candles_for_bt = _generate_offline_demo_candles(240)
-                bt_label = "Çevrimdışı Sentetik Doğrulama Serisi (Portföyden Bağımsız)"
+                candles_for_bt = _generate_offline_demo_candles(240, interval=selected_interval)
+                bt_label = "Sentetik Motor Gösterimi — Gerçek Piyasa Performansı Değildir"
 
             if candles_for_bt:
+                spot_bt_settings = dataclasses.replace(eff_settings, leverage=1)
                 rep = run_chronological_validation(
                     candles_for_bt,
                     symbol=selected_symbol,
                     interval=selected_interval,
-                    settings=settings,
+                    settings=spot_bt_settings,
                     initial_balance_usdc=cfg.initial_balance_usdc,
+                    strategy_params=active_profile.strategy,
+                    symbol_filters=bt_filters,
                 )
                 st.markdown(f"**Veri Seti:** `{bt_label}` ({rep.total_candles} kapanmış mum)")
                 rows_bt = []
@@ -887,7 +1167,12 @@ def main() -> None:
                         }
                     )
                 st.dataframe(pd.DataFrame(rows_bt), width="stretch", hide_index=True)
-                if rep.insufficient_data:
+                if run_demo_bt:
+                    st.info(
+                        "Bu sonuç yapay fiyatlarla üretilmiş bir motor gösterimidir. "
+                        "Stratejinin kârlılığını veya gerçek piyasadaki başarısını doğrulamaz."
+                    )
+                elif rep.insufficient_data:
                     st.info(f"📌 **Sonuç:** {rep.overall_verdict}")
                 else:
                     st.success(f"📌 **Örneklem Dışı Test Özeti:** {rep.overall_verdict}")
@@ -900,12 +1185,12 @@ def main() -> None:
             fc1, fc2 = st.columns(2)
             with fc1:
                 new_max_pos_usdc = st.number_input(
-                    f"Pozisyon Üst Sınırı ({selected_quote})",
+                    f" İşlem Başına Öz Teminat Üst Sınırı ({selected_quote})",
                     min_value=5.0,
                     max_value=float(cfg.initial_balance_usdc),
                     value=float(settings.max_position_size_usdc),
                     step=1.0,
-                    help="Minimum borsa emir tutarı bu sınırı aşarsa sınır otomatik büyütülmez; işlem reddedilir.",
+                    help="2x kaldıraçta 10 USDT teminat ~20 USDT pozisyon açar. Minimum emir tutarı aşılırsa işlem reddedilir.",
                 )
                 new_daily_loss = st.number_input(
                     f"Günlük Zarar Eşiği ({selected_quote} — Europe/Istanbul)",
@@ -930,7 +1215,7 @@ def main() -> None:
                 )
             with fc2:
                 new_fee_pct = st.number_input(
-                    "Tahmini Spot Komisyon Oranı (%)",
+                    "Tahmini Komisyon Oranı (%)",
                     min_value=0.0,
                     max_value=1.0,
                     value=float(settings.estimated_fee_rate * Decimal("100")),
@@ -975,9 +1260,13 @@ def main() -> None:
                     stop_loss_pct=Decimal(f"{new_sl_pct:.2f}") / Decimal("100"),
                     take_profit_pct=settings.take_profit_pct,
                     allow_stablecoin_conversion=False,
+                    leverage=int(selected_leverage),
+                    hourly_margin_interest_rate=getattr(
+                        settings, "hourly_margin_interest_rate", Decimal("0.000005")
+                    ),
                 )
                 storage.save_risk_settings(updated)
-                st.success("Risk ayarları SQLite veritabanına kaydedildi.")
+                st.success("Risk ve kaldıraç ayarları SQLite veritabanına kaydedildi.")
                 st.rerun()
 
         st.divider()

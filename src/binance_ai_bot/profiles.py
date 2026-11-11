@@ -38,18 +38,30 @@ class TradingProfile:
     direct_rule_execution: bool = False
     max_open_positions: int = 1
 
-    def apply_to_risk_settings(self, base: RiskSettings) -> RiskSettings:
+    def apply_to_risk_settings(
+        self, base: RiskSettings, *, leverage: int | None = None
+    ) -> RiskSettings:
         """
         Profilin işlem sıklığı ve çıkış seviyelerini uygular; pozisyon büyüklüğü ve günlük zarar
         eşiği gibi sert sınırlar kullanıcının kayıtlı ayarlarından AYNEN korunur.
         """
-        return dataclasses.replace(
-            base,
+        base_lev = getattr(base, "leverage", 1)
+        eff_lev = max(1, min(5, int(leverage if leverage is not None else base_lev)))
+        return RiskSettings(
             max_open_positions=max(base.max_open_positions, self.max_open_positions),
+            max_position_size_usdc=base.max_position_size_usdc,
+            daily_loss_limit_usdc=base.daily_loss_limit_usdc,
             max_daily_new_positions=self.max_daily_new_positions,
+            daily_limit_exit_policy=base.daily_limit_exit_policy,
+            estimated_fee_rate=base.estimated_fee_rate,
+            extra_slippage_bps=base.extra_slippage_bps,
             stop_loss_pct=self.stop_loss_pct,
             take_profit_pct=self.take_profit_pct,
             allow_stablecoin_conversion=False,
+            leverage=eff_lev,
+            hourly_margin_interest_rate=getattr(
+                base, "hourly_margin_interest_rate", Decimal("0.000005")
+            ),
         )
 
 
