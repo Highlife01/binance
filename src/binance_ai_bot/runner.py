@@ -23,11 +23,13 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from .config import PROJECT_ROOT, AppConfig, load_config
 from .engine import StepCycleSummary, TradingSystemEngine
 from .profiles import TradingProfile, get_profile
+from .risk import compute_open_position_unrealized_net_pnl
 
 RUNNER_HEARTBEAT_KEY = "runner_heartbeat_iso"
 RUNNER_INFO_KEY = "runner_info_json"
@@ -136,7 +138,7 @@ def _setup_logger() -> logging.Logger:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Kesintisiz Binance Spot arka plan botu")
     ap.add_argument("--mod", choices=["sanal", "canli"], default="sanal")
-    ap.add_argument("--profil", choices=["aktif", "temkinli"], default="temkinli")
+    ap.add_argument("--profil", choices=["hizli_30sn", "aktif", "temkinli"], default="hizli_30sn")
     ap.add_argument("--parite", default="", help="Örn. BTCUSDT (boşsa .env DEFAULT_SYMBOL)")
     ap.add_argument(
         "--pariteler",
@@ -146,7 +148,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             f"({','.join(DEFAULT_SCAN_SYMBOLS)})."
         ),
     )
-    ap.add_argument("--ai", choices=["acik", "kapali"], default="acik")
+    ap.add_argument("--ai", choices=["acik", "kapali", "zorla"], default="acik")
     ap.add_argument("--max-dongu", type=int, default=0, help="Test amaçlı: 0 = sınırsız")
     ap.add_argument(
         "--onay",
@@ -308,11 +310,16 @@ def run_bot(
                 storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
                 try:
                     settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+                    use_ai_now = (
+                        True
+                        if args.ai == "zorla"
+                        else (False if (args.ai == "kapali" or profile.direct_rule_execution) else True)
+                    )
                     res = eng.run_analysis_step(
                         symbol=sym,
                         interval=profile.interval,
                         settings=settings,
-                        ai_enabled_by_user=(args.ai == "acik"),
+                        ai_enabled_by_user=use_ai_now,
                         daily_ai_limit_override=profile.ai_daily_call_limit,
                         min_ai_interval_override=profile.ai_min_call_interval_seconds,
                         execution_mode=execution_mode,
@@ -349,6 +356,39 @@ def run_bot(
                     and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
                 ):
                     break
+
+            # Açık pozisyon varsa her döngüde anlık Kâr/Zarar durumunu yazdır
+            open_after = storage.get_open_positions(track=track)
+            mc = getattr(eng, "market_client", None)
+            if open_after and mc is not None:
+                p_open = open_after[0]
+                try:
+                    ob = mc.fetch_order_book(p_open.symbol, depth_limit=5)
+                    if ob.best_bid is not None:
+                        est_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+                        _, net_pnl = compute_open_position_unrealized_net_pnl(
+                            p_open,
+                            current_bid=ob.best_bid,
+                            estimated_fee_rate=est_settings.estimated_fee_rate,
+                        )
+                        cost_tot = p_open.cost_basis_usdc + p_open.entry_fee_usdc
+                        pnl_pct = (net_pnl / cost_tot * Decimal("100")) if cost_tot > 0 else Decimal("0")
+                        q_lbl = "USDT" if p_open.symbol.endswith("USDT") else "USDC"
+                        sl_txt = f"{p_open.stop_loss_price:.6g}" if p_open.stop_loss_price else "-"
+                        tp_txt = f"{p_open.take_profit_price:.6g}" if p_open.take_profit_price else "-"
+                        log.info(
+                            "ANLIK K/Z | %s | Giris=%.6g Anlik=%.6g | Net=%+.4f %s (%%%+.2f) | Zarar-Kes=%s Kar-Al=%s",
+                            p_open.symbol,
+                            p_open.entry_price,
+                            ob.best_bid,
+                            net_pnl,
+                            q_lbl,
+                            pnl_pct,
+                            sl_txt,
+                            tp_txt,
+                        )
+                except Exception:
+                    pass
 
             if cycle_summaries and time.monotonic() - last_alive_log > 300:
                 log.info("Bot calisiyor (yeni mum bekleniyor) | %s", " ".join(cycle_summaries))

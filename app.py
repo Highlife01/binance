@@ -9,6 +9,7 @@ veya:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -31,7 +32,11 @@ from binance_ai_bot.domain import Candle, RiskSettings
 from binance_ai_bot.engine import TradingSystemEngine
 from binance_ai_bot.market_data import MarketDataError
 from binance_ai_bot.profiles import TRADING_PROFILES, get_profile
-from binance_ai_bot.risk import EXIT_POLICY_DESCRIPTIONS_TR, RISK_DISCLAIMER_TR
+from binance_ai_bot.risk import (
+    EXIT_POLICY_DESCRIPTIONS_TR,
+    RISK_DISCLAIMER_TR,
+    compute_open_position_unrealized_net_pnl,
+)
 from binance_ai_bot.runner import RUNNER_STOP_KEY, is_runner_alive
 from binance_ai_bot.security import assert_localhost_only
 from binance_ai_bot.simulator import FILL_MODEL_EXPLANATION_TR
@@ -85,7 +90,109 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.5.0"
+ENGINE_STATE_VERSION = "1.6.0"
+
+
+def _fetch_live_bids(engine: TradingSystemEngine, symbols: list[str]) -> dict[str, Decimal]:
+    """Açık pozisyonların anlık en iyi alış (bid) fiyatlarını çeker; hata olursa o pariteyi atlar."""
+    bids: dict[str, Decimal] = {}
+    for sym in dict.fromkeys(symbols):
+        try:
+            book = engine.market_client.fetch_order_book(sym, depth_limit=5)
+            if book.best_bid is not None:
+                bids[sym] = book.best_bid
+        except Exception:
+            continue
+    return bids
+
+
+def _render_live_pnl(
+    engine: TradingSystemEngine,
+    settings: RiskSettings,
+    track: str,
+    quote: str,
+    tz,
+) -> None:
+    """Anlık Kâr/Zarar bölümü (st.fragment ile yalnızca bu kısım periyodik yenilenir)."""
+    storage = engine.storage
+    open_positions = storage.get_open_positions(track=track)
+    track_label = {
+        "LIVE_SPOT": "🔴 Gerçek Canlı Spot",
+        "MAIN": "🟢 Sanal Deneme",
+    }.get(track, track)
+    st.subheader(f"📈 Anlık Kâr / Zarar — {track_label}")
+
+    bids = _fetch_live_bids(engine, [p.symbol for p in open_positions])
+    summ = engine.get_portfolio_summary(settings, live_bid_by_symbol=bids, track=track)
+    total_pnl = summ["realized_pnl_usdc"] + summ["unrealized_pnl_usdc"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Açık Pozisyon Anlık K/Z",
+        f"{summ['unrealized_pnl_usdc']:+.4f} {quote}",
+        help="Anlık alış fiyatı ile; giriş komisyonu ve tahmini çıkış komisyonu düşülmüş net değer.",
+    )
+    c2.metric("Bugünkü Net K/Z (İstanbul)", f"{summ['daily_net_pnl_usdc']:+.4f} {quote}")
+    c3.metric("Toplam Net K/Z (Gerçekleşen + Açık)", f"{total_pnl:+.4f} {quote}")
+    c4.metric("Anlık Portföy Değeri", f"{summ['total_equity_usdc']:.2f} {quote}")
+
+    if open_positions:
+        rows = []
+        for p in open_positions:
+            bid = bids.get(p.symbol)
+            if bid is None:
+                rows.append({"Parite": p.symbol, "Durum": "Anlık fiyat alınamadı"})
+                continue
+            gross_val, pnl = compute_open_position_unrealized_net_pnl(
+                p, current_bid=bid, estimated_fee_rate=settings.estimated_fee_rate
+            )
+            cost = p.cost_basis_usdc + p.entry_fee_usdc
+            pnl_pct = (pnl / cost * Decimal("100")) if cost > 0 else Decimal("0")
+            move_pct = (bid - p.entry_price) / p.entry_price * Decimal("100") if p.entry_price > 0 else Decimal("0")
+            sl_dist = (
+                f"%{(bid - p.stop_loss_price) / bid * Decimal('100'):.2f}"
+                if p.stop_loss_price
+                else "-"
+            )
+            tp_dist = (
+                f"%{(p.take_profit_price - bid) / bid * Decimal('100'):.2f}"
+                if p.take_profit_price
+                else "-"
+            )
+            rows.append(
+                {
+                    "Parite": p.symbol,
+                    "Durum": "🟢 Kârda" if pnl > 0 else "🔴 Zararda",
+                    "Miktar": f"{p.quantity:.8f}",
+                    "Giriş Fiyatı": f"{p.entry_price:.6g}",
+                    "Anlık Fiyat": f"{bid:.6g}",
+                    "Fiyat Değişimi": f"%{move_pct:+.2f}",
+                    f"Anlık Değer ({quote})": f"{gross_val:.4f}",
+                    f"Net K/Z ({quote})": f"{pnl:+.4f}",
+                    "Net K/Z (%)": f"%{pnl_pct:+.2f}",
+                    "Zarar-Kes'e Uzaklık": sl_dist,
+                    "Kâr-Al'a Uzaklık": tp_dist,
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.caption("Şu anda açık pozisyon yok; yeni alım sinyali bekleniyor.")
+
+    st.caption(
+        f"Son güncelleme (İstanbul): {datetime.now(timezone.utc).astimezone(tz).strftime('%H:%M:%S')} "
+        "— Net K/Z, komisyonlar düşülerek hesaplanır."
+    )
+
+
+@st.fragment(run_every=10)
+def _render_live_pnl_fragment(
+    engine: TradingSystemEngine,
+    settings: RiskSettings,
+    track: str,
+    quote: str,
+    tz,
+) -> None:
+    _render_live_pnl(engine, settings, track, quote, tz)
 
 
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
@@ -153,7 +260,7 @@ def main() -> None:
         selected_profile_key = st.selectbox(
             "İşlem Profili",
             options=profile_keys,
-            index=profile_keys.index("TEMKINLI"),
+            index=profile_keys.index("HIZLI_30SN"),
             format_func=lambda k: TRADING_PROFILES[k].label_tr,
         )
         active_profile = get_profile(selected_profile_key)
@@ -234,7 +341,7 @@ def main() -> None:
             f"Spot {selected_quote} İşlem Çifti", options=symbol_options, index=0
         )
 
-        interval_options = ["5m", "15m", "30m", "1h", "4h"]
+        interval_options = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
         default_int_idx = (
             interval_options.index(active_profile.interval)
             if active_profile.interval in interval_options
@@ -250,7 +357,7 @@ def main() -> None:
         st.divider()
         st.subheader("🤖 Yapay Zekâ (Gemini) Ayarları")
         if cfg.has_gemini_key:
-            ai_enabled = st.toggle("Gemini Karar Modülü Aktif", value=True)
+            ai_enabled = st.toggle("Gemini Karar Modülü Aktif", value=(not active_profile.direct_rule_execution))
             st.caption(f"Model: `{cfg.gemini_model}` (Resmî `google-genai` SDK)")
         else:
             ai_enabled = False
@@ -278,6 +385,11 @@ def main() -> None:
         )
         if runner_alive:
             auto_loop = False
+        live_pnl_auto = st.toggle(
+            "Anlık K/Z Canlı Yenile (Her 10 sn)",
+            value=("PYTEST_CURRENT_TEST" not in os.environ),
+            help="Açık pozisyonun anlık kâr/zararını her 10 saniyede bir canlı günceller.",
+        )
 
     effective_mode = "LIVE_SPOT" if (mode_choice == "LIVE_SPOT" and ui_live_confirmed) else "PAPER"
     active_track = "LIVE_SPOT" if effective_mode == "LIVE_SPOT" else "MAIN"
@@ -377,7 +489,11 @@ def main() -> None:
         st.info(f"💤 {last_step.block_or_info_message}")
 
     # --- Portföy ve Maliyet Özeti Kartları ---
-    summary = engine.get_portfolio_summary(settings, track=active_track)
+    open_for_summary = storage.get_open_positions(track=active_track)
+    live_bids_for_summary = _fetch_live_bids(engine, [p.symbol for p in open_for_summary])
+    summary = engine.get_portfolio_summary(
+        settings, live_bid_by_symbol=live_bids_for_summary, track=active_track
+    )
     ai_usage = storage.get_ai_usage_summary(ist_today)
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -461,6 +577,11 @@ def main() -> None:
             )
 
     st.divider()
+    if live_pnl_auto:
+        _render_live_pnl_fragment(engine, settings, active_track, selected_quote, cfg.tz)
+    else:
+        _render_live_pnl(engine, settings, active_track, selected_quote, cfg.tz)
+    st.divider()
 
     # --- Ana Sekmeler ---
     tab_port, tab_cmp, tab_val, tab_cfg = st.tabs(
@@ -476,20 +597,27 @@ def main() -> None:
         st.subheader("Açık Pozisyon")
         open_pos = summary["open_positions"]
         if open_pos:
-            pos_rows = [
-                {
-                    "Pozisyon Kimliği": p.position_id,
-                    "Parite": p.symbol,
-                    "Miktar": f"{p.quantity:.8f}",
-                    f"Giriş Fiyatı ({selected_quote})": f"{p.entry_price:.6f}",
-                    f"Maliyet ({selected_quote})": f"{p.cost_basis_usdc:.2f}",
-                    "Giriş Komisyonu": f"{p.entry_fee_usdc:.4f}",
-                    "Zarar-Kes": f"{p.stop_loss_price:.6f}" if p.stop_loss_price else "-",
-                    "Kâr-Al": f"{p.take_profit_price:.6f}" if p.take_profit_price else "-",
-                    "Açılış Zamanı": p.opened_at_iso,
-                }
-                for p in open_pos
-            ]
+            pos_rows = []
+            for p in open_pos:
+                cur_bid = live_bids_for_summary.get(p.symbol, p.entry_price)
+                _, cur_pnl = compute_open_position_unrealized_net_pnl(
+                    p, current_bid=cur_bid, estimated_fee_rate=settings.estimated_fee_rate
+                )
+                pos_rows.append(
+                    {
+                        "Pozisyon Kimliği": p.position_id,
+                        "Parite": p.symbol,
+                        "Miktar": f"{p.quantity:.8f}",
+                        f"Giriş Fiyatı ({selected_quote})": f"{p.entry_price:.6f}",
+                        f"Anlık Fiyat ({selected_quote})": f"{cur_bid:.6f}",
+                        f"Anlık Net K/Z ({selected_quote})": f"{cur_pnl:+.4f}",
+                        f"Maliyet ({selected_quote})": f"{p.cost_basis_usdc:.2f}",
+                        "Giriş Komisyonu": f"{p.entry_fee_usdc:.4f}",
+                        "Zarar-Kes": f"{p.stop_loss_price:.6f}" if p.stop_loss_price else "-",
+                        "Kâr-Al": f"{p.take_profit_price:.6f}" if p.take_profit_price else "-",
+                        "Açılış Zamanı": p.opened_at_iso,
+                    }
+                )
             st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
         else:
             st.info("Şu anda açık pozisyon bulunmuyor.")

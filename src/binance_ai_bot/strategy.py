@@ -21,6 +21,9 @@ class StrategyParams:
     rsi_buy_max: float = 68.0
     rsi_overbought_exit: float = 74.0
     min_volume_ratio: float = 0.85
+    require_close_above_fast: bool = True
+    require_rising_momentum: bool = True
+    fast_exit: bool = False
 
 
 def compute_indicator_frame(
@@ -117,21 +120,32 @@ def evaluate_rule_signal_from_frame(
     vol_ratio = float(curr["volume_ratio"])
     close_val = float(curr["close"])
 
-    trend_up = ema_fast > ema_slow and close_val > ema_fast
-    momentum_rising = macd_hist > 0.0 and macd_hist >= prev_macd_hist
+    if cfg.require_close_above_fast:
+        trend_up = ema_fast > ema_slow and close_val > ema_fast
+    else:
+        trend_up = (ema_fast > ema_slow and close_val >= ema_slow) or (close_val > ema_fast)
+
+    if cfg.require_rising_momentum:
+        momentum_rising = macd_hist > 0.0 and macd_hist >= prev_macd_hist
+    else:
+        momentum_rising = (macd_hist >= 0.0) or (close_val > float(prev["close"]))
+
     rsi_healthy_for_buy = cfg.rsi_buy_min <= rsi_val <= cfg.rsi_buy_max
     volume_supported = vol_ratio >= cfg.min_volume_ratio
 
     trend_reversal_down = ema_fast < ema_slow and macd_hist < 0.0
     overbought_cooling = rsi_val >= cfg.rsi_overbought_exit and macd_hist < prev_macd_hist
+    quick_momentum_loss = cfg.fast_exit and (
+        (close_val < ema_fast and macd_hist <= 0.0) or (close_val < ema_slow)
+    )
 
     action: DecisionAction = "BEKLE"
     if trend_up and momentum_rising and rsi_healthy_for_buy and volume_supported:
         action = "AL"
         reason = (
-            f"Kural tabanlı yükseliş teyidi: EMA({cfg.ema_fast_span}) > EMA({cfg.ema_slow_span}), "
-            f"MACD histogram pozitif ({macd_hist:.4f}), RSI dengeli ({rsi_val:.1f}) ve "
-            f"hacim oranı yeterli ({vol_ratio:.2f}x)."
+            f"Kural tabanlı yükseliş teyidi: EMA({cfg.ema_fast_span})={ema_fast:.2f}, "
+            f"EMA({cfg.ema_slow_span})={ema_slow:.2f}, MACD_hist={macd_hist:.4f}, "
+            f"RSI={rsi_val:.1f}, Hacim={vol_ratio:.2f}x."
         )
     elif trend_reversal_down:
         action = "SAT"
@@ -145,11 +159,17 @@ def evaluate_rule_signal_from_frame(
             f"Kural tabanlı aşırı alım soğuması: RSI yüksek ({rsi_val:.1f}) ve "
             f"momentum ivmesi azalıyor."
         )
+    elif quick_momentum_loss:
+        action = "SAT"
+        reason = (
+            f"Hızlı çıkış (30sn/1dk aktif mod): Kapanış ({close_val:.4g}) kısa ortalama "
+            f"EMA({cfg.ema_fast_span}) altına indi veya ivme negatife döndü."
+        )
     else:
         action = "BEKLE"
         reason = (
-            f"Net kural kesişimi yok (EMA9={ema_fast:.2f}, EMA21={ema_slow:.2f}, "
-            f"RSI={rsi_val:.1f}, Hacim={vol_ratio:.2f}x); beklemede kalındı."
+            f"Net kural kesişimi yok (EMA{cfg.ema_fast_span}={ema_fast:.4g}, "
+            f"EMA{cfg.ema_slow_span}={ema_slow:.4g}, RSI={rsi_val:.1f}, Hacim={vol_ratio:.2f}x); beklemede kalındı."
         )
 
     return TechnicalSignal(

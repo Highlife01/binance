@@ -831,7 +831,7 @@ def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
             self.step_kwargs.append(kwargs)
             # Döngü sırasında kalp atışı yazılmış olmalı (panel kilidi için)
             alive, info = is_runner_alive(storage)
-            assert alive and info["profile"] in {"AKTIF", "TEMKINLI"}
+            assert alive and info["profile"] in {"HIZLI_30SN", "AKTIF", "TEMKINLI"}
             return StepCycleSummary(
                 ok=True,
                 timestamp_iso=datetime.now(timezone.utc).isoformat(),
@@ -1026,3 +1026,87 @@ def test_multi_coin_scan_paper_only_and_single_position(tmp_path: Path) -> None:
         lock_path=tmp_path / "t14.lock",
     )
     assert rc_live == 6
+
+
+# ---------------------------------------------------------------------------
+# TEST 15: 30 Saniyelik Hızlı Aktif Profil (1dk Mum) ve Anlık Canlı Kâr/Zarar Hesabı
+# ---------------------------------------------------------------------------
+def test_fast_30s_profile_and_live_unrealized_pnl(tmp_path: Path) -> None:
+    from binance_ai_bot.domain import Position
+    from binance_ai_bot.profiles import get_profile
+    from binance_ai_bot.strategy import evaluate_technical_strategy
+
+    hizli = get_profile("hizli_30sn")
+    assert hizli.loop_seconds == 30
+    assert hizli.interval == "1m"
+    assert hizli.direct_rule_execution is True
+
+    # Sert güvenlik sınırları (10 USDT işlem üst sınırı, 2 USDT günlük zarar kilidi) AYNEN korunmalı
+    base_risk = RiskSettings(
+        max_position_size_usdc=Decimal("10.00"),
+        daily_loss_limit_usdc=Decimal("2.00"),
+    )
+    applied = hizli.apply_to_risk_settings(base_risk)
+    assert applied.max_position_size_usdc == Decimal("10.00")
+    assert applied.daily_loss_limit_usdc == Decimal("2.00")
+    assert applied.max_open_positions == 1
+
+    # Düşük hacimli (0.25x) dengeli 1dk yükselişte TEMKINLI BEKLE derken HIZLI_30SN AL üretmeli
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    first_open = now_ms - 50 * 60_000
+    low_vol_candles: list[Candle] = []
+    px = Decimal("74500.00")
+    for i in range(45):
+        step = Decimal("28.00") if (i % 2 == 0 or i >= 43) else Decimal("-22.00")
+        o_p, c_p = px, px + step
+        vol = Decimal("3.0") if i == 44 else Decimal("12.0")  # son mumda hacim 0.25x
+        o_ms = first_open + i * 60_000
+        low_vol_candles.append(
+            Candle(
+                open_time_ms=o_ms,
+                open=o_p,
+                high=max(o_p, c_p) + Decimal("10"),
+                low=min(o_p, c_p) - Decimal("10"),
+                close=c_p,
+                volume=vol,
+                close_time_ms=o_ms + 59_999,
+                quote_volume=vol * c_p,
+                trade_count=80,
+                is_closed=True,
+            )
+        )
+        px = c_p
+
+    sig_temkinli, _ = evaluate_technical_strategy(
+        low_vol_candles, symbol="BTCUSDT", interval="1m", params=get_profile("temkinli").strategy
+    )
+    sig_fast, _ = evaluate_technical_strategy(
+        low_vol_candles, symbol="BTCUSDT", interval="1m", params=hizli.strategy
+    )
+    assert sig_temkinli.action == "BEKLE"
+    assert sig_fast.action == "AL"
+
+    # Anlık Kâr/Zarar (canlı bid ile) 0.000'da sabit kalmamalı; gerçek fiyat farkını yansıtmalı
+    cfg = AppConfig(sqlite_db_path=tmp_path / "t15.db", initial_balance_usdc=Decimal("86.73"))
+    eng = TradingSystemEngine(cfg)
+    eng.storage.insert_position(
+        Position(
+            position_id="POS-PNL-1",
+            symbol="BTCUSDT",
+            quantity=Decimal("0.00010"),
+            entry_price=Decimal("75000.00"),
+            cost_basis_usdc=Decimal("7.50"),
+            entry_fee_usdc=Decimal("0.0075"),
+            opened_at_iso=datetime.now(timezone.utc).isoformat(),
+            signal_key="SIG-PNL-1",
+            strategy_source="HIZLI_30SN",
+            stop_loss_price=Decimal("74737.50"),
+            take_profit_price=Decimal("75337.50"),
+            status="OPEN",
+        ),
+        track="MAIN",
+    )
+    summ_up = eng.get_portfolio_summary(
+        applied, live_bid_by_symbol={"BTCUSDT": Decimal("76000.00")}, track="MAIN"
+    )
+    assert summ_up["unrealized_pnl_usdc"] > Decimal("0.08")
