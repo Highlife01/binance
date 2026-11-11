@@ -163,7 +163,7 @@ class BinanceLiveSpotExecutor:
         self.storage.set_state("live_earn_ldusdc", f"{ldusdc_free:.8f}")
 
         perms = {str(p).upper() for p in data.get("permissions", [])}
-        spot_perm = "SPOT" in perms
+        spot_perm = ("SPOT" in perms) or any(p.startswith("TRD_GRP_") for p in perms)
         self.storage.set_state("live_spot_permission_ok", "1" if spot_perm else "0")
         return balances
 
