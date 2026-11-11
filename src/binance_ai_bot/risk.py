@@ -142,17 +142,17 @@ class RiskManager:
         ref_now = now_utc or datetime.now(timezone.utc)
         ist_date = self.storage.istanbul_date_str(ref_now)
 
-        # 0. Yalnızca aktif Spot USDC çiftleri ve izinsiz stabilcoin dönüşüm engeli
-        if not filters.is_tradable_usdc_spot:
+        # 0. Yalnızca aktif Spot USDT/USDC çiftleri ve izinsiz stabilcoin dönüşüm engeli
+        if not filters.is_tradable_spot_for_quote():
             return RiskCheckResult(
                 allowed=False,
-                reason=f"{filters.symbol} aktif bir Spot USDC çifti değil (durum: {filters.status}).",
+                reason=f"{filters.symbol} aktif bir Spot USDT/USDC çifti değil (durum: {filters.status}).",
             )
 
         if not settings.allow_stablecoin_conversion and filters.base_asset in STABLECOIN_OR_FIAT_ASSETS:
             return RiskCheckResult(
                 allowed=False,
-                reason=f"{filters.symbol} stabilcoin/itibari dönüşüm çiftidir; USDC izinsiz dönüştürülmez.",
+                reason=f"{filters.symbol} stabilcoin/itibari dönüşüm çiftidir; bakiye izinsiz dönüştürülmez.",
             )
 
         # 1. Kullanıcı veya sistem duraklatması (yalnızca ana portföy için kullanıcı kilidi)

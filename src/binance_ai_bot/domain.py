@@ -47,8 +47,12 @@ class SymbolFilters:
 
     @property
     def is_tradable_usdc_spot(self) -> bool:
+        return self.is_tradable_spot_for_quote("USDC")
+
+    def is_tradable_spot_for_quote(self, quote_asset: str | None = None) -> bool:
+        allowed_quotes = {quote_asset.upper()} if quote_asset else {"USDC", "USDT"}
         return (
-            self.quote_asset == "USDC"
+            self.quote_asset in allowed_quotes
             and self.status == "TRADING"
             and self.is_spot_trading_allowed
         )

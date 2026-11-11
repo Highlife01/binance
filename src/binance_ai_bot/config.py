@@ -63,6 +63,7 @@ class AppConfig:
     # Binance herkese acik veri katmani (Turkiye resmi erisilebilir uc nokta: api.binance.me)
     binance_public_base_url: str = "https://api.binance.me"
     binance_fallback_base_url: str = "https://data-api.binance.vision"
+    quote_asset: str = "USDC"
     default_symbol: str = "BTCUSDC"
     default_interval: str = "15m"
     max_data_age_seconds: int = 120
@@ -154,6 +155,11 @@ def load_config(env_path: Path | None = None) -> AppConfig:
         ),
         binance_fallback_base_url=(
             os.getenv("BINANCE_FALLBACK_BASE_URL", "https://data-api.binance.vision").strip().rstrip("/")
+        ),
+        quote_asset=(
+            os.getenv("QUOTE_ASSET", "USDC").strip().upper()
+            if os.getenv("QUOTE_ASSET", "USDC").strip().upper() in {"USDC", "USDT"}
+            else "USDC"
         ),
         default_symbol=os.getenv("DEFAULT_SYMBOL", "BTCUSDC").strip().upper() or "BTCUSDC",
         default_interval=os.getenv("DEFAULT_INTERVAL", "15m").strip() or "15m",

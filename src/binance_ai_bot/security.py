@@ -47,9 +47,9 @@ ALLOWED_LIVE_SPOT_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-# USDC'nin izinsiz başka stabilcoin veya itibari para çiftine dönüştürülmesini önleyen liste
+# Stabilcoin veya itibari para donusum ciftlerini izinsiz alim-satima karsi koruyan varlik seti
 STABLECOIN_OR_FIAT_ASSETS: frozenset[str] = frozenset(
-    {"USDT", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "TRY", "BRL", "GBP", "AEUR"}
+    {"USDC", "USDT", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "TRY", "BRL", "GBP", "AEUR"}
 )
 
 # Olası gizli anahtar / kimlik bilgisi sızıntı kalıpları

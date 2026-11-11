@@ -694,3 +694,96 @@ def test_streamlit_turkish_dashboard_renders_cleanly(tmp_path: Path, monkeypatch
     assert "Toplam Portföy Değeri" in metrics_labels
     assert "Toplam İşlem Komisyonu" in metrics_labels
     assert "Tahmini Yapay Zekâ Maliyeti" in metrics_labels
+
+
+# ---------------------------------------------------------------------------
+# TEST 12: USDT Spot Parite Keşfi, Stabilcoin Koruma ve Canlı USDT Bakiye Desteği
+# ---------------------------------------------------------------------------
+def test_usdt_spot_pair_discovery_risk_and_live_balance(tmp_path: Path) -> None:
+    import httpx
+    from binance_ai_bot.market_data import BinancePublicDataClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/time":
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            return httpx.Response(200, json={"serverTime": now_ms})
+        if request.url.path == "/api/v3/exchangeInfo":
+            return httpx.Response(
+                200,
+                json={
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "baseAsset": "BTC",
+                            "quoteAsset": "USDT",
+                            "status": "TRADING",
+                            "isSpotTradingAllowed": True,
+                            "filters": [
+                                {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+                                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "100", "stepSize": "0.00001"},
+                                {"filterType": "NOTIONAL", "minNotional": "5.00"},
+                            ],
+                        },
+                        {
+                            "symbol": "USDCUSDT",
+                            "baseAsset": "USDC",
+                            "quoteAsset": "USDT",
+                            "status": "TRADING",
+                            "isSpotTradingAllowed": True,
+                            "filters": [
+                                {"filterType": "PRICE_FILTER", "minPrice": "0.0001", "maxPrice": "10", "tickSize": "0.0001"},
+                                {"filterType": "LOT_SIZE", "minQty": "1.0", "maxQty": "100000", "stepSize": "1.0"},
+                                {"filterType": "NOTIONAL", "minNotional": "5.00"},
+                            ],
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/api/v3/account":
+            return httpx.Response(
+                200,
+                json={
+                    "canTrade": True,
+                    "permissions": ["TRD_GRP_065"],
+                    "balances": [
+                        {"asset": "USDT", "free": "86.72628900", "locked": "0.00000000"},
+                        {"asset": "LDUSDC", "free": "0.00000344", "locked": "0.00000000"},
+                    ],
+                },
+            )
+        return httpx.Response(404, json={})
+
+    mock_client = httpx.Client(transport=httpx.MockTransport(handler))
+    cfg = AppConfig(
+        sqlite_db_path=tmp_path / "t12.db",
+        quote_asset="USDT",
+        default_symbol="BTCUSDT",
+        enable_live_trading=True,
+        binance_api_key="test_k",
+        binance_api_secret="test_s",
+    )
+    storage = SQLiteStorage(tmp_path / "t12.db", initial_balance_usdc=Decimal("86.73"))
+    pub = BinancePublicDataClient(cfg, http_client=mock_client)
+    usdt_pairs = pub.discover_spot_pairs(quote_asset="USDT", allow_stablecoin_conversion=False)
+    assert "BTCUSDT" in usdt_pairs
+    assert "USDCUSDT" not in usdt_pairs  # Stabilcoin dönüşümü izinsiz açılmaz
+
+    risk_mgr = RiskManager(storage)
+    btcusdt_book = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(price=Decimal("95000.00"), quantity=Decimal("1.0"))],
+        asks=[OrderBookLevel(price=Decimal("95010.00"), quantity=Decimal("1.0"))],
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url="https://api.binance.me",
+    )
+    chk = risk_mgr.check_buy_entry(
+        filters=usdt_pairs["BTCUSDT"],
+        order_book=btcusdt_book,
+        settings=RiskSettings(max_position_size_usdc=Decimal("10.00")),
+    )
+    assert chk.allowed is True
+
+    live_exec = BinanceLiveSpotExecutor(cfg, storage, http_client=mock_client)
+    bals = live_exec.fetch_live_spot_balances(ui_live_confirmed=True, quote_asset="USDT")
+    assert bals["USDT"] == Decimal("86.72628900")
+    assert storage.get_cash_balance(track="LIVE_SPOT") == Decimal("86.72628900")

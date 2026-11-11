@@ -83,7 +83,7 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.3.0"
+ENGINE_STATE_VERSION = "1.4.0"
 
 
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
@@ -97,6 +97,7 @@ def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
         cfg.has_binance_live_keys,
         cfg.has_gemini_key,
         cfg.gemini_model,
+        cfg.quote_asset,
     )
     if (
         "engine" not in st.session_state
@@ -117,11 +118,21 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Çalışma Ayarları")
 
+        quote_options = ["USDT", "USDC"]
+        default_quote_idx = quote_options.index(cfg.quote_asset) if cfg.quote_asset in quote_options else 0
+        selected_quote = st.radio(
+            "Baz Para Birimi (Spot Cüzdan)",
+            options=quote_options,
+            index=default_quote_idx,
+            horizontal=True,
+            help="Spot cüzdanınızda bulundurduğunuz ana bakiye para birimi (USDT veya USDC).",
+        )
+
         mode_choice = st.radio(
             "İşlem Yürütme Modu",
             options=["PAPER", "LIVE_SPOT"],
             format_func=lambda m: (
-                "🟢 Sanal Deneme (86 USDC Sanal)"
+                f"🟢 Sanal Deneme ({cfg.initial_balance_usdc:.0f} {selected_quote} Sanal)"
                 if m == "PAPER"
                 else "🔴 Gerçek Para — Canlı Spot (Çift Kilitli)"
             ),
@@ -132,7 +143,7 @@ def main() -> None:
         ui_live_confirmed = False
         if mode_choice == "LIVE_SPOT":
             st.warning(
-                "Gerçek Spot modunda işlemler gerçek Binance Global USDC bakiyenizle yapılır. "
+                f"Gerçek Spot modunda işlemler gerçek Binance Global {selected_quote} bakiyenizle yapılır. "
                 "Kâr garantisi yoktur ve bilgisayar uykuya geçtiğinde bot durur."
             )
             if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
@@ -151,17 +162,20 @@ def main() -> None:
                 ui_live_confirmed = bool(ack_risk and unlock_switch)
                 if ui_live_confirmed:
                     sync_now = st.button("🔄 Gerçek Binance Bakiyesini Sorgula", width="stretch")
-                    if sync_now or not st.session_state.get("live_balance_synced"):
+                    last_synced_quote = st.session_state.get("live_balance_quote")
+                    if sync_now or not st.session_state.get("live_balance_synced") or last_synced_quote != selected_quote:
                         try:
                             bals = engine.live_executor.fetch_live_spot_balances(
-                                ui_live_confirmed=True
+                                ui_live_confirmed=True,
+                                quote_asset=selected_quote,
                             )
                             st.session_state["live_balance_synced"] = True
-                            usdc_now = bals.get("USDC", Decimal("0"))
-                            ldusdc_now = bals.get("LDUSDC", Decimal("0"))
+                            st.session_state["live_balance_quote"] = selected_quote
+                            quote_now = bals.get(selected_quote, Decimal("0"))
+                            earn_now = bals.get(f"LD{selected_quote}", Decimal("0"))
                             spot_perm_ok = storage.get_state("live_spot_permission_ok", "0") == "1"
                             st.success(
-                                f"Gerçek hesap okundu. Spot Serbest USDC: {usdc_now:.2f} USDC"
+                                f"Gerçek hesap okundu. Spot Serbest {selected_quote}: {quote_now:.2f} {selected_quote}"
                             )
                             if not spot_perm_ok:
                                 st.warning(
@@ -169,22 +183,25 @@ def main() -> None:
                                     "işaretli değil (yalnızca Okuma açık). Emir gönderebilmek için Binance API "
                                     "ekranında önce IP adresinizi girip bu kutuyu işaretlemeniz gerekir."
                                 )
-                            if usdc_now < Decimal("5.0") and ldusdc_now > Decimal("0"):
+                            if quote_now < Decimal("5.0") and earn_now > Decimal("0"):
                                 st.warning(
-                                    f"💡 Spot cüzdanınızda serbest USDC `{usdc_now:.2f}` görünüyor; ancak "
-                                    f"**Binance Simple Earn (Esnek Birikim)** hesabınızda **`{ldusdc_now:.2f} LDUSDC`** bulundu! "
+                                    f"💡 Spot cüzdanınızda serbest {selected_quote} `{quote_now:.2f}` görünüyor; ancak "
+                                    f"**Binance Simple Earn (Esnek Birikim)** hesabınızda **`{earn_now:.2f} LD{selected_quote}`** bulundu! "
                                     "Binance API'si Earn içindeki parayı doğrudan kullanamaz. Uygulamadan "
-                                    "**Earn (Kazan) -> USDC -> Redeem (Parayı Çek / Geri Al -> Spot Cüzdanı)** "
+                                    f"**Earn (Kazan) -> {selected_quote} -> Redeem (Parayı Çek / Geri Al -> Spot Cüzdanı)** "
                                     "yapıp **Auto-Subscribe (Otomatik Katılım)** özelliğini kapatın."
                                 )
                         except Exception as exc:
                             st.error(f"Canlı hesap okuma uyarısı: {exc}")
 
         st.divider()
-        symbol_options = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "BNBUSDC", "XRPUSDC", "ADAUSDC", "AVAXUSDC"]
-        if cfg.default_symbol not in symbol_options:
+        base_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX"]
+        symbol_options = [f"{coin}{selected_quote}" for coin in base_coins]
+        if cfg.default_symbol.endswith(selected_quote) and cfg.default_symbol not in symbol_options:
             symbol_options.insert(0, cfg.default_symbol)
-        selected_symbol = st.selectbox("Spot USDC İşlem Çifti", options=symbol_options, index=0)
+        selected_symbol = st.selectbox(
+            f"Spot {selected_quote} İşlem Çifti", options=symbol_options, index=0
+        )
 
         interval_options = ["5m", "15m", "30m", "1h", "4h"]
         default_int_idx = interval_options.index(cfg.default_interval) if cfg.default_interval in interval_options else 1
@@ -192,7 +209,7 @@ def main() -> None:
             "Kapanmış Mum Periyodu",
             options=interval_options,
             index=default_int_idx,
-            help="86 USDC bakiyede komisyon erimesini önlemek için 15m veya 1h önerilir.",
+            help=f"Küçük bakiyede ({selected_quote}) komisyon erimesini önlemek için 15m veya 1h önerilir.",
         )
 
         st.divider()
@@ -230,17 +247,17 @@ def main() -> None:
             f"""
             <div style="background-color:#0F766E;color:#FFFFFF;padding:14px 20px;border-radius:10px;
                         font-size:18px;font-weight:700;margin-bottom:14px;border-left:8px solid #99F6E4;">
-                🛡️ {SIMULATION_MODE_LABEL} — Gerçek Binance Bakiyenize Dokunulmaz (Başlangıç Sanal Kasa: {cfg.initial_balance_usdc:.2f} USDC)
+                🛡️ {SIMULATION_MODE_LABEL} — Gerçek Binance Bakiyenize Dokunulmaz (Başlangıç Sanal Kasa: {cfg.initial_balance_usdc:.2f} {selected_quote})
             </div>
             """,
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            """
+            f"""
             <div style="background-color:#991B1B;color:#FFFFFF;padding:14px 20px;border-radius:10px;
                         font-size:18px;font-weight:700;margin-bottom:14px;border-left:8px solid #FCA5A5;">
-                ⚠️ DİKKAT: CANLI SPOT İŞLEM MODU AKTİF — GERÇEK BINANCE GLOBAL USDC BAKİYESİ KULLANILMAKTADIR
+                ⚠️ DİKKAT: CANLI SPOT İŞLEM MODU AKTİF — GERÇEK BINANCE GLOBAL {selected_quote} BAKİYESİ KULLANILMAKTADIR
             </div>
             """,
             unsafe_allow_html=True,
@@ -316,21 +333,21 @@ def main() -> None:
     ai_usage = storage.get_ai_usage_summary(ist_today)
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Kullanılabilir Nakit", f"{summary['cash_usdc']:.2f} USDC")
-    m2.metric("Toplam Portföy Değeri", f"{summary['total_equity_usdc']:.2f} USDC")
+    m1.metric("Kullanılabilir Nakit", f"{summary['cash_usdc']:.2f} {selected_quote}")
+    m2.metric("Toplam Portföy Değeri", f"{summary['total_equity_usdc']:.2f} {selected_quote}")
     m3.metric(
         "Gerçekleşmiş Kâr/Zarar",
-        f"{summary['realized_pnl_usdc']:+.3f} USDC",
+        f"{summary['realized_pnl_usdc']:+.3f} {selected_quote}",
         help="Kapanmış pozisyonların giriş+çıkış komisyonu düşülmüş net sonucu.",
     )
     m4.metric(
         "Açık Pozisyon Net K/Z",
-        f"{summary['unrealized_pnl_usdc']:+.3f} USDC",
+        f"{summary['unrealized_pnl_usdc']:+.3f} {selected_quote}",
         help="Anlık alış kotasyonu ve tahmini çıkış komisyonu düşülmüş net değer değişimi.",
     )
     m5.metric(
         "Toplam İşlem Komisyonu",
-        f"{summary['total_fees_usdc']:.4f} USDC",
+        f"{summary['total_fees_usdc']:.4f} {selected_quote}",
         help=f"Varsayılan komisyon oranı: %{settings.estimated_fee_rate * Decimal('100'):.2f}",
     )
     ai_cost_label = (

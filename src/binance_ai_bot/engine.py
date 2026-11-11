@@ -224,13 +224,16 @@ class TradingSystemEngine:
         """
         is_live_mode = execution_mode == "LIVE_SPOT"
         active_track = "LIVE_SPOT" if is_live_mode else "MAIN"
+        quote_ccy = "USDT" if symbol.strip().upper().endswith("USDT") else "USDC"
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()
         ist_date = self.storage.istanbul_date_str(now_utc)
 
         if is_live_mode:
             try:
-                self.live_executor.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed)
+                self.live_executor.fetch_live_spot_balances(
+                    ui_live_confirmed=ui_live_confirmed, quote_asset=quote_ccy
+                )
             except (LiveOrderBlockedError, LiveExecutionError) as exc:
                 return StepCycleSummary(
                     ok=False,
@@ -551,17 +554,19 @@ class TradingSystemEngine:
             return False, "Kapatılacak açık pozisyon bulunmuyor."
 
         pos = open_positions[0]
+        pos_quote = "USDT" if pos.symbol.endswith("USDT") else "USDC"
         try:
-            usdc_map = self.market_client.discover_usdc_spot_pairs(
-                allow_stablecoin_conversion=settings.allow_stablecoin_conversion
+            spot_map = self.market_client.discover_spot_pairs(
+                quote_asset=pos_quote,
+                allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
             )
-            if pos.symbol not in usdc_map:
+            if pos.symbol not in spot_map:
                 return False, f"{pos.symbol} borsa filtre bilgisi alınamadı."
             if is_live:
                 now_utc = datetime.now(timezone.utc)
                 res = self.live_executor.execute_live_market_sell(
                     position=pos,
-                    filters=usdc_map[pos.symbol],
+                    filters=spot_map[pos.symbol],
                     signal_key=f"MANUAL_LIVE_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
                     strategy_source="KULLANICI_MANUEL",
                     close_reason="MANUEL_KAPATMA",
@@ -579,7 +584,7 @@ class TradingSystemEngine:
         now_utc = datetime.now(timezone.utc)
         res = self.simulator.execute_sell_position(
             position=pos,
-            filters=usdc_map[pos.symbol],
+            filters=spot_map[pos.symbol],
             order_book=book,
             signal_key=f"MANUAL_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
             strategy_source="KULLANICI_MANUEL",

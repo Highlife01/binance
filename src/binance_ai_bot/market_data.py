@@ -321,16 +321,18 @@ class BinancePublicDataClient:
             if close_after:
                 client_to_use.close()
 
-    def discover_usdc_spot_pairs(
+    def discover_spot_pairs(
         self,
         *,
+        quote_asset: str | None = None,
         allow_stablecoin_conversion: bool = False,
         force_refresh: bool = False,
     ) -> dict[str, SymbolFilters]:
         """
-        Binance `exchangeInfo` üzerinden aktif, kaldıraçsız Spot `USDC` çiftlerini ve
+        Binance `exchangeInfo` üzerinden aktif, kaldıraçsız Spot (`USDT` ve `USDC`) çiftlerini ve
         emir filtrelerini dinamik olarak keşfeder (15 dakika önbellekli).
         """
+        target_quotes = {quote_asset.strip().upper()} if quote_asset else {"USDC", "USDT"}
         now_mono = time.monotonic()
         if (
             not force_refresh
@@ -340,21 +342,23 @@ class BinancePublicDataClient:
             return {
                 sym: flt
                 for sym, flt in self._exchange_info_cache.items()
-                if allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS
+                if flt.quote_asset in target_quotes
+                and (allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS)
             }
 
         data, _ = self._get_json("/api/v3/exchangeInfo")
         symbols_raw = data.get("symbols", [])
         discovered: dict[str, SymbolFilters] = {}
         for item in symbols_raw:
-            if str(item.get("quoteAsset", "")).upper() != "USDC":
+            q_asset = str(item.get("quoteAsset", "")).upper()
+            if q_asset not in {"USDC", "USDT"}:
                 continue
             parsed = parse_symbol_filters(item)
-            if parsed.is_tradable_usdc_spot:
+            if parsed.is_tradable_spot_for_quote(q_asset):
                 discovered[parsed.symbol] = parsed
 
         if not discovered:
-            raise MarketDataError("exchangeInfo içinde aktif Spot USDC işlem çifti bulunamadı.")
+            raise MarketDataError("exchangeInfo içinde aktif Spot USDT/USDC işlem çifti bulunamadı.")
 
         self._exchange_info_cache = discovered
         self._exchange_info_fetched_at = now_mono
@@ -362,8 +366,22 @@ class BinancePublicDataClient:
         return {
             sym: flt
             for sym, flt in discovered.items()
-            if allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS
+            if flt.quote_asset in target_quotes
+            and (allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS)
         }
+
+    def discover_usdc_spot_pairs(
+        self,
+        *,
+        allow_stablecoin_conversion: bool = False,
+        force_refresh: bool = False,
+    ) -> dict[str, SymbolFilters]:
+        """Geriye dönük uyumlu USDC Spot çift keşfi."""
+        return self.discover_spot_pairs(
+            quote_asset="USDC",
+            allow_stablecoin_conversion=allow_stablecoin_conversion,
+            force_refresh=force_refresh,
+        )
 
     def fetch_top_usdc_pairs_by_volume(
         self, limit: int = 20, allow_stablecoin_conversion: bool = False
@@ -430,33 +448,35 @@ class BinancePublicDataClient:
         Tek bir analiz adımı için:
         1. Uyku dönüşünü kontrol eder,
         2. Sunucu saatini alır,
-        3. Sembolün aktif USDC spot kurallarını doğrular,
+        3. Sembolün aktif Spot (USDT veya USDC) kurallarını doğrular,
         4. Yalnızca kapanmış mumları ve canlı emir defterini çeker,
         5. Tazelik ve bütünlük kontrolünden geçirir.
         """
         sym = symbol.strip().upper()
+        inferred_quote = "USDT" if sym.endswith("USDT") else "USDC"
         wake_gap = self.detect_windows_wake_gap()
 
         time_payload, src_url = self._get_json("/api/v3/time")
         server_time_ms = int(time_payload["serverTime"])
 
-        usdc_pairs = self.discover_usdc_spot_pairs(
+        spot_pairs = self.discover_spot_pairs(
+            quote_asset=inferred_quote,
             allow_stablecoin_conversion=allow_stablecoin_conversion,
             force_refresh=wake_gap,
         )
-        if sym not in usdc_pairs:
+        if sym not in spot_pairs:
             # Belki stabilcoin dönüşüm korumasından dolayı hariç tutuldu; nedenini açıkla
-            all_usdc = self._exchange_info_cache
-            if sym in all_usdc and all_usdc[sym].base_asset in STABLECOIN_OR_FIAT_ASSETS:
+            all_cached = self._exchange_info_cache
+            if sym in all_cached and all_cached[sym].base_asset in STABLECOIN_OR_FIAT_ASSETS:
                 raise MarketDataError(
                     f"{sym} bir stabilcoin/itibari para dönüşüm çiftidir. "
-                    "USDC izinsiz başka varlığa dönüştürülmez."
+                    f"{inferred_quote} izinsiz başka varlığa dönüştürülmez."
                 )
             raise MarketDataError(
-                f"{sym} çifti aktif Binance Spot USDC listesinde bulunamadı veya işleme kapalı."
+                f"{sym} çifti aktif Binance Spot {inferred_quote} listesinde bulunamadı veya işleme kapalı."
             )
 
-        filters = usdc_pairs[sym]
+        filters = spot_pairs[sym]
         raw_klines, kline_src = self._get_json(
             "/api/v3/klines",
             params={"symbol": sym, "interval": interval, "limit": candle_limit},

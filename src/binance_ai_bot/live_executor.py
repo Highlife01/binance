@@ -142,8 +142,13 @@ class BinanceLiveSpotExecutor:
             if close_after:
                 client.close()
 
-    def fetch_live_spot_balances(self, *, ui_live_confirmed: bool) -> dict[str, Decimal]:
+    def fetch_live_spot_balances(
+        self, *, ui_live_confirmed: bool, quote_asset: str = "USDC"
+    ) -> dict[str, Decimal]:
         """Gerçek Binance Spot hesabındaki serbest (`free`) varlık bakiyelerini okur ve SQLite'ta günceller."""
+        q_norm = quote_asset.strip().upper() if quote_asset.strip().upper() in {"USDT", "USDC"} else "USDC"
+        earn_key = f"LD{q_norm}"
+
         data = self._request_signed("GET", "/api/v3/account", ui_live_confirmed=ui_live_confirmed)
         if not bool(data.get("canTrade", False)):
             raise LiveExecutionError(
@@ -154,13 +159,13 @@ class BinanceLiveSpotExecutor:
         for item in data.get("balances", []):
             asset = str(item.get("asset", "")).upper()
             free_amt = Decimal(str(item.get("free", "0")))
-            if free_amt > 0 or asset in {"USDC", "LDUSDC"}:
+            if free_amt > 0 or asset in {"USDC", "USDT", "LDUSDC", "LDUSDT"}:
                 balances[asset] = free_amt
 
-        usdc_free = balances.get("USDC", Decimal("0"))
-        ldusdc_free = balances.get("LDUSDC", Decimal("0"))
-        self.storage.set_state("live_spot_cash_usdc", f"{usdc_free:.8f}")
-        self.storage.set_state("live_earn_ldusdc", f"{ldusdc_free:.8f}")
+        quote_free = balances.get(q_norm, Decimal("0"))
+        earn_free = balances.get(earn_key, Decimal("0"))
+        self.storage.set_state("live_spot_cash_usdc", f"{quote_free:.8f}")
+        self.storage.set_state("live_earn_ldusdc", f"{earn_free:.8f}")
 
         perms = {str(p).upper() for p in data.get("permissions", [])}
         spot_perm = ("SPOT" in perms) or any(p.startswith("TRD_GRP_") for p in perms)
@@ -213,11 +218,12 @@ class BinanceLiveSpotExecutor:
         avg_price = (cumm_quote / executed_qty) if executed_qty > 0 else Decimal("0")
 
         # Fills dizisinden gerçek kesilen komisyonu hesapla
+        q_ccy = filters.quote_asset
         fee_usdc = Decimal("0")
         for fill in resp.get("fills", []):
             comm = Decimal(str(fill.get("commission", "0")))
             comm_asset = str(fill.get("commissionAsset", "")).upper()
-            if comm_asset == "USDC":
+            if comm_asset == q_ccy:
                 fee_usdc += comm
             elif comm_asset == filters.base_asset and avg_price > 0:
                 fee_usdc += comm * avg_price
@@ -265,7 +271,7 @@ class BinanceLiveSpotExecutor:
             strategy_source=strategy_source,
             explanation=(
                 f"GERÇEK SPOT ALIM ({mapped_status}): {eff_qty} {filters.base_asset} "
-                f"@ {avg_price:.6f} USDC (Toplam: {cumm_quote:.2f} USDC, Komisyon: {fee_usdc:.4f} USDC)."
+                f"@ {avg_price:.6f} {q_ccy} (Toplam: {cumm_quote:.2f} {q_ccy}, Komisyon: {fee_usdc:.4f} {q_ccy})."
             ),
             created_at_iso=now_iso,
         )
@@ -286,9 +292,12 @@ class BinanceLiveSpotExecutor:
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()
         ist_date = self.storage.istanbul_date_str(now_utc)
+        q_ccy = filters.quote_asset
 
         # Hesaptaki gerçek serbest baz varlık miktarını doğrula (dust farkı nedeniyle -2010 hatasını önler)
-        balances = self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed)
+        balances = self.fetch_live_spot_balances(
+            ui_live_confirmed=ui_live_confirmed, quote_asset=q_ccy
+        )
         free_base = balances.get(filters.base_asset, Decimal("0"))
         sell_qty = quantize_down(min(position.quantity, free_base), filters.market_step_size)
         if sell_qty < max(filters.min_qty, filters.market_min_qty) or sell_qty <= Decimal("0"):
@@ -322,7 +331,7 @@ class BinanceLiveSpotExecutor:
         for fill in resp.get("fills", []):
             comm = Decimal(str(fill.get("commission", "0")))
             comm_asset = str(fill.get("commissionAsset", "")).upper()
-            if comm_asset == "USDC":
+            if comm_asset == q_ccy:
                 exit_fee_usdc += comm
 
         net_proceeds = cumm_quote - exit_fee_usdc
@@ -339,7 +348,7 @@ class BinanceLiveSpotExecutor:
             close_reason=close_reason,
         )
         self.storage.mark_signal_processed(signal_key, order_id, now_iso, track="LIVE_SPOT")
-        self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed)
+        self.fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=q_ccy)
 
         res = SimulatedOrderResult(
             order_id=order_id,
@@ -357,7 +366,7 @@ class BinanceLiveSpotExecutor:
             strategy_source=strategy_source,
             explanation=(
                 f"GERÇEK SPOT SATIŞ ({close_reason}): {executed_qty} {filters.base_asset} "
-                f"@ {avg_price:.6f} USDC (Net: {net_proceeds:.2f} USDC, K/Z: {realized_pnl:+.4f} USDC)."
+                f"@ {avg_price:.6f} {q_ccy} (Net: {net_proceeds:.2f} {q_ccy}, K/Z: {realized_pnl:+.4f} {q_ccy})."
             ),
             created_at_iso=now_iso,
             realized_pnl_usdc=realized_pnl,
