@@ -84,17 +84,16 @@ kesintisiz çalışma için:
 
 | Dosya | Ne yapar |
 |---|---|
-| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan **Hızlı Aktif (`30 sn` döngü, `1m` mum)** profili ile 10 coini tarar ve anlık K/Z gösterir |
-| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile tek paritede (varsayılan BTCUSDT) **30 sn döngüyle** canlı Spot alım-satım yapar |
+| `bot_sanal.bat` | **Sanal Deneme** — gerçek bakiyeye dokunmadan **Hızlı Aktif (`30 sn` döngü, `1m` mum)** profili ile 10 coini tarar, aynı anda en fazla 5 farklı coinde pozisyon tutar ve anlık K/Z gösterir |
+| `bot_canli.bat` | **Gerçek Para** — `.env` kilidi + konsolda `EVET` onayı ile 10 coini **30 sn döngüyle** tarar; aynı anda en fazla 5 farklı coinde (`5 × 10 USDT = maks 50 USDT`) canlı Spot alım-satım yapar |
 
-- Çoklu coin taraması **yalnızca sanal modda** çalışır: açık pozisyon yokken listedeki pariteler taranır,
-  ilk geçerli AL sinyaline girilir (yine tek pozisyon); pozisyon açıkken yalnızca o parite yönetilir ve her 30 saniyede bir anlık K/Z yazdırılır.
+- Çoklu coin taraması hem **Sanal** hem **Canlı Spot** modunda ve web panelinde aktiftir: her 30 saniyede önce tüm açık pozisyonların zarar-kes / kâr-al / SAT çıkışı denetlenir, ardından boş slot varsa diğer coinler taranır. Aynı coine üst üste ekleme (Martingale) kesinlikle yapılmaz.
 
 - İşlem profilleri (`src/binance_ai_bot/profiles.py`):
-  - `HIZLI_30SN` *(varsayılan)*: 30 sn döngü, 1dk mum, EMA(5/13), gevşetilmiş hacim (0.15x), günde en fazla 60 pozisyon, %0.35 zarar-kes / %0.45 kâr-al + hızlı trend çıkışı.
-  - `AKTIF`: 30 sn döngü, 5dk mum, gevşetilmiş hacim/RSI eşikleri, günde en fazla 12 pozisyon, %0.8 zarar-kes / %1.2 kâr-al.
-  - `TEMKINLI`: 60 sn döngü, 15dk mum, günde en fazla 3 pozisyon, %2.5 zarar-kes / %4.5 kâr-al.
-- Hiçbir profil işlem başına pozisyon sınırını (10), günlük zarar eşiğini (2) ve tek açık pozisyon kuralını gevşetmez.
+  - `HIZLI_30SN` *(varsayılan)*: 30 sn döngü, 1dk mum, EMA(5/13), gevşetilmiş hacim (0.15x), aynı anda en fazla 5 farklı coin, günde en fazla 60 pozisyon, %0.35 zarar-kes / %0.45 kâr-al + hızlı trend çıkışı.
+  - `AKTIF`: 30 sn döngü, 5dk mum, aynı anda en fazla 3 farklı coin, günde en fazla 12 pozisyon, %0.8 zarar-kes / %1.2 kâr-al.
+  - `TEMKINLI`: 60 sn döngü, 15dk mum, aynı anda 1 coin, günde en fazla 3 pozisyon, %2.5 zarar-kes / %4.5 kâr-al.
+- Hiçbir profil işlem başına pozisyon sınırını (10 USDT/USDC) ve günlük toplam zarar eşiğini (2.00 USDT/USDC) gevşetmez.
 - Aynı anda tek bot çalışabilir; bot çalışırken panelin otomatik döngüsü ve analiz düğmesi kilitlenir.
 - Bot çalıştığı sürece Windows uykuya geçmez. Durdurmak için `Ctrl+C`, pencereyi kapatmak veya paneldeki **Arka Plan Botunu Durdur**.
 - Kayıtlar: `logs/bot_YYYY-MM-DD.log`.

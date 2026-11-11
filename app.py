@@ -90,7 +90,7 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
-ENGINE_STATE_VERSION = "1.6.0"
+ENGINE_STATE_VERSION = "1.7.0"
 
 
 def _fetch_live_bids(engine: TradingSystemEngine, symbols: list[str]) -> dict[str, Decimal]:
@@ -340,6 +340,15 @@ def main() -> None:
         selected_symbol = st.selectbox(
             f"Spot {selected_quote} İşlem Çifti", options=symbol_options, index=0
         )
+        scan_all_coins = st.toggle(
+            f"🌐 Çoklu Coin Eşzamanlı Al-Sat ({len(symbol_options)} Coin)",
+            value=(active_profile.max_open_positions > 1),
+            help=(
+                f"Açıkken tek bir coine takılı kalmaz; listedeki {len(symbol_options)} coini birlikte tarar "
+                f"ve aynı anda en fazla {active_profile.max_open_positions} farklı coinde alım-satım yapar "
+                "(aynı coine üst üste ekleme yapmaz)."
+            ),
+        )
 
         interval_options = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
         default_int_idx = (
@@ -440,9 +449,9 @@ def main() -> None:
 
     with btn_col3:
         close_btn_label = (
-            "🛑 Canlı Pozisyonu Piyasadan Sat"
+            "🛑 Açık Canlı Pozisyonları Sat"
             if effective_mode == "LIVE_SPOT"
-            else "🛑 Sanal Pozisyonu Kapat"
+            else "🛑 Açık Sanal Pozisyonları Kapat"
         )
         if st.button(close_btn_label, width="stretch"):
             ok_close, close_msg = engine.manual_close_open_position(
@@ -456,28 +465,113 @@ def main() -> None:
                 st.warning(close_msg)
 
     with btn_col4:
+        eff_settings = active_profile.apply_to_risk_settings(settings)
         if paused:
             st.warning(f"Yeni Alımlar Durduruldu: {pause_reason or 'Kullanıcı kilidi'}")
+        elif scan_all_coins:
+            st.success(
+                f"Çoklu Coin Aktif: {len(symbol_options)} coin taranır (Eşzamanlı en fazla {eff_settings.max_open_positions} coin)"
+            )
         else:
             st.success("Sistem Durumu: Yeni sinyal denetimine hazır (Yalnızca Kaldıraçsız Spot)")
 
     # Analiz adımı tetiklendiyse çalıştır
     if run_now or auto_loop:
-        with st.spinner(f"{selected_symbol} ({selected_interval}) doğrulanmış piyasa verisi analiz ediliyor..."):
-            step_res = engine.run_analysis_step(
-                symbol=selected_symbol,
-                interval=selected_interval,
-                settings=active_profile.apply_to_risk_settings(settings),
-                ai_enabled_by_user=ai_enabled,
-                daily_ai_limit_override=int(daily_ai_limit),
-                min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
-                execution_mode=effective_mode,
-                ui_live_confirmed=ui_live_confirmed,
-                strategy_params=active_profile.strategy,
-            )
-            st.session_state["last_step_summary"] = step_res
+        if scan_all_coins:
+            engine.lock_benchmark_symbol = True
+            with st.spinner(
+                f"{len(symbol_options)} coin ({selected_interval}) taranıyor; açık pozisyonlar ve yeni alım fırsatları kontrol ediliyor..."
+            ):
+                prefetched_live = False
+                if effective_mode == "LIVE_SPOT":
+                    try:
+                        engine.live_executor.fetch_live_spot_balances(
+                            ui_live_confirmed=ui_live_confirmed, quote_asset=selected_quote
+                        )
+                        prefetched_live = True
+                    except Exception:
+                        prefetched_live = False
+
+                open_before = storage.get_open_positions(track=active_track)
+                open_syms_before = list(dict.fromkeys(p.symbol for p in open_before))
+                if len(open_before) < eff_settings.max_open_positions:
+                    scan_targets = open_syms_before + [
+                        s for s in symbol_options if s not in open_syms_before
+                    ]
+                else:
+                    scan_targets = open_syms_before if open_syms_before else list(symbol_options)
+
+                executed_steps: list[Any] = []
+                last_scanned_res = None
+                scanned_count = 0
+                for sym in scan_targets:
+                    cur_open = storage.get_open_positions(track=active_track)
+                    cur_open_syms = {p.symbol for p in cur_open}
+                    if sym not in cur_open_syms and len(cur_open) >= eff_settings.max_open_positions:
+                        break
+                    step_res = engine.run_analysis_step(
+                        symbol=sym,
+                        interval=selected_interval,
+                        settings=eff_settings,
+                        ai_enabled_by_user=ai_enabled,
+                        daily_ai_limit_override=int(daily_ai_limit),
+                        min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
+                        execution_mode=effective_mode,
+                        ui_live_confirmed=ui_live_confirmed,
+                        strategy_params=active_profile.strategy,
+                        ai_only_on_rule_signal=True,
+                        skip_balance_prefetch=prefetched_live,
+                    )
+                    scanned_count += 1
+                    last_scanned_res = step_res
+                    if step_res.executed_order is not None:
+                        executed_steps.append(step_res)
+                    if (
+                        step_res.executed_order is not None
+                        and step_res.executed_order.side == "BUY"
+                        and step_res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
+                        and len(storage.get_open_positions(track=active_track)) >= eff_settings.max_open_positions
+                    ):
+                        break
+
+                st.session_state["last_step_summary"] = (
+                    executed_steps[-1] if executed_steps else last_scanned_res
+                )
+                open_now_list = storage.get_open_positions(track=active_track)
+                open_names = ", ".join(p.symbol for p in open_now_list) or "Yok"
+                exec_names = (
+                    ", ".join(
+                        f"{s.symbol} ({s.executed_order.side})"
+                        for s in executed_steps
+                        if s.executed_order is not None
+                    )
+                    or "Yeni işlem yok (uygun sinyal bekleniyor)"
+                )
+                st.session_state["last_multi_scan_note"] = (
+                    f"🌐 **Çoklu Coin Tarama Özeti:** `{scanned_count}` coin kontrol edildi | "
+                    f"**Açık Pozisyonlar ({len(open_now_list)}/{eff_settings.max_open_positions}):** `{open_names}` | "
+                    f"**Bu Döngüdeki İşlemler:** `{exec_names}`"
+                )
+        else:
+            with st.spinner(f"{selected_symbol} ({selected_interval}) doğrulanmış piyasa verisi analiz ediliyor..."):
+                step_res = engine.run_analysis_step(
+                    symbol=selected_symbol,
+                    interval=selected_interval,
+                    settings=eff_settings,
+                    ai_enabled_by_user=ai_enabled,
+                    daily_ai_limit_override=int(daily_ai_limit),
+                    min_ai_interval_override=active_profile.ai_min_call_interval_seconds,
+                    execution_mode=effective_mode,
+                    ui_live_confirmed=ui_live_confirmed,
+                    strategy_params=active_profile.strategy,
+                )
+                st.session_state["last_step_summary"] = step_res
+                st.session_state.pop("last_multi_scan_note", None)
 
     last_step = st.session_state.get("last_step_summary")
+    multi_scan_note = st.session_state.get("last_multi_scan_note")
+    if multi_scan_note:
+        st.info(multi_scan_note)
 
     # Bağlantı hatası varsa sade Türkçe açıklama göster
     if last_step is not None and not last_step.ok and last_step.error_message:
@@ -823,15 +917,15 @@ def main() -> None:
                 new_max_daily_trades = st.number_input(
                     "Günlük En Fazla Yeni Pozisyon Sayısı",
                     min_value=1,
-                    max_value=20,
-                    value=int(settings.max_daily_new_positions),
+                    max_value=200,
+                    value=min(200, max(1, int(settings.max_daily_new_positions))),
                     step=1,
                 )
                 new_max_open = st.number_input(
-                    "Aynı Anda En Fazla Açık Pozisyon",
+                    "Aynı Anda En Fazla Açık Pozisyon (Farklı Coin)",
                     min_value=1,
-                    max_value=3,
-                    value=int(settings.max_open_positions),
+                    max_value=8,
+                    value=min(8, max(1, int(settings.max_open_positions))),
                     step=1,
                 )
             with fc2:
@@ -852,10 +946,10 @@ def main() -> None:
                 )
                 new_sl_pct = st.number_input(
                     "Koruyucu Zarar-Kes Yüzdesi (%)",
-                    min_value=0.5,
+                    min_value=0.1,
                     max_value=20.0,
-                    value=float(settings.stop_loss_pct * Decimal("100")),
-                    step=0.5,
+                    value=min(20.0, max(0.1, float(settings.stop_loss_pct * Decimal("100")))),
+                    step=0.1,
                 )
                 new_exit_policy = st.selectbox(
                     "Günlük Zarar Eşiği Aşıldığında Açık Pozisyon Politikası",

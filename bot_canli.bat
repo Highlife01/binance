@@ -10,18 +10,19 @@ if not exist ".venv\Scripts\python.exe" (
     if %ERRORLEVEL% NEQ 0 exit /b 1
 )
 
-set PARITE=%1
-if "%PARITE%"=="" set PARITE=BTCUSDT
-
 echo ============================================================================
-echo   !!! GERCEK PARA - HIZLI AKTIF CANLI SPOT BOTU (30 SN DONGU, 1DK MUM) !!!
-echo   Parite : %PARITE%   (Her 30 sn alim-satim ve Anlik K/Z kontrolu)
-echo   Gunluk 2.00 USDT zarar kilidi ve islem basina 10.00 USDT siniri AKTIF.
+echo   !!! GERCEK PARA - HIZLI AKTIF COKLU COIN BOTU (30 SN DONGU, 1DK MUM) !!!
+echo   10 Coin Taranir: BTC ETH SOL BNB XRP ADA AVAX DOGE LINK SUI (USDT)
+echo   Ayni anda en fazla 5 farkli coin (her biri maks 10 USDT) + 2.00 USDT gunluk zarar kilidi.
 echo   Bilgisayar acik kaldigi surece calisir (uyku modu bot tarafindan engellenir).
 echo   Durdurmak icin: Ctrl+C, bu pencereyi kapatmak veya paneldeki "Botu Durdur".
 echo   Kayitlar: logs\bot_YYYY-MM-DD.log  ^|  Izleme: http://127.0.0.1:8501
 echo ============================================================================
 echo.
 
-.\.venv\Scripts\python.exe bot_calistir.py --mod canli --profil hizli_30sn --parite %PARITE%
+if "%1"=="" (
+    .\.venv\Scripts\python.exe bot_calistir.py --mod canli --profil hizli_30sn --pariteler varsayilan
+) else (
+    .\.venv\Scripts\python.exe bot_calistir.py --mod canli --profil hizli_30sn --parite %1
+)
 pause

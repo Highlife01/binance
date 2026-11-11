@@ -203,42 +203,40 @@ def run_bot(
         scan_symbols = [symbol]
     multi_scan = len(scan_symbols) > 1
 
-    if multi_scan and is_live:
-        log.error(
-            "Coklu coin taramasi simdilik YALNIZCA SANAL modda kullanilabilir. "
-            "Canli modda tek parite (--parite) secin."
-        )
-        return 6
-
     eng = engine or TradingSystemEngine(cfg)
     if multi_scan:
         eng.lock_benchmark_symbol = True
 
+    base_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+
     log.info("=" * 78)
     log.info(
-        "ARKA PLAN BOTU | Mod=%s | Profil=%s | Parite(ler)=%s | Mum=%s | Dongu=%ss | AI=%s",
+        "ARKA PLAN BOTU | Mod=%s | Profil=%s | Parite(ler)=%s | Mum=%s | Dongu=%ss | MaksAcik=%s | AI=%s",
         "CANLI SPOT (GERCEK PARA)" if is_live else "SANAL DENEME",
         profile.key,
         ",".join(scan_symbols),
         profile.interval,
         profile.loop_seconds,
+        base_settings.max_open_positions,
         args.ai,
     )
     log.info("Profil: %s", profile.description_tr)
     if multi_scan:
         log.info(
-            "Coklu tarama: Acik pozisyon yokken %s parite taranir, ilk gecerli AL sinyaline girilir "
-            "(yine tek pozisyon). Gemini yalnizca kuralin AL dedigi paritede cagrilir.",
+            "Coklu coin tarama aktif: %s parite her %s sn'de taranir; ayni anda en fazla %s farkli "
+            "coinde acik pozisyon tutulur (ayni coine ekleme yapilmaz).",
             len(scan_symbols),
+            profile.loop_seconds,
+            base_settings.max_open_positions,
         )
 
+    quote = "USDT" if scan_symbols[0].endswith("USDT") else "USDC"
     if is_live:
         if not cfg.enable_live_trading or not cfg.has_binance_live_keys:
             log.error(
                 "Canli mod kilitli: .env icinde ENABLE_LIVE_TRADING=true ve BINANCE_API_KEY/SECRET gerekli."
             )
             return 2
-        quote = "USDT" if symbol.endswith("USDT") else "USDC"
         try:
             bals = eng.live_executor.fetch_live_spot_balances(
                 ui_live_confirmed=True, quote_asset=quote
@@ -247,12 +245,12 @@ def run_bot(
         except Exception as exc:
             log.error("Gercek hesap okunamadi, bot baslatilmadi: %s", exc)
             return 3
-        base_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
         print()
         print("!" * 78)
         print("  DIKKAT: GERCEK PARA ILE OTOMATIK SPOT ALIM-SATIM BASLAYACAK.")
         print(
             f"  Islem basina en fazla {base_settings.max_position_size_usdc:.2f} {quote}, "
+            f"ayni anda en fazla {base_settings.max_open_positions} farkli coin, "
             f"gunluk zarar esigi {base_settings.daily_loss_limit_usdc:.2f} {quote}, "
             f"gunde en fazla {base_settings.max_daily_new_positions} yeni pozisyon."
         )
@@ -301,15 +299,37 @@ def run_bot(
                 log.info("Panelden durdurma istegi alindi; bot guvenli sekilde kapatiliyor.")
                 break
 
-            # Açık pozisyon varsa yalnızca o pariteyi yönet (zarar-kes/kâr-al/SAT); yoksa listeyi tara
+            settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+
+            # Canlı modda döngü başında bakiyeyi 1 kez senkronize et (10 paritede 10 ayrı hesap çağrısını önler)
+            prefetched_live = False
+            if is_live and getattr(eng, "live_executor", None) is not None:
+                try:
+                    eng.live_executor.fetch_live_spot_balances(
+                        ui_live_confirmed=True, quote_asset=quote
+                    )
+                    prefetched_live = True
+                except Exception as exc:
+                    log.warning("Canli bakiye on-okuma uyarisi: %s", exc)
+
+            # Önce tüm açık pozisyonları kontrol et (zarar-kes / kâr-al / SAT), boş yer varsa diğer coinleri tara
             open_now = storage.get_open_positions(track=track)
-            cycle_symbols = [open_now[0].symbol] if open_now else scan_symbols
+            open_syms = list(dict.fromkeys(p.symbol for p in open_now))
+            if len(open_now) < settings.max_open_positions:
+                cycle_symbols = open_syms + [s for s in scan_symbols if s not in open_syms]
+            else:
+                cycle_symbols = open_syms if open_syms else list(scan_symbols)
+
             cycle_ok = True
             cycle_summaries: list[str] = []
             for sym in cycle_symbols:
                 storage.set_state(RUNNER_HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat())
+                # Açık olmayan bir adaya bakarken kapasite dolduysa yeni alım aramayı kes
+                cur_open = storage.get_open_positions(track=track)
+                cur_open_syms = {p.symbol for p in cur_open}
+                if sym not in cur_open_syms and len(cur_open) >= settings.max_open_positions:
+                    break
                 try:
-                    settings = profile.apply_to_risk_settings(eng.default_risk_settings())
                     use_ai_now = (
                         True
                         if args.ai == "zorla"
@@ -326,6 +346,7 @@ def run_bot(
                         ui_live_confirmed=is_live,
                         strategy_params=profile.strategy,
                         ai_only_on_rule_signal=multi_scan,
+                        skip_balance_prefetch=prefetched_live,
                     )
                 except Exception as exc:  # Ağ/geçici hata: botu çökertme, bekle ve yeniden dene
                     cycle_ok = False
@@ -349,46 +370,47 @@ def run_bot(
                 if not res.ok:
                     cycle_ok = False
 
-                # Tarama sırasında bir alım gerçekleştiyse diğer paritelere bakma (tek pozisyon kuralı)
+                # Yeni alım gerçekleştiyse ve maksimum açık pozisyon kapasitesi dolduysa kalan adayları atla
                 if (
                     res.executed_order is not None
                     and res.executed_order.side == "BUY"
                     and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
+                    and len(storage.get_open_positions(track=track)) >= settings.max_open_positions
                 ):
                     break
 
-            # Açık pozisyon varsa her döngüde anlık Kâr/Zarar durumunu yazdır
+            # Açık pozisyonların tamamı için her döngüde anlık Kâr/Zarar durumunu yazdır
             open_after = storage.get_open_positions(track=track)
             mc = getattr(eng, "market_client", None)
             if open_after and mc is not None:
-                p_open = open_after[0]
-                try:
-                    ob = mc.fetch_order_book(p_open.symbol, depth_limit=5)
-                    if ob.best_bid is not None:
-                        est_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
-                        _, net_pnl = compute_open_position_unrealized_net_pnl(
-                            p_open,
-                            current_bid=ob.best_bid,
-                            estimated_fee_rate=est_settings.estimated_fee_rate,
-                        )
-                        cost_tot = p_open.cost_basis_usdc + p_open.entry_fee_usdc
-                        pnl_pct = (net_pnl / cost_tot * Decimal("100")) if cost_tot > 0 else Decimal("0")
-                        q_lbl = "USDT" if p_open.symbol.endswith("USDT") else "USDC"
-                        sl_txt = f"{p_open.stop_loss_price:.6g}" if p_open.stop_loss_price else "-"
-                        tp_txt = f"{p_open.take_profit_price:.6g}" if p_open.take_profit_price else "-"
-                        log.info(
-                            "ANLIK K/Z | %s | Giris=%.6g Anlik=%.6g | Net=%+.4f %s (%%%+.2f) | Zarar-Kes=%s Kar-Al=%s",
-                            p_open.symbol,
-                            p_open.entry_price,
-                            ob.best_bid,
-                            net_pnl,
-                            q_lbl,
-                            pnl_pct,
-                            sl_txt,
-                            tp_txt,
-                        )
-                except Exception:
-                    pass
+                est_settings = profile.apply_to_risk_settings(eng.default_risk_settings())
+                for p_open in open_after:
+                    try:
+                        ob = mc.fetch_order_book(p_open.symbol, depth_limit=5)
+                        if ob.best_bid is not None:
+                            _, net_pnl = compute_open_position_unrealized_net_pnl(
+                                p_open,
+                                current_bid=ob.best_bid,
+                                estimated_fee_rate=est_settings.estimated_fee_rate,
+                            )
+                            cost_tot = p_open.cost_basis_usdc + p_open.entry_fee_usdc
+                            pnl_pct = (net_pnl / cost_tot * Decimal("100")) if cost_tot > 0 else Decimal("0")
+                            q_lbl = "USDT" if p_open.symbol.endswith("USDT") else "USDC"
+                            sl_txt = f"{p_open.stop_loss_price:.6g}" if p_open.stop_loss_price else "-"
+                            tp_txt = f"{p_open.take_profit_price:.6g}" if p_open.take_profit_price else "-"
+                            log.info(
+                                "ANLIK K/Z | %s | Giris=%.6g Anlik=%.6g | Net=%+.4f %s (%%%+.2f) | Zarar-Kes=%s Kar-Al=%s",
+                                p_open.symbol,
+                                p_open.entry_price,
+                                ob.best_bid,
+                                net_pnl,
+                                q_lbl,
+                                pnl_pct,
+                                sl_txt,
+                                tp_txt,
+                            )
+                    except Exception:
+                        pass
 
             if cycle_summaries and time.monotonic() - last_alive_log > 300:
                 log.info("Bot calisiyor (yeni mum bekleniyor) | %s", " ".join(cycle_summaries))
@@ -413,13 +435,12 @@ def run_bot(
         lock.release()
         open_pos = storage.get_open_positions(track="LIVE_SPOT" if is_live else "MAIN")
         if open_pos:
-            p = open_pos[0]
+            pos_desc = ", ".join(f"{p.symbol} ({p.quantity} @ {p.entry_price})" for p in open_pos)
             log.warning(
-                "Bot durdu ancak ACIK POZISYON var: %s %s @ %s. Zarar-kes/kar-al takibi bot "
+                "Bot durdu ancak %s ACIK POZISYON var: %s. Zarar-kes/kar-al takibi bot "
                 "yeniden baslatilana kadar YAPILMAZ.",
-                p.symbol,
-                p.quantity,
-                p.entry_price,
+                len(open_pos),
+                pos_desc,
             )
         log.info("Arka plan botu kapandi. Toplam dongu: %s", loops)
     return exit_code

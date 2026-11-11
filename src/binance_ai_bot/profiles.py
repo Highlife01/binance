@@ -36,6 +36,7 @@ class TradingProfile:
     ai_min_call_interval_seconds: int
     loop_seconds: int
     direct_rule_execution: bool = False
+    max_open_positions: int = 1
 
     def apply_to_risk_settings(self, base: RiskSettings) -> RiskSettings:
         """
@@ -44,7 +45,7 @@ class TradingProfile:
         """
         return dataclasses.replace(
             base,
-            max_open_positions=1,
+            max_open_positions=max(base.max_open_positions, self.max_open_positions),
             max_daily_new_positions=self.max_daily_new_positions,
             stop_loss_pct=self.stop_loss_pct,
             take_profit_pct=self.take_profit_pct,
@@ -55,11 +56,11 @@ class TradingProfile:
 TRADING_PROFILES: dict[str, TradingProfile] = {
     "HIZLI_30SN": TradingProfile(
         key="HIZLI_30SN",
-        label_tr="🔥 Hızlı Aktif (30 sn Döngü — 1dk Mum)",
+        label_tr="🔥 Hızlı Aktif (30 sn Döngü — 1dk Mum — Çoklu Coin)",
         description_tr=(
-            "Her 30 saniyede bir kontrol eder; 1 dakikalık mumlarda hızlı EMA(5/13) ve gevşetilmiş "
-            "hacim (0.15x) ile aktif alım-satım yapar (%0.35 zarar-kes / %0.45 kâr-al + hızlı trend çıkışı). "
-            "Günlük 2.00 USDT/USDC zarar koruması ve 10 USDT/USDC işlem üst sınırı aynen aktiftir."
+            "Her 30 saniyede bir 10 coini tarar; 1 dakikalık mumlarda hızlı EMA(5/13) ile aynı anda "
+            "5 farklı coine kadar (her biri en fazla 10 USDT/USDC) aktif alım-satım yapar "
+            "(%0.35 zarar-kes / %0.45 kâr-al + hızlı trend çıkışı). Günlük 2.00 USDT/USDC zarar sigortası aktiftir."
         ),
         interval="1m",
         strategy=StrategyParams(
@@ -80,13 +81,14 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         ai_min_call_interval_seconds=25,
         loop_seconds=30,
         direct_rule_execution=True,
+        max_open_positions=5,
     ),
     "AKTIF": TradingProfile(
         key="AKTIF",
         label_tr="⚡ Aktif (30 sn Döngü — 5dk Mum)",
         description_tr=(
             "5 dakikalık kapanmış mumlar, gevşetilmiş hacim (0.5x) ve RSI (40-70) eşikleri, "
-            "günde en fazla 12 yeni pozisyon, %0.8 zarar-kes / %1.2 kâr-al."
+            "aynı anda 3 farklı coine kadar, günde en fazla 12 yeni pozisyon, %0.8 zarar-kes / %1.2 kâr-al."
         ),
         interval="5m",
         strategy=StrategyParams(
@@ -102,6 +104,7 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         ai_min_call_interval_seconds=120,
         loop_seconds=30,
         direct_rule_execution=False,
+        max_open_positions=3,
     ),
     "TEMKINLI": TradingProfile(
         key="TEMKINLI",

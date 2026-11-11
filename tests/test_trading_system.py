@@ -803,7 +803,7 @@ def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
     applied = aktif.apply_to_risk_settings(base)
     assert applied.max_position_size_usdc == Decimal("10.00")
     assert applied.daily_loss_limit_usdc == Decimal("2.00")
-    assert applied.max_open_positions == 1
+    assert applied.max_open_positions == 3
     assert applied.max_daily_new_positions == 12
     assert applied.allow_stablecoin_conversion is False
     assert aktif.interval == "5m"
@@ -911,21 +911,30 @@ def test_active_profile_and_background_runner_safety(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# TEST 14: Çoklu coin taraması (yalnızca sanal), ilk alımda taramayı kesme ve açık pozisyonu yönetme
+# TEST 14: Çoklu coin eşzamanlı tarama (hem Sanal hem Canlı), açık pozisyonları koruma ve paralel alım
 # ---------------------------------------------------------------------------
-def test_multi_coin_scan_paper_only_and_single_position(tmp_path: Path) -> None:
+def test_multi_coin_parallel_trading_paper_and_live(tmp_path: Path) -> None:
     from binance_ai_bot.domain import Position, SimulatedOrderResult
     from binance_ai_bot.engine import StepCycleSummary
     from binance_ai_bot.runner import run_bot
 
     storage = SQLiteStorage(tmp_path / "t14.db", initial_balance_usdc=Decimal("86.73"))
 
-    class _StubEngine:
+    class _StubLive:
         def __init__(self) -> None:
+            self.balance_calls = 0
+
+        def fetch_live_spot_balances(self, *, ui_live_confirmed: bool, quote_asset: str = "USDT"):
+            self.balance_calls += 1
+            return {quote_asset: Decimal("77.76")}
+
+    class _StubEngine:
+        def __init__(self, track_name: str = "MAIN") -> None:
             self.storage = storage
-            self.live_executor = None
+            self.track_name = track_name
+            self.live_executor = _StubLive()
             self.lock_benchmark_symbol = False
-            self.calls: list[tuple[int, str, bool]] = []
+            self.calls: list[tuple[int, str, bool, bool]] = []
             self.loop_no = 0
 
         def default_risk_settings(self) -> RiskSettings:
@@ -933,44 +942,54 @@ def test_multi_coin_scan_paper_only_and_single_position(tmp_path: Path) -> None:
 
         def run_analysis_step(self, **kw):
             sym = kw["symbol"]
-            self.calls.append((self.loop_no, sym, kw["ai_only_on_rule_signal"]))
+            self.calls.append(
+                (
+                    self.loop_no,
+                    sym,
+                    kw["ai_only_on_rule_signal"],
+                    kw.get("skip_balance_prefetch", False),
+                )
+            )
             order = None
             now_iso = datetime.now(timezone.utc).isoformat()
-            if sym == "ETHUSDT" and not storage.get_open_positions(track="MAIN"):
-                storage.insert_position(
-                    Position(
-                        position_id="POS-ETH-1",
-                        symbol="ETHUSDT",
-                        quantity=Decimal("0.004"),
-                        entry_price=Decimal("2500"),
-                        cost_basis_usdc=Decimal("10"),
-                        entry_fee_usdc=Decimal("0.01"),
-                        opened_at_iso=now_iso,
-                        signal_key="SIG-ETH",
+            open_syms = {p.symbol for p in storage.get_open_positions(track=self.track_name)}
+            # ETHUSDT ve SOLUSDT sinyal üretip aynı anda farklı coinlerde pozisyon açabilmeli
+            if sym in {"ETHUSDT", "SOLUSDT"} and sym not in open_syms:
+                if len(open_syms) < kw["settings"].max_open_positions:
+                    storage.insert_position(
+                        Position(
+                            position_id=f"POS-{self.track_name}-{sym}",
+                            symbol=sym,
+                            quantity=Decimal("0.01"),
+                            entry_price=Decimal("1000"),
+                            cost_basis_usdc=Decimal("10"),
+                            entry_fee_usdc=Decimal("0.01"),
+                            opened_at_iso=now_iso,
+                            signal_key=f"SIG-{sym}",
+                            strategy_source="TEST",
+                            stop_loss_price=None,
+                            take_profit_price=None,
+                            status="OPEN",
+                        ),
+                        track=self.track_name,
+                    )
+                    order = SimulatedOrderResult(
+                        order_id=f"O-{self.track_name}-{sym}",
+                        symbol=sym,
+                        side="BUY",
+                        order_type="MARKET",
+                        status="FILLED",
+                        requested_qty=Decimal("0.01"),
+                        filled_qty=Decimal("0.01"),
+                        avg_fill_price=Decimal("1000"),
+                        gross_quote_usdc=Decimal("10"),
+                        fee_usdc=Decimal("0.01"),
+                        slippage_bps=Decimal("0"),
+                        signal_key=f"SIG-{sym}",
                         strategy_source="TEST",
-                        stop_loss_price=None,
-                        take_profit_price=None,
-                        status="OPEN",
-                    ),
-                    track="MAIN",
-                )
-                order = SimulatedOrderResult(
-                    order_id="O-1",
-                    symbol="ETHUSDT",
-                    side="BUY",
-                    order_type="MARKET",
-                    status="FILLED",
-                    requested_qty=Decimal("0.004"),
-                    filled_qty=Decimal("0.004"),
-                    avg_fill_price=Decimal("2500"),
-                    gross_quote_usdc=Decimal("10"),
-                    fee_usdc=Decimal("0.01"),
-                    slippage_bps=Decimal("0"),
-                    signal_key="SIG-ETH",
-                    strategy_source="TEST",
-                    explanation="test alim",
-                    created_at_iso=now_iso,
-                )
+                        explanation="test alim",
+                        created_at_iso=now_iso,
+                    )
             return StepCycleSummary(
                 ok=True,
                 timestamp_iso=now_iso,
@@ -985,47 +1004,90 @@ def test_multi_coin_scan_paper_only_and_single_position(tmp_path: Path) -> None:
                 block_or_info_message="test",
             )
 
-    stub = _StubEngine()
+    # 14a: Temkinli profilde (max_open_positions=1) ilk alımdan sonra diğer coinler atlanır
+    stub_single = _StubEngine("MAIN")
     loop_counter = {"n": 0}
 
     def _sleep(_s):
         loop_counter["n"] += 1
-        stub.loop_no = loop_counter["n"]
+        stub_single.loop_no = loop_counter["n"]
 
     cfg = AppConfig(sqlite_db_path=tmp_path / "t14.db", default_symbol="BTCUSDT", quote_asset="USDT")
     rc = run_bot(
-        ["--mod", "sanal", "--pariteler", "BTCUSDT,ETHUSDT,SOLUSDT", "--max-dongu", "2"],
-        engine=stub,  # type: ignore[arg-type]
+        [
+            "--mod",
+            "sanal",
+            "--profil",
+            "temkinli",
+            "--pariteler",
+            "BTCUSDT,ETHUSDT,SOLUSDT",
+            "--max-dongu",
+            "2",
+        ],
+        engine=stub_single,  # type: ignore[arg-type]
         config=cfg,
         sleep_fn=_sleep,
         lock_path=tmp_path / "t14.lock",
     )
     assert rc == 0
-    assert stub.lock_benchmark_symbol is True
-    # 1. döngü: BTC -> ETH (alım) -> SOL'a BAKILMAZ; Gemini ön eleme açık
-    loop0 = [s for (n, s, _) in stub.calls if n == 0]
-    assert loop0 == ["BTCUSDT", "ETHUSDT"]
-    assert all(flag is True for (_, _, flag) in stub.calls)
-    # 2. döngü: açık pozisyon olduğu için yalnızca ETH yönetilir
-    loop1 = [s for (n, s, _) in stub.calls if n == 1]
-    assert loop1 == ["ETHUSDT"]
+    assert stub_single.lock_benchmark_symbol is True
+    assert [s for (n, s, _, _) in stub_single.calls if n == 0] == ["BTCUSDT", "ETHUSDT"]
+    assert [s for (n, s, _, _) in stub_single.calls if n == 1] == ["ETHUSDT"]
 
-    # Canlı modda çoklu tarama kesinlikle reddedilir
+    # 14b: Canlı Spot + HIZLI_30SN (max_open_positions=5): BTCUSDT zaten açıkken bile ETHUSDT ve SOLUSDT aynı anda alınır!
+    storage.insert_position(
+        Position(
+            position_id="LIVE-POS-BTC",
+            symbol="BTCUSDT",
+            quantity=Decimal("0.00012"),
+            entry_price=Decimal("74714.01"),
+            cost_basis_usdc=Decimal("8.97"),
+            entry_fee_usdc=Decimal("0.009"),
+            opened_at_iso=datetime.now(timezone.utc).isoformat(),
+            signal_key="SIG-BTC",
+            strategy_source="TEST",
+            stop_loss_price=Decimal("74116.30"),
+            take_profit_price=Decimal("75610.58"),
+            status="OPEN",
+        ),
+        track="LIVE_SPOT",
+    )
+    stub_live = _StubEngine("LIVE_SPOT")
     cfg_live = AppConfig(
         sqlite_db_path=tmp_path / "t14.db",
+        default_symbol="BTCUSDT",
+        quote_asset="USDT",
         enable_live_trading=True,
         binance_api_key="k",
         binance_api_secret="s",
     )
     rc_live = run_bot(
-        ["--mod", "canli", "--pariteler", "varsayilan", "--max-dongu", "1"],
-        engine=_StubEngine(),  # type: ignore[arg-type]
+        [
+            "--mod",
+            "canli",
+            "--profil",
+            "hizli_30sn",
+            "--pariteler",
+            "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
+            "--max-dongu",
+            "1",
+        ],
+        engine=stub_live,  # type: ignore[arg-type]
         config=cfg_live,
         sleep_fn=lambda _s: None,
         input_fn=lambda _p: "EVET",
         lock_path=tmp_path / "t14.lock",
     )
-    assert rc_live == 6
+    assert rc_live == 0
+    # Önce açık BTCUSDT denetlenir, ardından ETHUSDT, SOLUSDT ve BNBUSDT taranır
+    live_syms = [s for (_, s, _, _) in stub_live.calls]
+    assert live_syms == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    # Canlı bakiye döngü başında 1 kez okunur (+1 başlangıç kontrolü = toplam 2), her coinde tekrar çağrılmaz
+    assert stub_live.live_executor.balance_calls == 2
+    assert all(skip is True for (_, _, _, skip) in stub_live.calls)
+    # BTCUSDT + ETHUSDT + SOLUSDT olmak üzere 3 farklı coinde eşzamanlı açık pozisyon oluşmuş olmalı
+    open_live_syms = {p.symbol for p in storage.get_open_positions(track="LIVE_SPOT")}
+    assert open_live_syms == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 
 # ---------------------------------------------------------------------------
@@ -1041,7 +1103,7 @@ def test_fast_30s_profile_and_live_unrealized_pnl(tmp_path: Path) -> None:
     assert hizli.interval == "1m"
     assert hizli.direct_rule_execution is True
 
-    # Sert güvenlik sınırları (10 USDT işlem üst sınırı, 2 USDT günlük zarar kilidi) AYNEN korunmalı
+    # Sert güvenlik sınırları (10 USDT işlem üst sınırı, 2 USDT günlük zarar kilidi) AYNEN korunmalı; eşzamanlı 5 coin aktif
     base_risk = RiskSettings(
         max_position_size_usdc=Decimal("10.00"),
         daily_loss_limit_usdc=Decimal("2.00"),
@@ -1049,7 +1111,7 @@ def test_fast_30s_profile_and_live_unrealized_pnl(tmp_path: Path) -> None:
     applied = hizli.apply_to_risk_settings(base_risk)
     assert applied.max_position_size_usdc == Decimal("10.00")
     assert applied.daily_loss_limit_usdc == Decimal("2.00")
-    assert applied.max_open_positions == 1
+    assert applied.max_open_positions == 5
 
     # Düşük hacimli (0.25x) dengeli 1dk yükselişte TEMKINLI BEKLE derken HIZLI_30SN AL üretmeli
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -1110,3 +1172,169 @@ def test_fast_30s_profile_and_live_unrealized_pnl(tmp_path: Path) -> None:
         applied, live_bid_by_symbol={"BTCUSDT": Decimal("76000.00")}, track="MAIN"
     )
     assert summ_up["unrealized_pnl_usdc"] > Decimal("0.08")
+
+
+# ---------------------------------------------------------------------------
+# TEST 16: Motor düzeyinde eşzamanlı çoklu coin alımı ve aynı coinde Martingale koruması
+# ---------------------------------------------------------------------------
+def test_engine_simultaneous_multi_coin_entries_without_duplicate_coin(tmp_path: Path) -> None:
+    from binance_ai_bot.profiles import get_profile
+
+    hizli = get_profile("hizli_30sn")
+    settings = hizli.apply_to_risk_settings(
+        RiskSettings(max_position_size_usdc=Decimal("10.00"), daily_loss_limit_usdc=Decimal("2.00"))
+    )
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    first_open = now_ms - 50 * 60_000
+
+    def _build_uptrend(base_px: Decimal) -> list[Candle]:
+        candles: list[Candle] = []
+        px = base_px
+        for i in range(45):
+            step = (base_px * Decimal("0.0004")) if (i % 2 == 0 or i >= 43) else -(base_px * Decimal("0.0003"))
+            o_p, c_p = px, px + step
+            vol = Decimal("10.0")
+            o_ms = first_open + i * 60_000
+            candles.append(
+                Candle(
+                    open_time_ms=o_ms,
+                    open=o_p,
+                    high=max(o_p, c_p) * Decimal("1.0002"),
+                    low=min(o_p, c_p) * Decimal("0.9998"),
+                    close=c_p,
+                    volume=vol,
+                    close_time_ms=o_ms + 59_999,
+                    quote_volume=vol * c_p,
+                    trade_count=80,
+                    is_closed=True,
+                )
+            )
+            px = c_p
+        return candles
+
+    btc_filters = parse_symbol_filters(
+        {
+            "symbol": "BTCUSDT",
+            "baseAsset": "BTC",
+            "quoteAsset": "USDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+            "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000.00", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "100.0", "stepSize": "0.00001"},
+                {"filterType": "NOTIONAL", "minNotional": "5.00"},
+            ],
+        }
+    )
+    eth_filters = parse_symbol_filters(
+        {
+            "symbol": "ETHUSDT",
+            "baseAsset": "ETH",
+            "quoteAsset": "USDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+            "filters": [
+                {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "100000.00", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.0001", "maxQty": "1000.0", "stepSize": "0.0001"},
+                {"filterType": "NOTIONAL", "minNotional": "5.00"},
+            ],
+        }
+    )
+    btc_candles = _build_uptrend(Decimal("74500.00"))
+    eth_candles = _build_uptrend(Decimal("2500.00"))
+    btc_px = btc_candles[-1].close
+    eth_px = eth_candles[-1].close
+
+    class _MockMarketClient:
+        def fetch_verified_market_bundle(self, *, symbol: str, interval: str, **kwargs) -> MarketBundle:
+            now_utc = datetime.now(timezone.utc)
+            srv_ms = int(now_utc.timestamp() * 1000)
+            if symbol == "BTCUSDT":
+                return MarketBundle(
+                    symbol="BTCUSDT",
+                    interval=interval,
+                    filters=btc_filters,
+                    closed_candles=btc_candles,
+                    order_book=OrderBookSnapshot(
+                        symbol="BTCUSDT",
+                        bids=[OrderBookLevel(price=btc_px, quantity=Decimal("2.0"))],
+                        asks=[OrderBookLevel(price=btc_px + Decimal("1.0"), quantity=Decimal("2.0"))],
+                        fetched_at_utc=now_utc,
+                        source_url="https://api.binance.me",
+                    ),
+                    server_time_ms=srv_ms,
+                    fetched_at_utc=now_utc,
+                    source_label="api.binance.me",
+                )
+            return MarketBundle(
+                symbol="ETHUSDT",
+                interval=interval,
+                filters=eth_filters,
+                closed_candles=eth_candles,
+                order_book=OrderBookSnapshot(
+                    symbol="ETHUSDT",
+                    bids=[OrderBookLevel(price=eth_px, quantity=Decimal("20.0"))],
+                    asks=[OrderBookLevel(price=eth_px + Decimal("0.2"), quantity=Decimal("20.0"))],
+                    fetched_at_utc=now_utc,
+                    source_url="https://api.binance.me",
+                ),
+                server_time_ms=srv_ms,
+                fetched_at_utc=now_utc,
+                source_label="api.binance.me",
+            )
+
+        def discover_spot_pairs(self, **_kw):
+            return {"BTCUSDT": btc_filters, "ETHUSDT": eth_filters}
+
+        def fetch_order_book(self, symbol: str, **_kw) -> OrderBookSnapshot:
+            px = btc_px if symbol == "BTCUSDT" else eth_px
+            return OrderBookSnapshot(
+                symbol=symbol,
+                bids=[OrderBookLevel(price=px, quantity=Decimal("10.0"))],
+                asks=[OrderBookLevel(price=px + Decimal("0.5"), quantity=Decimal("10.0"))],
+                fetched_at_utc=datetime.now(timezone.utc),
+                source_url="https://api.binance.me",
+            )
+
+    cfg = AppConfig(sqlite_db_path=tmp_path / "t16.db", initial_balance_usdc=Decimal("86.73"))
+    eng = TradingSystemEngine(cfg, market_client=_MockMarketClient())  # type: ignore[arg-type]
+
+    # 1) İlk adımda BTCUSDT alınır
+    r_btc_1 = eng.run_analysis_step(
+        symbol="BTCUSDT",
+        interval="1m",
+        settings=settings,
+        ai_enabled_by_user=False,
+        strategy_params=hizli.strategy,
+    )
+    assert r_btc_1.executed_order is not None and r_btc_1.executed_order.side == "BUY"
+
+    # 2) BTCUSDT açıkken ETHUSDT taranır -> ETHUSDT de aynı anda alınır!
+    r_eth_1 = eng.run_analysis_step(
+        symbol="ETHUSDT",
+        interval="1m",
+        settings=settings,
+        ai_enabled_by_user=False,
+        strategy_params=hizli.strategy,
+    )
+    assert r_eth_1.executed_order is not None and r_eth_1.executed_order.side == "BUY"
+    assert {p.symbol for p in eng.storage.get_open_positions(track="MAIN")} == {"BTCUSDT", "ETHUSDT"}
+
+    # 3) BTCUSDT tekrar tarandığında ek alım / korkutucu engel üretmez; BEKLE olarak korur
+    r_btc_2 = eng.run_analysis_step(
+        symbol="BTCUSDT",
+        interval="1m",
+        settings=settings,
+        ai_enabled_by_user=False,
+        strategy_params=hizli.strategy,
+    )
+    assert r_btc_2.final_action == "BEKLE"
+    assert r_btc_2.executed_order is None
+    latest_dec = eng.storage.get_recent_decisions(limit=1)[0]
+    assert latest_dec["block_reason"] is None
+
+    # 4) Manuel kapatma tüm açık pozisyonları tek seferde kapatır
+    ok_close, _ = eng.manual_close_open_position(settings, execution_mode="PAPER")
+    assert ok_close is True
+    assert eng.storage.get_open_positions(track="MAIN") == []

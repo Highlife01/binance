@@ -144,27 +144,26 @@ class TradingSystemEngine:
         """
         shadow_open = self.storage.get_open_positions(track="RULE_SHADOW")
         best_bid = market.order_book.best_bid
-        if shadow_open and best_bid is not None:
-            pos = shadow_open[0]
-            if pos.symbol == market.symbol:
-                stop_hit = pos.stop_loss_price is not None and best_bid <= pos.stop_loss_price
-                tp_hit = pos.take_profit_price is not None and best_bid >= pos.take_profit_price
-                if stop_hit or tp_hit or tech_signal.action == "SAT":
-                    reason = "STOP_LOSS" if stop_hit else ("TAKE_PROFIT" if tp_hit else "KURAL_SAT")
-                    self.simulator.execute_sell_position(
-                        position=pos,
-                        filters=market.filters,
-                        order_book=market.order_book,
-                        signal_key=f"SHADOW_EXIT:{tech_signal.signal_key}:{reason}",
-                        strategy_source="KURAL_TABANLI_GOLGE",
-                        close_reason=reason,
-                        settings=settings,
-                        now_utc=now_utc,
-                        track="RULE_SHADOW",
-                    )
-                    return
+        shadow_pos = next((p for p in shadow_open if p.symbol == market.symbol), None)
+        if shadow_pos is not None and best_bid is not None:
+            stop_hit = shadow_pos.stop_loss_price is not None and best_bid <= shadow_pos.stop_loss_price
+            tp_hit = shadow_pos.take_profit_price is not None and best_bid >= shadow_pos.take_profit_price
+            if stop_hit or tp_hit or tech_signal.action == "SAT":
+                reason = "STOP_LOSS" if stop_hit else ("TAKE_PROFIT" if tp_hit else "KURAL_SAT")
+                self.simulator.execute_sell_position(
+                    position=shadow_pos,
+                    filters=market.filters,
+                    order_book=market.order_book,
+                    signal_key=f"SHADOW_EXIT:{tech_signal.signal_key}:{reason}",
+                    strategy_source="KURAL_TABANLI_GOLGE",
+                    close_reason=reason,
+                    settings=settings,
+                    now_utc=now_utc,
+                    track="RULE_SHADOW",
+                )
+                return
 
-        if not shadow_open and tech_signal.action == "AL":
+        if shadow_pos is None and len(shadow_open) < settings.max_open_positions and tech_signal.action == "AL":
             chk = self.risk_manager.check_buy_entry(
                 filters=market.filters,
                 order_book=market.order_book,
@@ -228,6 +227,7 @@ class TradingSystemEngine:
         ui_live_confirmed: bool = False,
         strategy_params: StrategyParams | None = None,
         ai_only_on_rule_signal: bool = False,
+        skip_balance_prefetch: bool = False,
     ) -> StepCycleSummary:
         """
         Tek bir tam denetimli analiz ve yürütme döngüsü çalıştırır.
@@ -241,7 +241,7 @@ class TradingSystemEngine:
         now_iso = now_utc.isoformat()
         ist_date = self.storage.istanbul_date_str(now_utc)
 
-        if is_live_mode:
+        if is_live_mode and not skip_balance_prefetch:
             try:
                 self.live_executor.fetch_live_spot_balances(
                     ui_live_confirmed=ui_live_confirmed, quote_asset=quote_ccy
@@ -320,7 +320,8 @@ class TradingSystemEngine:
         self._update_rule_shadow_track(market, tech_signal, settings, now_utc)
 
         open_positions = self.storage.get_open_positions(track=active_track)
-        has_open_pos = len(open_positions) > 0
+        symbol_open_pos = next((p for p in open_positions if p.symbol == market.symbol), None)
+        has_open_pos = symbol_open_pos is not None
 
         # 4. Günlük zarar limiti ve açık pozisyon koruyucu çıkış denetimi
         bid_map = {pos.symbol: (best_bid if pos.symbol == market.symbol else pos.entry_price) for pos in open_positions}
@@ -333,26 +334,26 @@ class TradingSystemEngine:
         )
         if breached:
             halt_msg = (
-                f"Günlük zarar eşiği ({settings.daily_loss_limit_usdc:.2f} USDC) aşıldı "
-                f"(toplam kayıp: {daily_loss:.2f} USDC). Yeni alımlar durduruldu."
+                f"Günlük zarar eşiği ({settings.daily_loss_limit_usdc:.2f} {quote_ccy}) aşıldı "
+                f"(toplam kayıp: {daily_loss:.2f} {quote_ccy}). Yeni alımlar durduruldu."
             )
             self.storage.set_new_entries_paused(True, halt_msg)
-            if auto_close_due_to_daily_limit and open_positions and open_positions[0].symbol == market.symbol:
+            if auto_close_due_to_daily_limit and symbol_open_pos is not None:
                 if is_live_mode:
                     closed_ord = self.live_executor.execute_live_market_sell(
-                        position=open_positions[0],
+                        position=symbol_open_pos,
                         filters=market.filters,
-                        signal_key=f"DAILY_LOSS_AUTO_EXIT:{ist_date}:{open_positions[0].position_id}",
+                        signal_key=f"DAILY_LOSS_AUTO_EXIT:{ist_date}:{symbol_open_pos.position_id}",
                         strategy_source="RISK_KORUMA",
                         close_reason="GUNLUK_ZARAR_OTOMATIK_CIKIS",
                         ui_live_confirmed=ui_live_confirmed,
                     )
                 else:
                     closed_ord = self.simulator.execute_sell_position(
-                        position=open_positions[0],
+                        position=symbol_open_pos,
                         filters=market.filters,
                         order_book=market.order_book,
-                        signal_key=f"DAILY_LOSS_AUTO_EXIT:{ist_date}:{open_positions[0].position_id}",
+                        signal_key=f"DAILY_LOSS_AUTO_EXIT:{ist_date}:{symbol_open_pos.position_id}",
                         strategy_source="RISK_KORUMA",
                         close_reason="GUNLUK_ZARAR_OTOMATIK_CIKIS",
                         settings=settings,
@@ -375,8 +376,8 @@ class TradingSystemEngine:
                 )
 
         # Açık pozisyonun Zarar-Kes (Stop-Loss) veya Kâr-Al (Take-Profit) kontrolü
-        if open_positions and open_positions[0].symbol == market.symbol:
-            pos = open_positions[0]
+        if symbol_open_pos is not None:
+            pos = symbol_open_pos
             stop_hit = pos.stop_loss_price is not None and best_bid <= pos.stop_loss_price
             tp_hit = pos.take_profit_price is not None and best_bid >= pos.take_profit_price
             if stop_hit or tp_hit:
@@ -442,61 +443,69 @@ class TradingSystemEngine:
 
         # 6. Nihai kararın risk denetimi ve emir yürütmesi
         if final_action == "AL":
-            paused, pause_reason = self.storage.is_new_entries_paused()
-            if paused:
-                block_reason = f"Yeni pozisyon açılışı durdurulmuş durumda ({pause_reason})."
-                info_msg = block_reason
-            else:
-                risk_chk = self.risk_manager.check_buy_entry(
-                    filters=market.filters,
-                    order_book=market.order_book,
-                    settings=settings,
-                    now_utc=now_utc,
-                    track=active_track,
+            if symbol_open_pos is not None:
+                # Bu paritede zaten pozisyon taşınıyor; hata/engel uyarısı yerine pozisyon tutma bilgisi ver
+                final_action = "BEKLE"
+                info_msg = (
+                    f"{market.symbol} açık pozisyonu korunuyor "
+                    "(Kâr-Al / Zarar-Kes / dönüş sinyali takibinde; aynı coine ek alım yapılmaz)."
                 )
-                if not risk_chk.allowed:
-                    block_reason = risk_chk.reason
-                    info_msg = f"AL sinyali risk denetiminde durduruldu: {risk_chk.reason}"
+            else:
+                paused, pause_reason = self.storage.is_new_entries_paused()
+                if paused:
+                    block_reason = f"Yeni pozisyon açılışı durdurulmuş durumda ({pause_reason})."
+                    info_msg = block_reason
                 else:
-                    sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
-                    if is_live_mode:
-                        try:
-                            ord_res = self.live_executor.execute_live_market_buy(
+                    risk_chk = self.risk_manager.check_buy_entry(
+                        filters=market.filters,
+                        order_book=market.order_book,
+                        settings=settings,
+                        now_utc=now_utc,
+                        track=active_track,
+                    )
+                    if not risk_chk.allowed:
+                        block_reason = risk_chk.reason
+                        info_msg = f"AL sinyali risk denetiminde durduruldu: {risk_chk.reason}"
+                    else:
+                        sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
+                        if is_live_mode:
+                            try:
+                                ord_res = self.live_executor.execute_live_market_buy(
+                                    filters=market.filters,
+                                    approved_qty=risk_chk.approved_quantity,
+                                    signal_key=sig_key,
+                                    strategy_source=ai_decision.mode_label,
+                                    settings=settings,
+                                    ui_live_confirmed=ui_live_confirmed,
+                                )
+                                executed_order = ord_res
+                                info_msg = ord_res.explanation
+                            except (LiveOrderBlockedError, LiveExecutionError) as exc:
+                                block_reason = str(exc)
+                                info_msg = f"Canlı Spot ALIM engellendi/reddedildi: {exc}"
+                        else:
+                            ord_res = self.simulator.execute_buy(
                                 filters=market.filters,
-                                approved_qty=risk_chk.approved_quantity,
+                                order_book=market.order_book,
+                                requested_qty=risk_chk.approved_quantity,
                                 signal_key=sig_key,
                                 strategy_source=ai_decision.mode_label,
                                 settings=settings,
-                                ui_live_confirmed=ui_live_confirmed,
+                                now_utc=now_utc,
+                                track="MAIN",
                             )
                             executed_order = ord_res
+                            if ord_res.status not in ("FILLED", "PARTIALLY_FILLED"):
+                                block_reason = ord_res.explanation
                             info_msg = ord_res.explanation
-                        except (LiveOrderBlockedError, LiveExecutionError) as exc:
-                            block_reason = str(exc)
-                            info_msg = f"Canlı Spot ALIM engellendi/reddedildi: {exc}"
-                    else:
-                        ord_res = self.simulator.execute_buy(
-                            filters=market.filters,
-                            order_book=market.order_book,
-                            requested_qty=risk_chk.approved_quantity,
-                            signal_key=sig_key,
-                            strategy_source=ai_decision.mode_label,
-                            settings=settings,
-                            now_utc=now_utc,
-                            track="MAIN",
-                        )
-                        executed_order = ord_res
-                        if ord_res.status not in ("FILLED", "PARTIALLY_FILLED"):
-                            block_reason = ord_res.explanation
-                        info_msg = ord_res.explanation
 
         elif final_action == "SAT":
-            if open_positions and open_positions[0].symbol == market.symbol:
+            if symbol_open_pos is not None:
                 sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:SAT"
                 if is_live_mode:
                     try:
                         ord_res = self.live_executor.execute_live_market_sell(
-                            position=open_positions[0],
+                            position=symbol_open_pos,
                             filters=market.filters,
                             signal_key=sig_key,
                             strategy_source=ai_decision.mode_label,
@@ -510,7 +519,7 @@ class TradingSystemEngine:
                         info_msg = f"Canlı Spot SATIŞ hatası: {exc}"
                 else:
                     ord_res = self.simulator.execute_sell_position(
-                        position=open_positions[0],
+                        position=symbol_open_pos,
                         filters=market.filters,
                         order_book=market.order_book,
                         signal_key=sig_key,
@@ -567,55 +576,64 @@ class TradingSystemEngine:
         *,
         execution_mode: str = "PAPER",
         ui_live_confirmed: bool = False,
+        symbol: str | None = None,
     ) -> tuple[bool, str]:
-        """Açık pozisyonu (Sanal veya Canlı Spot moduna göre) anlık piyasa alış fiyatından kapatır."""
+        """Açık pozisyonları (Sanal veya Canlı Spot moduna göre) anlık piyasa alış fiyatından kapatır."""
         is_live = execution_mode == "LIVE_SPOT"
         track = "LIVE_SPOT" if is_live else "MAIN"
         open_positions = self.storage.get_open_positions(track=track)
+        if symbol:
+            open_positions = [p for p in open_positions if p.symbol == symbol]
         if not open_positions:
             return False, "Kapatılacak açık pozisyon bulunmuyor."
 
-        pos = open_positions[0]
-        pos_quote = "USDT" if pos.symbol.endswith("USDT") else "USDC"
-        try:
-            spot_map = self.market_client.discover_spot_pairs(
-                quote_asset=pos_quote,
-                allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
-            )
-            if pos.symbol not in spot_map:
-                return False, f"{pos.symbol} borsa filtre bilgisi alınamadı."
-            if is_live:
+        spot_cache: dict[str, dict[str, Any]] = {}
+        any_closed = False
+        messages: list[str] = []
+        for pos in open_positions:
+            pos_quote = "USDT" if pos.symbol.endswith("USDT") else "USDC"
+            try:
+                if pos_quote not in spot_cache:
+                    spot_cache[pos_quote] = self.market_client.discover_spot_pairs(
+                        quote_asset=pos_quote,
+                        allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
+                    )
+                spot_map = spot_cache[pos_quote]
+                if pos.symbol not in spot_map:
+                    messages.append(f"{pos.symbol}: borsa filtre bilgisi alınamadı.")
+                    continue
                 now_utc = datetime.now(timezone.utc)
-                res = self.live_executor.execute_live_market_sell(
-                    position=pos,
-                    filters=spot_map[pos.symbol],
-                    signal_key=f"MANUAL_LIVE_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
-                    strategy_source="KULLANICI_MANUEL",
-                    close_reason="MANUEL_KAPATMA",
-                    ui_live_confirmed=ui_live_confirmed,
+                if is_live:
+                    res = self.live_executor.execute_live_market_sell(
+                        position=pos,
+                        filters=spot_map[pos.symbol],
+                        signal_key=f"MANUAL_LIVE_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
+                        strategy_source="KULLANICI_MANUEL",
+                        close_reason="MANUEL_KAPATMA",
+                        ui_live_confirmed=ui_live_confirmed,
+                    )
+                else:
+                    book = self.market_client.fetch_order_book(pos.symbol, depth_limit=20)
+                    res = self.simulator.execute_sell_position(
+                        position=pos,
+                        filters=spot_map[pos.symbol],
+                        order_book=book,
+                        signal_key=f"MANUAL_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
+                        strategy_source="KULLANICI_MANUEL",
+                        close_reason="MANUEL_KAPATMA",
+                        settings=settings,
+                        now_utc=now_utc,
+                        track="MAIN",
+                    )
+                if res.status in ("FILLED", "PARTIALLY_FILLED"):
+                    any_closed = True
+                messages.append(res.explanation)
+            except (MarketDataError, LiveOrderBlockedError, LiveExecutionError) as exc:
+                messages.append(
+                    f"{pos.symbol}: Güncel piyasa kotasyonu/bağlantısı alınamadığı için işlem yapılamadı ({exc})"
                 )
-                return res.status in ("FILLED", "PARTIALLY_FILLED"), res.explanation
 
-            book = self.market_client.fetch_order_book(pos.symbol, depth_limit=20)
-        except (MarketDataError, LiveOrderBlockedError, LiveExecutionError) as exc:
-            return (
-                False,
-                f"Güncel piyasa kotasyonu/bağlantısı alınamadığı için işlem yapılamadı: {exc}",
-            )
-
-        now_utc = datetime.now(timezone.utc)
-        res = self.simulator.execute_sell_position(
-            position=pos,
-            filters=spot_map[pos.symbol],
-            order_book=book,
-            signal_key=f"MANUAL_CLOSE:{pos.position_id}:{int(now_utc.timestamp())}",
-            strategy_source="KULLANICI_MANUEL",
-            close_reason="MANUEL_KAPATMA",
-            settings=settings,
-            now_utc=now_utc,
-            track="MAIN",
-        )
-        return res.status in ("FILLED", "PARTIALLY_FILLED"), res.explanation
+        return any_closed, " | ".join(messages)
 
     def _record_snapshot(
         self,
