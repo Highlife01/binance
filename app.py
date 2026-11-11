@@ -83,11 +83,26 @@ def _generate_offline_demo_candles(count: int = 180) -> list[Candle]:
     return candles
 
 
+ENGINE_STATE_VERSION = "1.2.0"
+
+
 def _get_engine() -> tuple[AppConfig, TradingSystemEngine]:
+    # Acik Streamlit oturumunda eski engelli URL kalmissa resmi api.binance.me adresine gecir
+    import os
+
+    if os.getenv("BINANCE_PUBLIC_BASE_URL") == "https://data-api.binance.vision":
+        os.environ["BINANCE_PUBLIC_BASE_URL"] = "https://api.binance.me"
+    if os.getenv("BINANCE_LIVE_BASE_URL") == "https://api.binance.com":
+        os.environ["BINANCE_LIVE_BASE_URL"] = "https://api.binance.me"
+
     cfg = load_config()
     assert_localhost_only(cfg.localhost_host)
-    if "engine" not in st.session_state:
+    if (
+        "engine" not in st.session_state
+        or st.session_state.get("engine_version") != ENGINE_STATE_VERSION
+    ):
         st.session_state["engine"] = TradingSystemEngine(cfg)
+        st.session_state["engine_version"] = ENGINE_STATE_VERSION
     return cfg, st.session_state["engine"]
 
 
@@ -205,15 +220,15 @@ def main() -> None:
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1.4, 1.4, 1.4, 2.0])
 
     with btn_col1:
-        run_now = st.button("▶️ Analiz Adımını Şimdi Çalıştır", type="primary", use_container_width=True)
+        run_now = st.button("▶️ Analiz Adımını Şimdi Çalıştır", type="primary", width="stretch")
 
     with btn_col2:
         if paused:
-            if st.button("🟢 Yeni İşlemlere İzin Ver", use_container_width=True):
+            if st.button("🟢 Yeni İşlemlere İzin Ver", width="stretch"):
                 storage.set_new_entries_paused(False, "")
                 st.rerun()
         else:
-            if st.button("⏸️ Yeni İşlemleri Durdur", use_container_width=True):
+            if st.button("⏸️ Yeni İşlemleri Durdur", width="stretch"):
                 storage.set_new_entries_paused(True, "Kullanıcı panelden yeni alımları durdurdu")
                 st.rerun()
 
@@ -223,7 +238,7 @@ def main() -> None:
             if effective_mode == "LIVE_SPOT"
             else "🛑 Sanal Pozisyonu Kapat"
         )
-        if st.button(close_btn_label, use_container_width=True):
+        if st.button(close_btn_label, width="stretch"):
             ok_close, close_msg = engine.manual_close_open_position(
                 settings,
                 execution_mode=effective_mode,
@@ -379,7 +394,7 @@ def main() -> None:
                 }
                 for p in open_pos
             ]
-            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
         else:
             st.info("Şu anda açık pozisyon bulunmuyor.")
 
@@ -419,14 +434,14 @@ def main() -> None:
                 yaxis_title="Toplam Değer (USDC)",
                 xaxis_title="Zaman (UTC)",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.caption("Bakiye grafiği ilk analiz adımından itibaren oluşturulacaktır.")
 
         st.subheader("İşlem Geçmişi")
         orders = storage.get_orders(track=active_track, limit=100)
         if orders:
-            st.dataframe(pd.DataFrame(orders), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(orders), width="stretch", hide_index=True)
         else:
             st.caption("Henüz gerçekleşmiş veya reddedilmiş emir kaydı bulunmuyor.")
 
@@ -471,7 +486,7 @@ def main() -> None:
                 },
             ]
         )
-        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+        st.dataframe(cmp_df, width="stretch", hide_index=True)
 
         ai_alpha = (
             summary["total_equity_usdc"]
@@ -502,10 +517,10 @@ def main() -> None:
             "açılışında spread + kayma + komisyon eklenerek test edilir."
         )
         bcol1, bcol2 = st.columns(2)
-        run_live_bt = bcol1.button("🌐 Canlı Binance Geçmiş Mumlarıyla Doğrula (500 Mum)", use_container_width=True)
+        run_live_bt = bcol1.button("🌐 Canlı Binance Geçmiş Mumlarıyla Doğrula (500 Mum)", width="stretch")
         run_demo_bt = bcol2.button(
             "🧪 Çevrimdışı Örnek Seri ile Doğrulama Motorunu Test Et",
-            use_container_width=True,
+            width="stretch",
             help="İnternet/İSS engeli varken doğrulama motorunun nasıl çalıştığını gösterir; portföye dokunmaz.",
         )
 
@@ -553,7 +568,7 @@ def main() -> None:
                             "Değerlendirme": sl.verdict_text,
                         }
                     )
-                st.dataframe(pd.DataFrame(rows_bt), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_bt), width="stretch", hide_index=True)
                 if rep.insufficient_data:
                     st.info(f"📌 **Sonuç:** {rep.overall_verdict}")
                 else:
@@ -655,28 +670,28 @@ def main() -> None:
             data=storage.export_table_to_csv_bytes("orders"),
             file_name=f"emirler_{ist_today}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         dl2.download_button(
             "📄 Pozisyonlar (CSV)",
             data=storage.export_table_to_csv_bytes("positions"),
             file_name=f"pozisyonlar_{ist_today}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         dl3.download_button(
             "📄 Karar Geçmişi (CSV)",
             data=storage.export_table_to_csv_bytes("decisions"),
             file_name=f"kararlar_{ist_today}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         dl4.download_button(
             "📄 Bakiye Eğrisi (CSV)",
             data=storage.export_table_to_csv_bytes("equity_snapshots"),
             file_name=f"bakiye_gecmisi_{ist_today}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     # Otomatik yenileme açıksa 60 sn bekle ve yeniden çiz

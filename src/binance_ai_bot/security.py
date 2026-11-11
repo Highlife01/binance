@@ -11,6 +11,7 @@ LIVE_TRADING_CAPABLE: bool = False
 
 ALLOWED_BINANCE_HOSTS: frozenset[str] = frozenset(
     {
+        "api.binance.me",
         "data-api.binance.vision",
         "api.binance.com",
         "api-gcp.binance.com",

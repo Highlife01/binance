@@ -60,9 +60,9 @@ class AppConfig:
     estimated_fee_rate: Decimal = Decimal("0.0010")  # %0.10 standart spot komisyon varsayimi
     extra_slippage_bps: Decimal = Decimal("2.0")     # 2 baz puan (%0.02) muhafazakar kayma tamponu
 
-    # Binance herkese acik veri katmani
-    binance_public_base_url: str = "https://data-api.binance.vision"
-    binance_fallback_base_url: str = "https://api.binance.com"
+    # Binance herkese acik veri katmani (Turkiye resmi erisilebilir uc nokta: api.binance.me)
+    binance_public_base_url: str = "https://api.binance.me"
+    binance_fallback_base_url: str = "https://data-api.binance.vision"
     default_symbol: str = "BTCUSDC"
     default_interval: str = "15m"
     max_data_age_seconds: int = 120
@@ -71,7 +71,7 @@ class AppConfig:
     enable_live_trading: bool = False
     binance_api_key: str = ""
     binance_api_secret: str = ""
-    binance_live_base_url: str = "https://api.binance.com"
+    binance_live_base_url: str = "https://api.binance.me"
     binance_recv_window_ms: int = 5000
 
     # Gemini yapay zeka ayarlari (Istege bagli)
@@ -148,10 +148,10 @@ def load_config(env_path: Path | None = None) -> AppConfig:
             os.getenv("EXTRA_SLIPPAGE_BPS"), "2.0", min_val=Decimal("0")
         ),
         binance_public_base_url=(
-            os.getenv("BINANCE_PUBLIC_BASE_URL", "https://data-api.binance.vision").strip().rstrip("/")
+            os.getenv("BINANCE_PUBLIC_BASE_URL", "https://api.binance.me").strip().rstrip("/")
         ),
         binance_fallback_base_url=(
-            os.getenv("BINANCE_FALLBACK_BASE_URL", "https://api.binance.com").strip().rstrip("/")
+            os.getenv("BINANCE_FALLBACK_BASE_URL", "https://data-api.binance.vision").strip().rstrip("/")
         ),
         default_symbol=os.getenv("DEFAULT_SYMBOL", "BTCUSDC").strip().upper() or "BTCUSDC",
         default_interval=os.getenv("DEFAULT_INTERVAL", "15m").strip() or "15m",
@@ -160,7 +160,7 @@ def load_config(env_path: Path | None = None) -> AppConfig:
         binance_api_key=os.getenv("BINANCE_API_KEY", "").strip(),
         binance_api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
         binance_live_base_url=(
-            os.getenv("BINANCE_LIVE_BASE_URL", "https://api.binance.com").strip().rstrip("/")
+            os.getenv("BINANCE_LIVE_BASE_URL", "https://api.binance.me").strip().rstrip("/")
         ),
         binance_recv_window_ms=_parse_int(os.getenv("BINANCE_RECV_WINDOW_MS"), 5000, min_val=1000),
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),

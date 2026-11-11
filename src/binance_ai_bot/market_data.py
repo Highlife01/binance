@@ -229,9 +229,11 @@ class BinancePublicDataClient:
     def _build_base_url_list(self) -> list[str]:
         candidates = [
             self.config.binance_public_base_url,
+            "https://api.binance.me",
             self.config.binance_fallback_base_url,
+            "https://data-api.binance.vision",
+            "https://api.binance.com",
             "https://api-gcp.binance.com",
-            "https://api1.binance.com",
         ]
         unique: list[str] = []
         for url in candidates:
