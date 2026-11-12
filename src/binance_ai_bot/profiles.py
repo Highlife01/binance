@@ -73,8 +73,9 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         label_tr="🚀 Al & Kârı Görünce Sat (Sürekli Döngü — 1dk Mum)",
         description_tr=(
             "10 coini sürekli tarar; dip dönüşü ve yükseliş başlangıcında alır, ufak geri çekilmelerde "
-            "zararına erken satış yapmaz, komisyon sonrası net kârı görünce (+%0.38–%0.55) anında satıp "
-            "nakde döner ve hemen yeni alım fırsatı arar (%3.5 acil çöküş koruması + günlük zarar sigortası aktiftir)."
+            "zararına erken satış yapmaz, komisyon sonrası net kârı görünce (+%0.80–%1.15 brüt / "
+            "+%0.65–%1.00 net) anında satıp nakde döner ve hemen yeni alım fırsatı arar "
+            "(%3.5 acil çöküş koruması + günlük zarar sigortası aktiftir)."
         ),
         interval="1m",
         strategy=StrategyParams(
@@ -91,13 +92,13 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         ),
         max_daily_new_positions=120,
         stop_loss_pct=Decimal("0.035"),
-        take_profit_pct=Decimal("0.0055"),
+        take_profit_pct=Decimal("0.0115"),
         ai_daily_call_limit=400,
         ai_min_call_interval_seconds=25,
         loop_seconds=20,
         direct_rule_execution=True,
         max_open_positions=5,
-        min_net_profit_exit_pct=Decimal("0.0038"),
+        min_net_profit_exit_pct=Decimal("0.0080"),
     ),
     "HIZLI_30SN": TradingProfile(
         key="HIZLI_30SN",

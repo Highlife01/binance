@@ -157,7 +157,7 @@ class CloudConfig:
         return AppConfig(
             initial_balance_usdc=self.initial_balance_usdc,
             max_open_positions=5,
-            max_position_size_usdc=Decimal("10.00"),
+            max_position_size_usdc=Decimal("15.00"),
             daily_loss_limit_usdc=Decimal("2.00"),
             max_daily_new_positions=60,
             daily_limit_exit_policy="HOLD_EXISTING",
@@ -360,7 +360,7 @@ class CloudBotApplication:
             prof = get_profile("AL_YUKSELINCE_SAT")
             base = RiskSettings(
                 max_open_positions=5,
-                max_position_size_usdc=Decimal("10.00"),
+                max_position_size_usdc=Decimal("15.00"),
                 daily_loss_limit_usdc=Decimal("2.00"),
                 max_daily_new_positions=prof.max_daily_new_positions,
                 stop_loss_pct=prof.stop_loss_pct,
@@ -369,6 +369,40 @@ class CloudBotApplication:
                 min_net_profit_exit_pct=prof.min_net_profit_exit_pct,
             )
             storage.save_risk_settings(base)
+            changed = True
+        if storage.get_state("profit_target_v2_15usdt", "") != "1":
+            prof = get_profile(storage.get_state("cloud_profile", "AL_YUKSELINCE_SAT") or "AL_YUKSELINCE_SAT")
+            cur = storage.load_risk_settings(
+                RiskSettings(max_open_positions=5, max_position_size_usdc=Decimal("15.00"), daily_loss_limit_usdc=Decimal("2.00"))
+            )
+            new_pos_size = Decimal("15.00") if cur.max_position_size_usdc == Decimal("10.00") else cur.max_position_size_usdc
+            upgraded = RiskSettings(
+                max_open_positions=max(1, min(10, int(cur.max_open_positions))),
+                max_position_size_usdc=new_pos_size,
+                daily_loss_limit_usdc=cur.daily_loss_limit_usdc,
+                max_daily_new_positions=prof.max_daily_new_positions,
+                daily_limit_exit_policy=cur.daily_limit_exit_policy,
+                estimated_fee_rate=cur.estimated_fee_rate,
+                extra_slippage_bps=cur.extra_slippage_bps,
+                stop_loss_pct=prof.stop_loss_pct,
+                take_profit_pct=prof.take_profit_pct,
+                leverage=cur.leverage,
+                hourly_margin_interest_rate=cur.hourly_margin_interest_rate,
+                min_net_profit_exit_pct=prof.min_net_profit_exit_pct,
+            )
+            storage.save_risk_settings(upgraded)
+            for trk in ("LIVE_SPOT", "MAIN"):
+                for pos in storage.get_open_positions(track=trk):
+                    storage.update_position_remaining(
+                        pos.position_id,
+                        quantity=pos.quantity,
+                        cost_basis_usdc=pos.cost_basis_usdc,
+                        entry_fee_usdc=pos.entry_fee_usdc,
+                        stop_loss_price=pos.entry_price * (Decimal("1") - prof.stop_loss_pct),
+                        take_profit_price=pos.entry_price * (Decimal("1") + prof.take_profit_pct),
+                        update_exit_targets=True,
+                    )
+            storage.set_state("profit_target_v2_15usdt", "1")
             changed = True
         return changed
 

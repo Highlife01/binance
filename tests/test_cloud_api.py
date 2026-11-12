@@ -308,8 +308,8 @@ def test_al_yukselince_sat_holds_pullback_locks_net_profit_and_rebuys_continuous
     from binance_ai_bot.strategy import evaluate_technical_strategy
 
     prof = get_profile("AL_YUKSELINCE_SAT")
-    assert prof.min_net_profit_exit_pct == Decimal("0.0038")
-    assert prof.take_profit_pct == Decimal("0.0055")
+    assert prof.min_net_profit_exit_pct == Decimal("0.0080")
+    assert prof.take_profit_pct == Decimal("0.0115")
     assert prof.direct_rule_execution is True
 
     # 1. Dip-rebound candle series: steady decline (EMA5 < EMA13, RSI ~36) followed by a green bounce candle
@@ -437,10 +437,10 @@ def test_al_yukselince_sat_holds_pullback_locks_net_profit_and_rebuys_continuous
     assert "zararına erken satış yapılmadı" in s2.block_or_info_message
     assert len(eng.storage.get_open_positions()) == 1
 
-    # Step C: Price rises +0.70% above entry -> immediately sells in net profit!
+    # Step C: Price rises +1.30% above entry -> immediately sells in net profit!
     sm.candle_shift = 2
     sm.mode = "PROFIT_SPIKE"
-    sm.price_by_symbol["SOLUSDT"] = (entry_px * Decimal("1.007")).quantize(Decimal("0.01"))
+    sm.price_by_symbol["SOLUSDT"] = (entry_px * Decimal("1.013")).quantize(Decimal("0.01"))
     s3 = eng.run_analysis_step(
         symbol="SOLUSDT", interval="1m", settings=settings, ai_enabled_by_user=False, strategy_params=prof.strategy
     )
