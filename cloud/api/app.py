@@ -1102,7 +1102,7 @@ class CloudBotApplication:
             # 30 saniyede bir kâr-al ve yeni alım fırsatlarını yakalamak için kilidi bırakarak ikinci geçiş
             double_pass = (
                 "PYTEST_CURRENT_TEST" not in os.environ
-                and _parse_bool(os.getenv("CLOUD_CRON_DOUBLE_PASS", "1"), default=True)
+                and _parse_bool(os.getenv("CLOUD_CRON_DOUBLE_PASS", "0"), default=False)
             )
             if double_pass:
                 time.sleep(25.0)
