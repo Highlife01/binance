@@ -583,3 +583,93 @@ def test_live_spot_substep_dust_never_blocks_rebuy_and_recycles_cleanly(tmp_path
     merged_open = st.get_open_positions(track="LIVE_SPOT")
     assert len(merged_open) == 1
     assert merged_open[0].quantity == Decimal("7.1858")  # 0.0929 + 7.0929 -> next sell will sell full 7.1 XRP!
+
+
+def test_engine_automatically_values_bnb_commission_and_unblocks_next_live_buy(tmp_path: Path):
+    """Binance BNB komisyon indirimiyle kesilen komisyonlar otomatik değerlenir ve sonraki alımı engellemez."""
+    import httpx
+    from binance_ai_bot.config import AppConfig
+    from binance_ai_bot.domain import RiskSettings
+    from binance_ai_bot.live_executor import BinanceLiveSpotExecutor
+    from binance_ai_bot.market_data import parse_symbol_filters
+    from binance_ai_bot.storage import SQLiteStorage
+
+    eth_filters = parse_symbol_filters(
+        {
+            "symbol": "ETHUSDT",
+            "baseAsset": "ETH",
+            "quoteAsset": "USDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.0001", "minQty": "0.0001", "maxQty": "1000"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+            ],
+        }
+    )
+
+    cfg = AppConfig(
+        sqlite_db_path=tmp_path / "bnb_fee.db",
+        enable_live_trading=True,
+        binance_api_key="test-key",
+        binance_api_secret="test-secret",
+        quote_asset="USDT",
+    )
+    st = SQLiteStorage(cfg.sqlite_db_path)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/time"):
+            return httpx.Response(200, json={"serverTime": int(datetime.now(timezone.utc).timestamp() * 1000)})
+        if req.url.path.endswith("/account"):
+            return httpx.Response(
+                200,
+                json={
+                    "canTrade": True,
+                    "permissions": ["SPOT"],
+                    "balances": [{"asset": "USDT", "free": "80.00"}, {"asset": "BNB", "free": "0.01"}],
+                },
+            )
+        if req.url.path.endswith("/order/test"):
+            return httpx.Response(200, json={})
+        if req.url.path.endswith("/order") and req.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": 2001,
+                    "status": "FILLED",
+                    "executedQty": "0.0048",
+                    "cummulativeQuoteQty": "9.60",
+                    "fills": [{"qty": "0.0048", "price": "2000.00", "commission": "0.00001100", "commissionAsset": "BNB"}],
+                },
+            )
+        raise AssertionError(req.url.path)
+
+    ex = BinanceLiveSpotExecutor(cfg, st, httpx.Client(transport=httpx.MockTransport(handler)))
+    rset = RiskSettings(max_open_positions=5, max_position_size_usdc=Decimal("10.00"), leverage=1)
+    ex.execute_live_market_buy(
+        filters=eth_filters,
+        approved_qty=Decimal("0.0048"),
+        approved_notional=Decimal("10.00"),
+        signal_key="ETH-BNB-1",
+        strategy_source="TEST",
+        settings=rset,
+        ui_live_confirmed=True,
+    )
+    assert st.get_state("live_unvalued_commissions") not in {"", "{}"}
+
+    class _BnbBookMarket:
+        def fetch_order_book(self, symbol: str, depth_limit: int = 5) -> OrderBookSnapshot:
+            return OrderBookSnapshot(
+                symbol=symbol,
+                bids=[OrderBookLevel(Decimal("650.00"), Decimal("10"))],
+                asks=[OrderBookLevel(Decimal("650.10"), Decimal("10"))],
+                fetched_at_utc=datetime.now(timezone.utc),
+                source_url="https://api.binance.com/api/v3/depth",
+            )
+
+    eng = TradingSystemEngine(cfg, storage=st, market_client=_BnbBookMarket())
+    eng._resolve_live_unvalued_commissions("USDT", rset)
+    assert st.get_state("live_unvalued_commissions") == "{}"
+    pos = st.get_open_positions(track="LIVE_SPOT")[0]
+    assert pos.entry_fee_usdc == Decimal("0.00001100") * Decimal("650.00")
+

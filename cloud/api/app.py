@@ -1242,6 +1242,8 @@ def make_handler(application: CloudBotApplication):
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     app = CloudBotApplication(CloudConfig.from_env())
     port = int(os.getenv("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(app))

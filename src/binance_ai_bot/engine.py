@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from functools import wraps
+import json
 from typing import Any, Callable
 
 from .ai_advisor import GeminiDecisionAdvisor
@@ -326,6 +327,7 @@ class TradingSystemEngine:
             self.storage.ensure_quote_asset(active_track, quote_ccy)
             if is_live_spot:
                 self.live_executor.reconcile_pending_orders(ui_live_confirmed=ui_live_confirmed)
+                self._resolve_live_unvalued_commissions(quote_ccy, settings)
         except (ValueError, LiveOrderBlockedError, LiveExecutionError) as exc:
             return blocked(str(exc))
 
@@ -470,6 +472,7 @@ class TradingSystemEngine:
                         ui_live_confirmed=ui_live_confirmed,
                         stop_requested=stop_requested,
                     )
+                    self._resolve_live_unvalued_commissions(quote_ccy, settings)
                 elif is_live_margin:
                     closed_ord = self.live_margin_executor.execute_live_margin_sell(
                         position=symbol_open_pos,
@@ -528,6 +531,7 @@ class TradingSystemEngine:
                         ui_live_confirmed=ui_live_confirmed,
                         stop_requested=stop_requested,
                     )
+                    self._resolve_live_unvalued_commissions(quote_ccy, settings)
                 elif is_live_margin:
                     closed_ord = self.live_margin_executor.execute_live_margin_sell(
                         position=pos,
@@ -653,6 +657,14 @@ class TradingSystemEngine:
                                     ui_live_confirmed=ui_live_confirmed,
                                     stop_requested=stop_requested,
                                 )
+                                self._resolve_live_unvalued_commissions(quote_ccy, settings)
+                                ord_res = dataclasses.replace(
+                                    ord_res,
+                                    explanation=ord_res.explanation.replace(
+                                        " Üçüncü varlık komisyonunun değeri bilinmiyor; K/Z geçicidir, yeni alımlar durduruldu.",
+                                        " BNB komisyon indirimi uygulandı.",
+                                    ),
+                                )
                                 executed_order = ord_res
                                 info_msg = ord_res.explanation
                             except (LiveOrderBlockedError, LiveExecutionError) as exc:
@@ -711,6 +723,14 @@ class TradingSystemEngine:
                             close_reason=exit_reason_label,
                             ui_live_confirmed=ui_live_confirmed,
                             stop_requested=stop_requested,
+                        )
+                        self._resolve_live_unvalued_commissions(quote_ccy, settings)
+                        ord_res = dataclasses.replace(
+                            ord_res,
+                            explanation=ord_res.explanation.replace(
+                                " Üçüncü varlık komisyonunun değeri bilinmiyor; K/Z geçicidir, yeni alımlar durduruldu.",
+                                " BNB komisyon indirimi uygulandı.",
+                            ),
                         )
                         executed_order = ord_res
                         info_msg = ord_res.explanation
@@ -837,6 +857,14 @@ class TradingSystemEngine:
                         close_reason="MANUEL_KAPATMA",
                         ui_live_confirmed=ui_live_confirmed,
                     )
+                    self._resolve_live_unvalued_commissions(pos_quote, settings)
+                    res = dataclasses.replace(
+                        res,
+                        explanation=res.explanation.replace(
+                            " Üçüncü varlık komisyonunun değeri bilinmiyor; K/Z geçicidir, yeni alımlar durduruldu.",
+                            " BNB komisyon indirimi uygulandı.",
+                        ),
+                    )
                 elif is_live_margin:
                     res = self.live_margin_executor.execute_live_margin_sell(
                         position=pos,
@@ -869,6 +897,115 @@ class TradingSystemEngine:
                 )
 
         return any_closed, " | ".join(messages)
+
+    def _resolve_live_unvalued_commissions(self, quote_ccy: str, settings: RiskSettings) -> None:
+        """
+        Binance 'BNB ile Komisyon İndirimi' gibi üçüncü varlık komisyonlarını (ör. BNB)
+        güncel parite fiyatıyla (ör. BNBUSDT) portföy para biriminde (USDT/USDC) değerleyip
+        ilgili emir/pozisyon muhasebesine işler ve `live_unvalued_commissions` kilidini temizler.
+        """
+        raw = self.storage.get_state("live_unvalued_commissions", "{}") or "{}"
+        if raw.strip() in {"", "{}", "[]"}:
+            return
+        try:
+            unvalued = json.loads(raw)
+        except ValueError:
+            self.storage.set_state("live_unvalued_commissions", "{}")
+            return
+        if not isinstance(unvalued, dict) or not unvalued:
+            self.storage.set_state("live_unvalued_commissions", "{}")
+            return
+
+        q_norm = quote_ccy.strip().upper() if quote_ccy.strip().upper() in {"USDT", "USDC"} else "USDT"
+        rate_cache: dict[str, Decimal] = {q_norm: Decimal("1"), "USDT": Decimal("1"), "USDC": Decimal("1")}
+
+        for client_order_id, asset_map in list(unvalued.items()):
+            if not isinstance(asset_map, dict):
+                unvalued.pop(client_order_id, None)
+                continue
+            total_fee_quote = Decimal("0")
+            for asset, amt_str in asset_map.items():
+                asset_up = str(asset).strip().upper()
+                try:
+                    amt = Decimal(str(amt_str))
+                except Exception:
+                    continue
+                if not amt.is_finite() or amt <= 0:
+                    continue
+                if asset_up not in rate_cache:
+                    rate: Decimal | None = None
+                    try:
+                        ob = self.market_client.fetch_order_book(f"{asset_up}{q_norm}", depth_limit=5)
+                        rate = ob.best_bid or ob.best_ask
+                    except Exception:
+                        rate = None
+                    if rate is not None and rate > 0:
+                        rate_cache[asset_up] = rate
+                if asset_up in rate_cache:
+                    total_fee_quote += amt * rate_cache[asset_up]
+
+            with self.storage.atomic() as conn:
+                row = conn.execute(
+                    "SELECT signal_key, payload_json FROM live_order_intents WHERE payload_json LIKE ?",
+                    (f"%{client_order_id}%",),
+                ).fetchone()
+                if row is not None:
+                    sig_key, payload_raw = row[0], row[1]
+                    try:
+                        intent_data = json.loads(payload_raw)
+                    except ValueError:
+                        intent_data = {}
+                    if total_fee_quote <= 0:
+                        try:
+                            app_q = Decimal(str(intent_data.get("applied_quote", "0")))
+                            if app_q > 0:
+                                total_fee_quote = app_q * settings.estimated_fee_rate
+                        except Exception:
+                            total_fee_quote = Decimal("0")
+                    pos_id = intent_data.get("position_id")
+                    side = str(intent_data.get("side", "")).upper()
+                    if total_fee_quote > 0 and pos_id:
+                        pos = self.storage.get_position(str(pos_id), track="LIVE_SPOT")
+                        if pos is not None:
+                            if side == "BUY":
+                                conn.execute(
+                                    "UPDATE positions SET entry_fee_usdc = ? WHERE position_id = ? AND portfolio_track = 'LIVE_SPOT'",
+                                    (str(pos.entry_fee_usdc + total_fee_quote), str(pos_id)),
+                                )
+                            elif side == "SELL" and pos.status == "CLOSED":
+                                new_exit_fee = (pos.exit_fee_usdc or Decimal("0")) + total_fee_quote
+                                new_pnl = (pos.realized_pnl_usdc or Decimal("0")) - total_fee_quote
+                                conn.execute(
+                                    "UPDATE positions SET exit_fee_usdc = ?, realized_pnl_usdc = ? WHERE position_id = ? AND portfolio_track = 'LIVE_SPOT'",
+                                    (str(new_exit_fee), str(new_pnl), str(pos_id)),
+                                )
+                    if sig_key:
+                        ord_row = conn.execute(
+                            "SELECT order_id, side, fee_usdc, realized_pnl_usdc, explanation FROM orders WHERE signal_key = ? AND portfolio_track = 'LIVE_SPOT' ORDER BY rowid DESC LIMIT 1",
+                            (str(sig_key),),
+                        ).fetchone()
+                        if ord_row is not None:
+                            oid, oside, ofee, opnl, oexp = ord_row
+                            new_ofee = Decimal(str(ofee or "0")) + total_fee_quote
+                            new_opnl = (
+                                Decimal(str(opnl or "0")) - total_fee_quote
+                                if str(oside).upper() == "SELL"
+                                else Decimal(str(opnl or "0"))
+                            )
+                            new_exp = str(oexp or "").replace(
+                                "Üçüncü varlık komisyonunun değeri bilinmiyor; K/Z geçicidir, yeni alımlar durduruldu.",
+                                f"BNB komisyonu ({total_fee_quote:.4f} {q_norm}) değerlendi.",
+                            )
+                            conn.execute(
+                                "UPDATE orders SET fee_usdc = ?, realized_pnl_usdc = ?, explanation = ? WHERE order_id = ? AND portfolio_track = 'LIVE_SPOT'",
+                                (str(new_ofee), str(new_opnl), new_exp, str(oid)),
+                            )
+            unvalued.pop(client_order_id, None)
+
+        self.storage.set_state(
+            "live_unvalued_commissions",
+            json.dumps(unvalued, sort_keys=True) if unvalued else "{}",
+        )
 
     def _record_snapshot(
         self,
