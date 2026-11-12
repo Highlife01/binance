@@ -216,6 +216,7 @@ class RiskSettings:
     allow_stablecoin_conversion: bool = False
     leverage: int = 1  # 1 = Kaldıraçsız Spot, 2..5 = Çapraz Marjin / Sanal Kaldıraç çarpanı
     hourly_margin_interest_rate: Decimal = Decimal("0.000005")  # ~%0.0005/saat (~%0.012/gün)
+    min_net_profit_exit_pct: Decimal = Decimal("0")  # >0 ise teknik SAT sinyalinde zararına çıkmaz, bu kâr eşiğini bekler
 
 
 @dataclass(frozen=True)
@@ -251,6 +252,20 @@ class Position:
     leverage: int = 1
     borrowed_usdc: Decimal = Decimal("0")
     liquidation_price: Decimal | None = None
+
+
+def is_substep_dust_position(pos: Position, filters: SymbolFilters | None = None) -> bool:
+    """Borsa adım/minimum miktarının altında kalan satılamaz küsurat (dust) kaydını tespit eder."""
+    if pos.quantity <= Decimal("0"):
+        return True
+    if filters is not None and pos.symbol == filters.symbol:
+        eff_step = filters.market_step_size if filters.market_step_size > Decimal("0") else filters.step_size
+        eff_min = max(filters.min_qty, filters.market_min_qty)
+        return quantize_down(pos.quantity, eff_step) < eff_min
+    return (
+        Decimal("0") < pos.cost_basis_usdc < Decimal("1.00")
+        and getattr(pos, "borrowed_usdc", Decimal("0")) <= Decimal("0")
+    )
 
 
 @dataclass(frozen=True)

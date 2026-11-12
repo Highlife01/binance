@@ -34,6 +34,7 @@ from .domain import (
     RiskSettings,
     SimulatedOrderResult,
     SymbolFilters,
+    is_substep_dust_position,
     quantize_down,
 )
 from .market_data import _friendly_network_error
@@ -434,10 +435,17 @@ class BinanceLiveSpotExecutor:
                             ), track="LIVE_SPOT",
                         )
                     elif pos.status == "OPEN":
+                        entry = quote / executed
+                        recycle_dust = bool(intent.get("recycle_dust"))
+                        sl_pct = Decimal(str(intent.get("stop_loss_pct", "0")))
+                        tp_pct = Decimal(str(intent.get("take_profit_pct", "0")))
                         self.storage.update_position_remaining(
                             pos.position_id, quantity=pos.quantity + net_qty,
                             cost_basis_usdc=pos.cost_basis_usdc + delta_quote,
-                            entry_fee_usdc=pos.entry_fee_usdc + quote_fee, entry_price=quote / executed,
+                            entry_fee_usdc=pos.entry_fee_usdc + quote_fee, entry_price=entry,
+                            stop_loss_price=entry * (1 - sl_pct) if (recycle_dust and sl_pct > 0) else None,
+                            take_profit_price=entry * (1 + tp_pct) if (recycle_dust and tp_pct > 0) else None,
+                            update_exit_targets=recycle_dust,
                         )
                     else:
                         raise LiveExecutionError("Devam eden alışın yerel pozisyonu kapalı; uzlaştırma gerekiyor.")
@@ -530,7 +538,16 @@ class BinanceLiveSpotExecutor:
             if self.storage.get_state("live_unvalued_commissions", "{}") not in {"", "{}", None}:
                 raise LiveExecutionError("Üçüncü varlık komisyonları değerlenmeden yeni canlı alım yapılamaz.")
             opened = self.storage.get_open_positions(track="LIVE_SPOT")
-            if any(p.symbol == filters.symbol for p in opened) or len(opened) >= settings.max_open_positions:
+            active_opened = [
+                p
+                for p in opened
+                if not is_substep_dust_position(p, filters if p.symbol == filters.symbol else None)
+            ]
+            dust_same_sym = next(
+                (p for p in opened if p.symbol == filters.symbol and is_substep_dust_position(p, filters)),
+                None,
+            )
+            if any(p.symbol == filters.symbol for p in active_opened) or len(active_opened) >= settings.max_open_positions:
                 raise LiveExecutionError("Açık pozisyon veya aynı coin sınırı nedeniyle yeni alım engellendi.")
             qty = quantize_down(approved_qty, filters.market_step_size)
             if not qty.is_finite() or qty <= 0 or qty < max(filters.min_qty, filters.market_min_qty):
@@ -539,10 +556,16 @@ class BinanceLiveSpotExecutor:
             free_quote = balances.get(filters.quote_asset, Decimal(0))
             if free_quote <= 0:
                 raise LiveExecutionError("Gerçek serbest Spot bakiyesi yetersiz; alım yapılmadı.")
+            pos_id = (
+                dust_same_sym.position_id
+                if dust_same_sym is not None
+                else f"LIVE-POS-{hashlib.sha256(signal_key.encode()).hexdigest()[:20]}"
+            )
             intent = self._new_intent(
                 filters=filters, quantity=qty, signal_key=signal_key, side="BUY",
                 strategy_source=strategy_source,
-                position_id=f"LIVE-POS-{hashlib.sha256(signal_key.encode()).hexdigest()[:20]}",
+                position_id=pos_id,
+                recycle_dust=(dust_same_sym is not None),
                 stop_loss_pct=str(settings.stop_loss_pct), take_profit_pct=str(settings.take_profit_pct),
             )
             if approved_notional is not None:

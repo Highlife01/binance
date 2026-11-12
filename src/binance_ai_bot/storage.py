@@ -377,6 +377,7 @@ class SQLiteStorage:
             "allow_stablecoin_conversion": settings.allow_stablecoin_conversion,
             "leverage": int(settings.leverage),
             "hourly_margin_interest_rate": str(settings.hourly_margin_interest_rate),
+            "min_net_profit_exit_pct": str(getattr(settings, "min_net_profit_exit_pct", Decimal("0"))),
         }
         self.set_state("risk_settings_json", json.dumps(payload, ensure_ascii=False))
 
@@ -418,6 +419,14 @@ class SQLiteStorage:
                     str(
                         data.get(
                             "hourly_margin_interest_rate", fallback.hourly_margin_interest_rate
+                        )
+                    )
+                ),
+                min_net_profit_exit_pct=Decimal(
+                    str(
+                        data.get(
+                            "min_net_profit_exit_pct",
+                            getattr(fallback, "min_net_profit_exit_pct", Decimal("0")),
                         )
                     )
                 ),
@@ -505,6 +514,9 @@ class SQLiteStorage:
         self, position_id: str, *, quantity: Decimal, cost_basis_usdc: Decimal,
         entry_fee_usdc: Decimal, entry_price: Decimal | None = None,
         borrowed_usdc: Decimal | None = None,
+        stop_loss_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
+        update_exit_targets: bool = False,
     ) -> None:
         with self._connect() as conn:
             fields = "quantity = ?, cost_basis_usdc = ?, entry_fee_usdc = ?"
@@ -515,6 +527,10 @@ class SQLiteStorage:
             if borrowed_usdc is not None:
                 fields += ", borrowed_usdc = ?"
                 values.append(str(borrowed_usdc))
+            if update_exit_targets:
+                fields += ", stop_loss_price = ?, take_profit_price = ?"
+                values.append(str(stop_loss_price) if stop_loss_price is not None else None)
+                values.append(str(take_profit_price) if take_profit_price is not None else None)
             values.append(position_id)
             result = conn.execute(f"UPDATE positions SET {fields} WHERE position_id = ? AND status = 'OPEN'", values)
             if result.rowcount != 1:

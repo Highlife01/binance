@@ -24,6 +24,7 @@ class StrategyParams:
     require_close_above_fast: bool = True
     require_rising_momentum: bool = True
     fast_exit: bool = False
+    dip_rebound_buy: bool = False
 
 
 def compute_indicator_frame(
@@ -132,6 +133,16 @@ def evaluate_rule_signal_from_frame(
 
     rsi_healthy_for_buy = cfg.rsi_buy_min <= rsi_val <= cfg.rsi_buy_max
     volume_supported = vol_ratio >= cfg.min_volume_ratio
+    open_val = float(curr["open"])
+    prev_close_val = float(prev["close"])
+    dip_bounce_up = (
+        cfg.dip_rebound_buy
+        and (20.0 <= rsi_val <= 58.0)
+        and (close_val > prev_close_val)
+        and (close_val >= open_val)
+        and (macd_hist >= prev_macd_hist or close_val >= ema_fast * 0.9985)
+        and volume_supported
+    )
 
     trend_reversal_down = ema_fast < ema_slow and macd_hist < 0.0
     overbought_cooling = rsi_val >= cfg.rsi_overbought_exit and macd_hist < prev_macd_hist
@@ -145,6 +156,12 @@ def evaluate_rule_signal_from_frame(
         reason = (
             f"Kural tabanlı yükseliş teyidi: EMA({cfg.ema_fast_span})={ema_fast:.2f}, "
             f"EMA({cfg.ema_slow_span})={ema_slow:.2f}, MACD_hist={macd_hist:.4f}, "
+            f"RSI={rsi_val:.1f}, Hacim={vol_ratio:.2f}x."
+        )
+    elif dip_bounce_up:
+        action = "AL"
+        reason = (
+            f"Dip dönüşü ve tepki yükselişi alımı: Kapanış ({close_val:.4g}) > Önceki ({prev_close_val:.4g}), "
             f"RSI={rsi_val:.1f}, Hacim={vol_ratio:.2f}x."
         )
     elif trend_reversal_down:

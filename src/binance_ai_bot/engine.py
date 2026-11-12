@@ -27,6 +27,7 @@ from .domain import (
     RiskSettings,
     SimulatedOrderResult,
     TechnicalSignal,
+    is_substep_dust_position,
 )
 from .live_executor import BinanceLiveSpotExecutor, LiveExecutionError
 from .margin_executor import BinanceLiveMarginExecutor
@@ -194,11 +195,19 @@ class TradingSystemEngine:
         shadow_track = self._shadow_track(market.filters.quote_asset)
         shadow_open = self.storage.get_open_positions(track=shadow_track)
         best_bid = market.order_book.best_bid
-        shadow_pos = next((p for p in shadow_open if p.symbol == market.symbol), None)
+        shadow_pos = next(
+            (p for p in shadow_open if p.symbol == market.symbol and not is_substep_dust_position(p, market.filters)),
+            None,
+        )
+        min_profit_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
         if shadow_pos is not None and best_bid is not None:
             stop_hit = shadow_pos.stop_loss_price is not None and best_bid <= shadow_pos.stop_loss_price
             tp_hit = shadow_pos.take_profit_price is not None and best_bid >= shadow_pos.take_profit_price
-            if stop_hit or tp_hit or tech_signal.action == "SAT":
+            rule_sell_ok = tech_signal.action == "SAT" and (
+                min_profit_pct <= Decimal("0")
+                or best_bid >= shadow_pos.entry_price * (Decimal("1") + min_profit_pct)
+            )
+            if stop_hit or tp_hit or rule_sell_ok:
                 reason = "STOP_LOSS" if stop_hit else ("TAKE_PROFIT" if tp_hit else "KURAL_SAT")
                 self.simulator.execute_sell_position(
                     position=shadow_pos,
@@ -213,7 +222,8 @@ class TradingSystemEngine:
                 )
                 return
 
-        if shadow_pos is None and len(shadow_open) < settings.max_open_positions and tech_signal.action == "AL":
+        active_shadow_open = [p for p in shadow_open if not is_substep_dust_position(p)]
+        if shadow_pos is None and len(active_shadow_open) < settings.max_open_positions and tech_signal.action == "AL":
             chk = self.risk_manager.check_buy_entry(
                 filters=market.filters,
                 order_book=market.order_book,
@@ -424,7 +434,10 @@ class TradingSystemEngine:
         )
 
         open_positions = self.storage.get_open_positions(track=active_track)
-        symbol_open_pos = next((p for p in open_positions if p.symbol == market.symbol), None)
+        symbol_open_pos = next(
+            (p for p in open_positions if p.symbol == market.symbol and not is_substep_dust_position(p, market.filters)),
+            None,
+        )
         has_open_pos = symbol_open_pos is not None
 
         # 4. Günlük zarar limiti ve açık pozisyon koruyucu çıkış denetimi
@@ -574,6 +587,25 @@ class TradingSystemEngine:
         executed_order: SimulatedOrderResult | None = None
         info_msg = ai_decision.reason
         block_reason: str | None = None
+        min_profit_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
+
+        # "Al & Kârı Görünce Sat" koruması:
+        # 1) Fiyat net kâr eşiğinin (+min_net_profit_exit_pct) üzerine çıktıysa ve teknik ivme SAT diyorsa anında kârı kilitle.
+        # 2) Fiyat henüz kâr eşiğine ulaşmadıysa ufak mum dalgalanmalarında zararına erken SAT yapma; yükselişi bekle!
+        if symbol_open_pos is not None and min_profit_pct > Decimal("0"):
+            min_exit_px = symbol_open_pos.entry_price * (Decimal("1") + min_profit_pct)
+            if best_bid >= min_exit_px and tech_signal.action == "SAT":
+                final_action = "SAT"
+                info_msg = (
+                    f"{market.symbol} kâr bölgesinde (+%{min_profit_pct * Decimal('100'):.2f} üzeri) "
+                    f"ivme yavaşladığı için net kâr kilitleniyor (Giriş: {symbol_open_pos.entry_price:.6g}, Anlık: {best_bid:.6g})."
+                )
+            elif final_action == "SAT" and best_bid < min_exit_px:
+                final_action = "BEKLE"
+                info_msg = (
+                    f"{market.symbol} kâr hedefi bekleniyor (Giriş: {symbol_open_pos.entry_price:.6g}, "
+                    f"Anlık: {best_bid:.6g}, Kârlı Çıkış Eşiği: {min_exit_px:.6g}); zararına erken satış yapılmadı."
+                )
 
         if stop_requested and stop_requested():
             return blocked("Durdurma isteği alındı; emir gönderilmedi.")
@@ -661,6 +693,14 @@ class TradingSystemEngine:
         elif final_action == "SAT":
             if symbol_open_pos is not None:
                 sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:SAT"
+                exit_reason_label = (
+                    "KARDA_STRATEJI_SAT"
+                    if (
+                        min_profit_pct > Decimal("0")
+                        and best_bid >= symbol_open_pos.entry_price * (Decimal("1") + min_profit_pct)
+                    )
+                    else "STRATEJI_SAT_SINYALI"
+                )
                 if is_live_spot:
                     try:
                         ord_res = self.live_executor.execute_live_market_sell(
@@ -668,7 +708,7 @@ class TradingSystemEngine:
                             filters=market.filters,
                             signal_key=sig_key,
                             strategy_source=ai_decision.mode_label,
-                            close_reason="STRATEJI_SAT_SINYALI",
+                            close_reason=exit_reason_label,
                             ui_live_confirmed=ui_live_confirmed,
                             stop_requested=stop_requested,
                         )
@@ -684,7 +724,7 @@ class TradingSystemEngine:
                             filters=market.filters,
                             signal_key=sig_key,
                             strategy_source=ai_decision.mode_label,
-                            close_reason="STRATEJI_SAT_SINYALI",
+                            close_reason=exit_reason_label,
                             ui_live_confirmed=ui_live_confirmed,
                             ui_margin_confirmed=ui_margin_confirmed,
                         )
@@ -700,7 +740,7 @@ class TradingSystemEngine:
                         order_book=market.order_book,
                         signal_key=sig_key,
                         strategy_source=ai_decision.mode_label,
-                        close_reason="STRATEJI_SAT_SINYALI",
+                        close_reason=exit_reason_label,
                         settings=settings,
                         now_utc=now_utc,
                         track="MAIN",
@@ -784,6 +824,8 @@ class TradingSystemEngine:
                 spot_map = spot_cache[pos_quote]
                 if pos.symbol not in spot_map:
                     messages.append(f"{pos.symbol}: borsa filtre bilgisi alınamadı.")
+                    continue
+                if is_substep_dust_position(pos, spot_map[pos.symbol]):
                     continue
                 now_utc = datetime.now(timezone.utc)
                 if is_live_spot:

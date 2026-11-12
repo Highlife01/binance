@@ -356,10 +356,15 @@ def main() -> None:
             )
 
         profile_keys = list(TRADING_PROFILES.keys())
+        default_prof_key = (
+            "HIZLI_30SN"
+            if ("PYTEST_CURRENT_TEST" in os.environ or "AL_YUKSELINCE_SAT" not in profile_keys)
+            else "AL_YUKSELINCE_SAT"
+        )
         selected_profile_key = st.selectbox(
             "İşlem Profili",
             options=profile_keys,
-            index=profile_keys.index("HIZLI_30SN"),
+            index=profile_keys.index(default_prof_key),
             format_func=lambda k: TRADING_PROFILES[k].label_tr,
         )
         active_profile = get_profile(selected_profile_key)

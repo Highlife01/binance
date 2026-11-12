@@ -40,7 +40,7 @@ from google.oauth2 import id_token
 import requests
 
 from binance_ai_bot.config import AppConfig
-from binance_ai_bot.domain import RiskSettings
+from binance_ai_bot.domain import RiskSettings, is_substep_dust_position
 from binance_ai_bot.engine import StepCycleSummary, TradingSystemEngine
 from binance_ai_bot.live_executor import LiveExecutionError
 from binance_ai_bot.market_data import MarketDataError
@@ -342,9 +342,10 @@ class CloudBotApplication:
         defaults = {
             "cloud_auto_enabled": "1",
             "cloud_mode": "PAPER",
-            "cloud_profile": "HIZLI_30SN",
+            "cloud_profile": "AL_YUKSELINCE_SAT",
             "cloud_leverage": "2",
             "cloud_ai_enabled": "1" if bool(self.config.gemini_api_key) else "0",
+            "cloud_ai_force": "0",
             "cloud_live_confirmed": "0",
             "cloud_scan_symbols": ",".join(DEFAULT_SCAN_SYMBOLS),
         }
@@ -356,7 +357,7 @@ class CloudBotApplication:
             storage.ensure_quote_asset("MAIN", "USDT")
             changed = True
         if storage.get_state("risk_settings_json", "") == "":
-            prof = get_profile("HIZLI_30SN")
+            prof = get_profile("AL_YUKSELINCE_SAT")
             base = RiskSettings(
                 max_open_positions=5,
                 max_position_size_usdc=Decimal("10.00"),
@@ -365,6 +366,7 @@ class CloudBotApplication:
                 stop_loss_pct=prof.stop_loss_pct,
                 take_profit_pct=prof.take_profit_pct,
                 leverage=2,
+                min_net_profit_exit_pct=prof.min_net_profit_exit_pct,
             )
             storage.save_risk_settings(base)
             changed = True
@@ -382,7 +384,7 @@ class CloudBotApplication:
         )
         mode = "LIVE_SPOT" if can_live else "PAPER"
         track = "LIVE_SPOT" if mode == "LIVE_SPOT" else "MAIN"
-        profile: TradingProfile = get_profile(st.get_state("cloud_profile", "HIZLI_30SN"))
+        profile: TradingProfile = get_profile(st.get_state("cloud_profile", "AL_YUKSELINCE_SAT"))
         try:
             lev = max(1, min(5, int(st.get_state("cloud_leverage", "2") or "2")))
         except ValueError:
@@ -406,6 +408,7 @@ class CloudBotApplication:
             allow_stablecoin_conversion=False,
             leverage=lev,
             hourly_margin_interest_rate=saved_risk.hourly_margin_interest_rate,
+            min_net_profit_exit_pct=profile.min_net_profit_exit_pct,
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
         symbols = [
@@ -416,6 +419,8 @@ class CloudBotApplication:
         if not symbols:
             symbols = list(DEFAULT_SCAN_SYMBOLS)
         ai_enabled = (st.get_state("cloud_ai_enabled", "1") == "1") and eng.config.has_gemini_key
+        ai_force = (st.get_state("cloud_ai_force", "0") == "1") and ai_enabled
+        ai_mode = "2" if ai_force else ("1" if ai_enabled else "0")
         auto_enabled = st.get_state("cloud_auto_enabled", "1") == "1"
         return {
             "mode": mode,
@@ -425,6 +430,8 @@ class CloudBotApplication:
             "settings": eff_settings,
             "symbols": symbols,
             "ai_enabled": ai_enabled,
+            "ai_force": ai_force,
+            "ai_mode": ai_mode,
             "auto_enabled": auto_enabled,
             "live_confirmed": live_confirmed,
         }
@@ -455,6 +462,8 @@ class CloudBotApplication:
         settings: RiskSettings = params["settings"]
         scan_symbols: list[str] = params["symbols"]
         ai_enabled: bool = params["ai_enabled"]
+        ai_force: bool = params["ai_force"]
+        use_ai_now = ai_force if profile.direct_rule_execution else ai_enabled
         is_live_spot = mode == "LIVE_SPOT"
 
         prefetched_live = False
@@ -467,7 +476,7 @@ class CloudBotApplication:
                 last_error = self._friendly_live_error(str(exc))
                 st.set_state("cloud_last_error", last_error)
 
-        open_now = st.get_open_positions(track=track)
+        open_now = [p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]
         open_syms = list(dict.fromkeys(p.symbol for p in open_now))
         paused, _ = st.is_new_entries_paused(track=track)
         if len(open_now) < settings.max_open_positions and not paused:
@@ -478,7 +487,7 @@ class CloudBotApplication:
         scanned: list[dict[str, Any]] = []
         orders_executed = 0
         for sym in cycle_symbols:
-            cur_open = st.get_open_positions(track=track)
+            cur_open = [p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]
             cur_open_syms = {p.symbol for p in cur_open}
             if sym not in cur_open_syms and (len(cur_open) >= settings.max_open_positions or paused):
                 break
@@ -486,7 +495,7 @@ class CloudBotApplication:
                 symbol=sym,
                 interval=profile.interval,
                 settings=settings,
-                ai_enabled_by_user=ai_enabled,
+                ai_enabled_by_user=use_ai_now,
                 daily_ai_limit_override=profile.ai_daily_call_limit,
                 min_ai_interval_override=profile.ai_min_call_interval_seconds,
                 execution_mode=mode,
@@ -514,7 +523,7 @@ class CloudBotApplication:
                 res.executed_order is not None
                 and res.executed_order.side == "BUY"
                 and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
-                and len(st.get_open_positions(track=track)) >= settings.max_open_positions
+                and len([p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]) >= settings.max_open_positions
             ):
                 break
 
@@ -635,6 +644,8 @@ class CloudBotApplication:
 
         pos_rows: list[dict[str, Any]] = []
         for pos in open_positions:
+            if is_substep_dust_position(pos):
+                continue
             cur_bid = bids.get(pos.symbol)
             unreal_pnl: Decimal | None = None
             unreal_pct: Decimal | None = None
@@ -754,6 +765,8 @@ class CloudBotApplication:
             "interval": profile.interval,
             "leverage": settings.leverage,
             "ai_enabled": params["ai_enabled"],
+            "ai_force": params["ai_force"],
+            "ai_mode": params["ai_mode"],
             "has_gemini_key": eng.config.has_gemini_key,
             "gemini_model": eng.config.gemini_model,
             "has_binance_live_keys": eng.config.has_binance_live_keys,
@@ -778,6 +791,7 @@ class CloudBotApplication:
                 "max_daily_new_positions": settings.max_daily_new_positions,
                 "stop_loss_pct": _dec_str(settings.stop_loss_pct * Decimal("100"), "0.01"),
                 "take_profit_pct": _dec_str(settings.take_profit_pct * Decimal("100"), "0.01"),
+                "min_net_profit_exit_pct": _dec_str(settings.min_net_profit_exit_pct * Decimal("100"), "0.02"),
             },
             "ai_usage": {
                 "today_network_calls": ai_summary["today_network_calls"],
@@ -823,9 +837,23 @@ class CloudBotApplication:
             except (TypeError, ValueError):
                 pass
 
-        if "ai_enabled" in payload:
+        if "ai_mode" in payload:
+            req_ai_mode = str(payload["ai_mode"]).strip()
+            has_key = eng.config.has_gemini_key
+            if req_ai_mode == "2" and has_key:
+                st.set_state("cloud_ai_enabled", "1")
+                st.set_state("cloud_ai_force", "1")
+            elif req_ai_mode == "1" and has_key:
+                st.set_state("cloud_ai_enabled", "1")
+                st.set_state("cloud_ai_force", "0")
+            else:
+                st.set_state("cloud_ai_enabled", "0")
+                st.set_state("cloud_ai_force", "0")
+        elif "ai_enabled" in payload:
             ai_on = bool(payload["ai_enabled"]) and eng.config.has_gemini_key
             st.set_state("cloud_ai_enabled", "1" if ai_on else "0")
+            if not ai_on:
+                st.set_state("cloud_ai_force", "0")
 
         cur_risk = eng.default_risk_settings()
         max_open = cur_risk.max_open_positions
@@ -860,7 +888,7 @@ class CloudBotApplication:
 
         if risk_changed:
             lev_now = max(1, min(5, int(st.get_state("cloud_leverage", "2") or "2")))
-            prof_now = get_profile(st.get_state("cloud_profile", "HIZLI_30SN"))
+            prof_now = get_profile(st.get_state("cloud_profile", "AL_YUKSELINCE_SAT"))
             updated_risk = RiskSettings(
                 max_open_positions=max_open,
                 max_position_size_usdc=pos_size,
@@ -872,6 +900,7 @@ class CloudBotApplication:
                 stop_loss_pct=prof_now.stop_loss_pct,
                 take_profit_pct=prof_now.take_profit_pct,
                 leverage=lev_now,
+                min_net_profit_exit_pct=prof_now.min_net_profit_exit_pct,
             )
             st.save_risk_settings(updated_risk)
             notes.append("Risk ve pozisyon limitleri kaydedildi.")
@@ -1030,12 +1059,33 @@ class CloudBotApplication:
                 if eng.storage.get_state("cloud_auto_enabled", "1") != "1":
                     return respond(200, {"ok": True, "skipped": True, "reason": "7/24 otomatik tarama kullanıcı tarafından duraklatılmış."})
                 tick_summary = self._run_scan_cycle(eng, source="CRON")
-                return respond(200, {"ok": True, "skipped": False, "summary": tick_summary})
             except Exception as exc:
                 logging.exception("Cron tick hatasi")
                 return respond(500, {"error": _safe_text(exc, 240)})
             finally:
                 self._op_lock.release()
+
+            # 30 saniyede bir kâr-al ve yeni alım fırsatlarını yakalamak için kilidi bırakarak ikinci geçiş
+            double_pass = (
+                "PYTEST_CURRENT_TEST" not in os.environ
+                and _parse_bool(os.getenv("CLOUD_CRON_DOUBLE_PASS", "1"), default=True)
+            )
+            if double_pass:
+                time.sleep(25.0)
+                if self._op_lock.acquire(blocking=False):
+                    try:
+                        eng2 = self._get_engine()
+                        if eng2.storage.get_state("cloud_auto_enabled", "1") == "1":
+                            tick_summary_2 = self._run_scan_cycle(eng2, source="CRON_30SN")
+                            tick_summary["orders_executed"] = int(tick_summary.get("orders_executed", 0)) + int(
+                                tick_summary_2.get("orders_executed", 0)
+                            )
+                            tick_summary["second_pass"] = True
+                    except Exception:
+                        logging.exception("Cron 2. gecis uyarisi")
+                    finally:
+                        self._op_lock.release()
+            return respond(200, {"ok": True, "skipped": False, "summary": tick_summary})
 
         known_owner_routes = {
             "/status",

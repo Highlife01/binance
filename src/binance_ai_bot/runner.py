@@ -27,6 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .config import PROJECT_ROOT, AppConfig, load_config
+from .domain import is_substep_dust_position
 from .engine import StepCycleSummary, TradingSystemEngine
 from .profiles import TradingProfile, get_profile
 from .risk import compute_open_position_unrealized_net_pnl
@@ -156,7 +157,11 @@ def _setup_logger() -> logging.Logger:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Kesintisiz Binance Spot / Çapraz Marjin arka plan botu")
     ap.add_argument("--mod", choices=["sanal", "canli", "marjin"], default="sanal")
-    ap.add_argument("--profil", choices=["hizli_30sn", "aktif", "temkinli"], default="hizli_30sn")
+    ap.add_argument(
+        "--profil",
+        choices=["al_yukselince_sat", "hizli_30sn", "aktif", "temkinli"],
+        default="hizli_30sn",
+    )
     ap.add_argument("--parite", default="", help="Örn. BTCUSDT (boşsa .env DEFAULT_SYMBOL)")
     ap.add_argument(
         "--pariteler",
@@ -388,7 +393,7 @@ def run_bot(
                     log.warning("Canli marjin bakiye on-okuma uyarisi: %s", exc)
 
             # Önce tüm açık pozisyonları kontrol et (zarar-kes / kâr-al / SAT), boş yer varsa diğer coinleri tara
-            open_now = storage.get_open_positions(track=track)
+            open_now = [p for p in storage.get_open_positions(track=track) if not is_substep_dust_position(p)]
             open_syms = list(dict.fromkeys(p.symbol for p in open_now))
             if len(open_now) < settings.max_open_positions:
                 cycle_symbols = open_syms + [s for s in scan_symbols if s not in open_syms]
@@ -402,7 +407,7 @@ def run_bot(
                 if _stop_requested(storage):
                     break
                 # Açık olmayan bir adaya bakarken kapasite dolduysa yeni alım aramayı kes
-                cur_open = storage.get_open_positions(track=track)
+                cur_open = [p for p in storage.get_open_positions(track=track) if not is_substep_dust_position(p)]
                 cur_open_syms = {p.symbol for p in cur_open}
                 if sym not in cur_open_syms and len(cur_open) >= settings.max_open_positions:
                     break
@@ -456,7 +461,7 @@ def run_bot(
                     res.executed_order is not None
                     and res.executed_order.side == "BUY"
                     and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
-                    and len(storage.get_open_positions(track=track)) >= settings.max_open_positions
+                    and len([p for p in storage.get_open_positions(track=track) if not is_substep_dust_position(p)]) >= settings.max_open_positions
                 ):
                     break
 
@@ -465,7 +470,7 @@ def run_bot(
                 break
 
             # Açık pozisyonların tamamı için her döngüde anlık Kâr/Zarar durumunu yazdır
-            open_after = storage.get_open_positions(track=track)
+            open_after = [p for p in storage.get_open_positions(track=track) if not is_substep_dust_position(p)]
             mc = getattr(eng, "market_client", None)
             if open_after and mc is not None:
                 est_settings = profile.apply_to_risk_settings(

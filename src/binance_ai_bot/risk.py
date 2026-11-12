@@ -19,6 +19,7 @@ from .domain import (
     RiskCheckResult,
     RiskSettings,
     SymbolFilters,
+    is_substep_dust_position,
     quantize_down,
 )
 from .security import STABLECOIN_OR_FIAT_ASSETS
@@ -256,7 +257,13 @@ class RiskManager:
             )
 
         # 3. Zararda ek alım / Martingale engeli ve maksimum açık pozisyon sınırı
-        for pos in open_positions:
+        # Not: Önceki satıştan borsanın lot adımı altında kalan ufak küsurat (dust) aktif pozisyon sayılmaz.
+        active_open_positions = [
+            pos
+            for pos in open_positions
+            if not is_substep_dust_position(pos, filters if pos.symbol == filters.symbol else None)
+        ]
+        for pos in active_open_positions:
             if pos.symbol == filters.symbol:
                 return RiskCheckResult(
                     allowed=False,
@@ -267,7 +274,7 @@ class RiskManager:
                     daily_total_loss_usdc=daily_loss,
                 )
 
-        if len(open_positions) >= settings.max_open_positions:
+        if len(active_open_positions) >= settings.max_open_positions:
             return RiskCheckResult(
                 allowed=False,
                 reason=(

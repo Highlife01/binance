@@ -37,6 +37,7 @@ class TradingProfile:
     loop_seconds: int
     direct_rule_execution: bool = False
     max_open_positions: int = 1
+    min_net_profit_exit_pct: Decimal = Decimal("0")
 
     def apply_to_risk_settings(
         self, base: RiskSettings, *, leverage: int | None = None
@@ -62,10 +63,42 @@ class TradingProfile:
             hourly_margin_interest_rate=getattr(
                 base, "hourly_margin_interest_rate", Decimal("0.000005")
             ),
+            min_net_profit_exit_pct=self.min_net_profit_exit_pct,
         )
 
 
 TRADING_PROFILES: dict[str, TradingProfile] = {
+    "AL_YUKSELINCE_SAT": TradingProfile(
+        key="AL_YUKSELINCE_SAT",
+        label_tr="🚀 Al & Kârı Görünce Sat (Sürekli Döngü — 1dk Mum)",
+        description_tr=(
+            "10 coini sürekli tarar; dip dönüşü ve yükseliş başlangıcında alır, ufak geri çekilmelerde "
+            "zararına erken satış yapmaz, komisyon sonrası net kârı görünce (+%0.38–%0.55) anında satıp "
+            "nakde döner ve hemen yeni alım fırsatı arar (%3.5 acil çöküş koruması + günlük zarar sigortası aktiftir)."
+        ),
+        interval="1m",
+        strategy=StrategyParams(
+            ema_fast_span=5,
+            ema_slow_span=13,
+            rsi_buy_min=26.0,
+            rsi_buy_max=68.0,
+            rsi_overbought_exit=69.0,
+            min_volume_ratio=0.12,
+            require_close_above_fast=False,
+            require_rising_momentum=False,
+            fast_exit=True,
+            dip_rebound_buy=True,
+        ),
+        max_daily_new_positions=120,
+        stop_loss_pct=Decimal("0.035"),
+        take_profit_pct=Decimal("0.0055"),
+        ai_daily_call_limit=400,
+        ai_min_call_interval_seconds=25,
+        loop_seconds=20,
+        direct_rule_execution=True,
+        max_open_positions=5,
+        min_net_profit_exit_pct=Decimal("0.0038"),
+    ),
     "HIZLI_30SN": TradingProfile(
         key="HIZLI_30SN",
         label_tr="🔥 Hızlı Aktif (30 sn Döngü — 1dk Mum — Çoklu Coin)",

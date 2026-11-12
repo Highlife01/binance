@@ -200,6 +200,7 @@
           <div class="field">
             <label>Profil</label>
             <select id="selProfile">
+              <option value="AL_YUKSELINCE_SAT">🚀 Al & Kârı Görünce Sat (Sürekli)</option>
               <option value="HIZLI_30SN">🔥 Hızlı Aktif (1dk Mum)</option>
               <option value="AKTIF">⚡ Aktif (5dk Mum)</option>
               <option value="TEMKINLI">🛡️ Temkinli (15dk Mum)</option>
@@ -227,10 +228,11 @@
             <input type="number" id="inpDailyLoss" min="0.5" max="100" step="0.5" value="2.0" />
           </div>
           <div class="field">
-            <label>Gemini AI</label>
+            <label>Karar Motoru / AI</label>
             <select id="selAi">
-              <option value="1">🤖 Açık</option>
-              <option value="0">📐 Yalnızca Kural</option>
+              <option value="1">⚡ Otomatik (Hızlıda Doğrudan Kural)</option>
+              <option value="0">📐 Yalnızca Hızlı Kural</option>
+              <option value="2">🧠 Zorunlu Gemini AI Filtresi</option>
             </select>
           </div>
           <button id="saveSettingsBtn" class="btn-blue">💾 Ayarları Kaydet</button>
@@ -453,7 +455,7 @@
       // Kontrolleri senkronla (kullanici duzenlemiyorsa)
       if (document.activeElement.tagName !== "SELECT" && document.activeElement.tagName !== "INPUT") {
         $("selMode").value = d.mode || "PAPER";
-        $("selProfile").value = d.profile || "HIZLI_30SN";
+        $("selProfile").value = d.profile || "AL_YUKSELINCE_SAT";
         $("selLeverage").value = String(d.leverage || 2);
         $("selLeverage").disabled = d.mode === "LIVE_SPOT";
         if (d.risk_settings) {
@@ -461,15 +463,16 @@
           $("inpMaxOpen").value = Number(d.risk_settings.max_open_positions || 5);
           $("inpDailyLoss").value = Number(d.risk_settings.daily_loss_limit_usdc || 2);
         }
-        $("selAi").value = d.ai_enabled ? "1" : "0";
+        $("selAi").value = d.ai_mode != null ? String(d.ai_mode) : (d.ai_enabled ? "1" : "0");
       }
 
       $("toggleAutoBtn").textContent = d.cloud_auto_enabled ? "⏱️ 7/24 Otomatik: AÇIK" : "⏱️ 7/24 Otomatik: KAPALI";
       $("togglePauseBtn").textContent = d.new_entries_paused ? "🟢 Yeni Alımlara İzin Ver" : "⏸️ Yeni Alımları Durdur";
 
+      const profDesc = d.profile_description ? ` • ${d.profile_description}` : "";
       const hbText = d.heartbeat_at
-        ? `Son Bulut Taraması: ${fmtTrTime(d.heartbeat_at)} (${d.heartbeat_age_seconds ?? "?"} sn önce) • Taranan: ${(d.scan_symbols || []).join(", ")}`
-        : `Henüz tarama kaydı yok — 'Şimdi 10 Coini Tara' düğmesine basabilir veya 1 dk içinde otomatik başlamasını bekleyebilirsiniz.`;
+        ? `Son Bulut Taraması: ${fmtTrTime(d.heartbeat_at)} (${d.heartbeat_age_seconds ?? "?"} sn önce) • Taranan: ${(d.scan_symbols || []).join(", ")}${profDesc}`
+        : `Henüz tarama kaydı yok — 'Şimdi 10 Coini Tara' düğmesine basabilir veya 30 sn içinde otomatik başlamasını bekleyebilirsiniz.${profDesc}`;
       $("heartbeatInfo").textContent = hbText;
 
       if (d.ai_usage) {
@@ -641,7 +644,7 @@
           max_position_size_usdc: $("inpPosSize").value,
           max_open_positions: Number($("inpMaxOpen").value),
           daily_loss_limit_usdc: $("inpDailyLoss").value,
-          ai_enabled: $("selAi").value === "1"
+          ai_mode: $("selAi").value
         });
         showToast(res.message);
         if (res.dashboard) renderDashboard(res.dashboard);
