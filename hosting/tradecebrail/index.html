@@ -195,6 +195,7 @@
             <select id="selMode">
               <option value="PAPER">🟢 Sanal Deneme (PAPER)</option>
               <option value="LIVE_SPOT">🔴 Gerçek Spot (1x)</option>
+              <option value="LIVE_MARGIN">⚡ Gerçek Kaldıraçlı Marjin (2x–5x)</option>
             </select>
           </div>
           <div class="field">
@@ -207,11 +208,12 @@
             </select>
           </div>
           <div class="field">
-            <label>Kaldıraç (Sanal)</label>
+            <label>Kaldıraç (Sanal / Marjin)</label>
             <select id="selLeverage">
               <option value="1">1x (Spot)</option>
               <option value="2">2x (Önerilen)</option>
               <option value="3">3x</option>
+              <option value="4">4x</option>
               <option value="5">5x</option>
             </select>
           </div>
@@ -435,6 +437,9 @@
       if (d.mode === "LIVE_SPOT") {
         banner.className = "banner banner-live";
         banner.textContent = `⚠️ CANLI SPOT MODU (1x) AKTİF — Gerçek Binance ${ccy} Bakiyesi Kullanılıyor`;
+      } else if (d.mode === "LIVE_MARGIN") {
+        banner.className = "banner banner-live";
+        banner.textContent = `⚡ GERÇEK KALDIRAÇLI MARJİN (${d.leverage}x) AKTİF — Çapraz Marjin Cüzdanı Kullanılıyor • Marjin Seviyesi: ${d.margin_level || "—"}`;
       } else {
         banner.className = "banner";
         banner.textContent = `🛡️ SANAL DENEME MODU (${d.leverage}x Kaldıraç) — Gerçek Binance Bakiyenize Dokunulmaz • 10 Coin 7/24 Bulut Takibi`;
@@ -458,6 +463,7 @@
         $("selProfile").value = d.profile || "AL_YUKSELINCE_SAT";
         $("selLeverage").value = String(d.leverage || 2);
         $("selLeverage").disabled = d.mode === "LIVE_SPOT";
+        applyModeLeverageRules();
         if (d.risk_settings) {
           $("inpPosSize").value = Number(d.risk_settings.max_position_size_usdc || 10);
           $("inpMaxOpen").value = Number(d.risk_settings.max_open_positions || 5);
@@ -628,9 +634,21 @@
       }
     });
 
+    function applyModeLeverageRules() {
+      const m = $("selMode").value;
+      const lev = $("selLeverage");
+      if (m === "LIVE_SPOT") { lev.value = "1"; lev.disabled = true; }
+      else { lev.disabled = false; if (m === "LIVE_MARGIN" && lev.value === "1") lev.value = "2"; }
+    }
+    $("selMode").addEventListener("change", applyModeLeverageRules);
+
     $("saveSettingsBtn").addEventListener("click", async () => {
       const reqMode = $("selMode").value;
       let confirmText = "";
+      if (reqMode === "LIVE_MARGIN" && (!latestDash || latestDash.mode !== "LIVE_MARGIN")) {
+        confirmText = prompt("DİKKAT: Gerçek Binance Çapraz Marjin (2x–5x Kaldıraçlı) moduna geçmek için büyük harflerle EVET yazın:") || "";
+        if (confirmText.trim().toUpperCase() !== "EVET") return;
+      }
       if (reqMode === "LIVE_SPOT" && (!latestDash || latestDash.mode !== "LIVE_SPOT")) {
         confirmText = prompt("DİKKAT: Gerçek Binance Spot (1x) moduna geçmek için büyük harflerle EVET yazın:") || "";
         if (confirmText.trim().toUpperCase() !== "EVET") return;

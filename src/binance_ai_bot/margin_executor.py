@@ -232,6 +232,7 @@ class BinanceLiveMarginExecutor:
         settings: RiskSettings,
         ui_live_confirmed: bool,
         ui_margin_confirmed: bool,
+        approved_notional: Decimal | None = None,
     ) -> SimulatedOrderResult:
         """
         Önce `/api/v3/order/test` ve `/sapi/v1/margin/maxBorrowable` kontrollerini yapar,
@@ -291,6 +292,15 @@ class BinanceLiveMarginExecutor:
                 f"Marjin cüzdanındaki serbest {q_ccy} ({status_info['quote_free']:.2f}) + borç limiti "
                 f"({max_borrow:.2f}) minimum emir tutarını ({filters.min_notional:.2f} {q_ccy}) karşılamıyor."
             )
+        if (
+            approved_notional is not None
+            and approved_notional > Decimal("0")
+            and approved_notional > total_buying_power * Decimal("0.985")
+        ):
+            scale = (total_buying_power * Decimal("0.985")) / approved_notional
+            scaled_qty = quantize_down(approved_qty * scale, filters.market_step_size)
+            if scaled_qty >= max(filters.min_qty, filters.market_min_qty):
+                qty = scaled_qty
 
         # 3. Gerçek Çapraz Marjin alım emri (MARGIN_BUY -> bakiye yetmezse otomatik borçlanır)
         order_params = {
@@ -324,6 +334,11 @@ class BinanceLiveMarginExecutor:
             elif comm_asset == filters.base_asset and avg_price > 0:
                 fee_usdc += comm * avg_price
                 executed_qty = max(Decimal("0"), executed_qty - comm)
+            elif comm > 0 and cumm_quote > 0:
+                fill_qty = Decimal(str(fill.get("qty", "0")))
+                fill_px = Decimal(str(fill.get("price", "0")))
+                fill_quote = fill_qty * fill_px if (fill_qty > 0 and fill_px > 0) else cumm_quote
+                fee_usdc += fill_quote * getattr(settings, "estimated_fee_rate", Decimal("0.00075"))
 
         eff_qty = quantize_down(executed_qty, filters.market_step_size)
         order_id = f"MARG-{resp.get('orderId', client_oid)}"
@@ -448,6 +463,13 @@ class BinanceLiveMarginExecutor:
             comm_asset = str(fill.get("commissionAsset", "")).upper()
             if comm_asset == q_ccy:
                 exit_fee_usdc += comm
+            elif comm_asset == filters.base_asset and avg_price > 0:
+                exit_fee_usdc += comm * avg_price
+            elif comm > 0 and cumm_quote > 0:
+                fill_qty = Decimal(str(fill.get("qty", "0")))
+                fill_px = Decimal(str(fill.get("price", "0")))
+                fill_quote = fill_qty * fill_px if (fill_qty > 0 and fill_px > 0) else cumm_quote
+                exit_fee_usdc += fill_quote * Decimal("0.00075")
 
         net_proceeds = cumm_quote - exit_fee_usdc
         realized_pnl = net_proceeds - position.cost_basis_usdc - position.entry_fee_usdc

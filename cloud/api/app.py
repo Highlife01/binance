@@ -11,6 +11,7 @@ TradeCebrail 7/24 Bulut Alım-Satım Motoru ve Sahip Doğrulamalı Kontrol API's
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -309,6 +310,7 @@ class CloudBotApplication:
 
         if self._engine is not None:
             self._engine.lock_benchmark_symbol = True
+            self._engine.allow_live_margin = True
             self._ensure_cloud_defaults(self._engine.storage)
 
     def _get_engine(self) -> TradingSystemEngine:
@@ -327,6 +329,7 @@ class CloudBotApplication:
             app_cfg = self.config.to_app_config()
             eng = TradingSystemEngine(app_cfg)
             eng.lock_benchmark_symbol = True
+            eng.allow_live_margin = True
             created_defaults = self._ensure_cloud_defaults(eng.storage)
             if created_defaults:
                 try:
@@ -347,6 +350,7 @@ class CloudBotApplication:
             "cloud_ai_enabled": "1" if bool(self.config.gemini_api_key) else "0",
             "cloud_ai_force": "0",
             "cloud_live_confirmed": "0",
+            "cloud_margin_confirmed": "0",
             "cloud_scan_symbols": ",".join(DEFAULT_SCAN_SYMBOLS),
         }
         for key, val in defaults.items():
@@ -410,14 +414,17 @@ class CloudBotApplication:
         st = eng.storage
         raw_mode = st.get_state("cloud_mode", "PAPER").strip().upper()
         live_confirmed = st.get_state("cloud_live_confirmed", "0") == "1"
-        can_live = (
-            raw_mode == "LIVE_SPOT"
-            and live_confirmed
-            and eng.config.enable_live_trading
-            and eng.config.has_binance_live_keys
-        )
-        mode = "LIVE_SPOT" if can_live else "PAPER"
-        track = "LIVE_SPOT" if mode == "LIVE_SPOT" else "MAIN"
+        margin_confirmed = st.get_state("cloud_margin_confirmed", "0") == "1"
+        has_live_creds = eng.config.enable_live_trading and eng.config.has_binance_live_keys
+        if raw_mode == "LIVE_MARGIN" and live_confirmed and margin_confirmed and has_live_creds:
+            mode = "LIVE_MARGIN"
+            track = "LIVE_MARGIN"
+        elif raw_mode == "LIVE_SPOT" and live_confirmed and has_live_creds:
+            mode = "LIVE_SPOT"
+            track = "LIVE_SPOT"
+        else:
+            mode = "PAPER"
+            track = "MAIN"
         profile: TradingProfile = get_profile(st.get_state("cloud_profile", "AL_YUKSELINCE_SAT"))
         try:
             lev = max(1, min(5, int(st.get_state("cloud_leverage", "2") or "2")))
@@ -425,24 +432,15 @@ class CloudBotApplication:
             lev = 2
         if mode == "LIVE_SPOT":
             lev = 1
+        elif mode == "LIVE_MARGIN":
+            lev = max(2, min(5, lev))
 
         saved_risk = eng.default_risk_settings()
         eff_settings = profile.apply_to_risk_settings(saved_risk, leverage=lev)
-        # Kullanicinin kaydettigi acik pozisyon ust sinirini (1..10) koru
-        eff_settings = RiskSettings(
+        # Kullanicinin kaydettigi acik pozisyon ust sinirini (1..10) koru, kaldiraca gore ayarlanan SL/TP/Kar Kilidi hedeflerini muhafaza et
+        eff_settings = dataclasses.replace(
+            eff_settings,
             max_open_positions=max(1, min(10, int(saved_risk.max_open_positions))),
-            max_position_size_usdc=saved_risk.max_position_size_usdc,
-            daily_loss_limit_usdc=saved_risk.daily_loss_limit_usdc,
-            max_daily_new_positions=profile.max_daily_new_positions,
-            daily_limit_exit_policy=saved_risk.daily_limit_exit_policy,
-            estimated_fee_rate=saved_risk.estimated_fee_rate,
-            extra_slippage_bps=saved_risk.extra_slippage_bps,
-            stop_loss_pct=profile.stop_loss_pct,
-            take_profit_pct=profile.take_profit_pct,
-            allow_stablecoin_conversion=False,
-            leverage=lev,
-            hourly_margin_interest_rate=saved_risk.hourly_margin_interest_rate,
-            min_net_profit_exit_pct=profile.min_net_profit_exit_pct,
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
         symbols = [
@@ -468,6 +466,7 @@ class CloudBotApplication:
             "ai_mode": ai_mode,
             "auto_enabled": auto_enabled,
             "live_confirmed": live_confirmed,
+            "margin_confirmed": margin_confirmed,
         }
 
     def _get_live_bids_for_positions(self, eng: TradingSystemEngine, positions: list[Any]) -> dict[str, Decimal]:
@@ -499,12 +498,22 @@ class CloudBotApplication:
         ai_force: bool = params["ai_force"]
         use_ai_now = ai_force if profile.direct_rule_execution else ai_enabled
         is_live_spot = mode == "LIVE_SPOT"
+        is_live_margin = mode == "LIVE_MARGIN"
 
         prefetched_live = False
         last_error = ""
         if is_live_spot:
             try:
                 eng.live_executor.fetch_live_spot_balances(ui_live_confirmed=True, quote_asset="USDT")
+                prefetched_live = True
+            except Exception as exc:
+                last_error = self._friendly_live_error(str(exc))
+                st.set_state("cloud_last_error", last_error)
+        elif is_live_margin:
+            try:
+                eng.live_margin_executor.fetch_live_margin_balances(
+                    ui_live_confirmed=True, ui_margin_confirmed=True, quote_asset="USDT"
+                )
                 prefetched_live = True
             except Exception as exc:
                 last_error = self._friendly_live_error(str(exc))
@@ -533,7 +542,8 @@ class CloudBotApplication:
                 daily_ai_limit_override=profile.ai_daily_call_limit,
                 min_ai_interval_override=profile.ai_min_call_interval_seconds,
                 execution_mode=mode,
-                ui_live_confirmed=is_live_spot,
+                ui_live_confirmed=(is_live_spot or is_live_margin),
+                ui_margin_confirmed=is_live_margin,
                 strategy_params=profile.strategy,
                 ai_only_on_rule_signal=(len(scan_symbols) > 1),
                 skip_balance_prefetch=prefetched_live,
@@ -645,12 +655,41 @@ class CloudBotApplication:
                             "value_usdt": _dec_str(usd_val, "0.01"),
                         }
                     )
+            margin_usd = Decimal("0")
+            try:
+                m_raw = eng.live_margin_executor._request_signed(
+                    "GET", "/sapi/v1/margin/account", ui_live_confirmed=True, ui_margin_confirmed=True
+                )
+                for mb in m_raw.get("userAssets", []):
+                    net_amt = Decimal(str(mb.get("netAsset", "0")))
+                    free_amt = Decimal(str(mb.get("free", "0"))) + Decimal(str(mb.get("locked", "0")))
+                    borrowed_amt = Decimal(str(mb.get("borrowed", "0"))) + Decimal(str(mb.get("interest", "0")))
+                    if free_amt <= Decimal("0") and borrowed_amt <= Decimal("0"):
+                        continue
+                    m_asset = str(mb.get("asset", "")).upper()
+                    unit_px = Decimal("1") if m_asset in {"USDT", "USDC", "FDUSD"} else px_map.get(f"{m_asset}USDT", Decimal("0"))
+                    net_usd = net_amt * unit_px
+                    margin_usd += net_usd
+                    if abs(net_usd) >= Decimal("0.01") or free_amt >= Decimal("0.01"):
+                        rows.append(
+                            {
+                                "location": "Çapraz Marjin (Kaldıraç)",
+                                "is_earn": False,
+                                "asset": f"{m_asset} (Borç: {_dec_str(borrowed_amt, '0.01')})" if borrowed_amt > 0 else m_asset,
+                                "quantity": _dec_str(net_amt),
+                                "price_usdt": _dec_str(unit_px, "0.0001") if unit_px > 0 else None,
+                                "value_usdt": _dec_str(net_usd, "0.01"),
+                            }
+                        )
+            except Exception:
+                pass
             rows.sort(key=lambda r: Decimal(r["value_usdt"]), reverse=True)
             return {
                 "ok": True,
                 "spot_usdt": _dec_str(spot_usd, "0.01"),
+                "margin_usdt": _dec_str(margin_usd, "0.01"),
                 "earn_usdt": _dec_str(earn_usd, "0.01"),
-                "total_usdt": _dec_str(spot_usd + earn_usd, "0.01"),
+                "total_usdt": _dec_str(spot_usd + margin_usd + earn_usd, "0.01"),
                 "rows": rows,
             }
         except Exception as exc:
@@ -806,6 +845,8 @@ class CloudBotApplication:
             "has_binance_live_keys": eng.config.has_binance_live_keys,
             "live_env_enabled": eng.config.enable_live_trading,
             "live_confirmed": params["live_confirmed"],
+            "margin_confirmed": params["margin_confirmed"],
+            "margin_level": st.get_state("live_margin_level", "") or None,
             "scan_symbols": params["symbols"],
             "valuation_complete": bool(summary["valuation_complete"]),
             # Eski /api/status uyumluluk alanlari + detayli portfoy
@@ -944,6 +985,7 @@ class CloudBotApplication:
             if req_mode == "PAPER":
                 st.set_state("cloud_mode", "PAPER")
                 st.set_state("cloud_live_confirmed", "0")
+                st.set_state("cloud_margin_confirmed", "0")
                 notes.append("Sanal Deneme (PAPER) moduna geçildi.")
             elif req_mode == "LIVE_SPOT":
                 confirm_txt = str(payload.get("confirm_text", "")).strip().upper()
@@ -964,11 +1006,81 @@ class CloudBotApplication:
                     st.set_state("cloud_last_error", msg)
                     raise ValueError(msg) from exc
                 st.set_state("cloud_live_confirmed", "1")
+                st.set_state("cloud_margin_confirmed", "0")
                 st.set_state("cloud_mode", "LIVE_SPOT")
                 st.set_state("cloud_leverage", "1")
                 st.set_state("cloud_last_error", "")
                 free_usdt = bals.get("USDT", Decimal("0"))
                 notes.append(f"Canlı Spot (1x) doğrulandı ve açıldı (Serbest: {free_usdt:.2f} USDT).")
+            elif req_mode == "LIVE_MARGIN":
+                confirm_txt = str(payload.get("confirm_text", "")).strip().upper()
+                if not eng.config.enable_live_trading or not eng.config.has_binance_live_keys:
+                    raise ValueError(
+                        "Canlı Kaldıraçlı Marjin kilitli: Sunucuda ENABLE_LIVE_TRADING=true ve Binance API anahtarları tanımlı olmalıdır."
+                    )
+                already_margin_ok = (
+                    st.get_state("cloud_live_confirmed", "0") == "1"
+                    and st.get_state("cloud_margin_confirmed", "0") == "1"
+                )
+                if confirm_txt != "EVET" and not already_margin_ok:
+                    raise ValueError(
+                        "Gerçek Kaldıraçlı Çapraz Marjin modunu açmak için onay kutusuna büyük harflerle EVET yazmanız gerekir."
+                    )
+                try:
+                    st.ensure_quote_asset("LIVE_MARGIN", "USDT")
+                    m_info = eng.live_margin_executor.fetch_live_margin_balances(
+                        ui_live_confirmed=True, ui_margin_confirmed=True, quote_asset="USDT"
+                    )
+                except (LiveExecutionError, LiveOrderBlockedError, ValueError) as exc:
+                    msg = self._friendly_live_error(str(exc))
+                    st.set_state("cloud_last_error", msg)
+                    raise ValueError(msg) from exc
+                avail_col = Decimal(str(m_info.get("available_collateral", "0")))
+                open_margin_pos = [
+                    p for p in st.get_open_positions(track="LIVE_MARGIN") if not is_substep_dust_position(p)
+                ]
+                if avail_col < Decimal("5.00") and not open_margin_pos:
+                    raise ValueError(
+                        f"Binance Çapraz Marjin (Cross Margin) cüzdanınızda kullanılabilir USDT teminatı bulunmuyor "
+                        f"(Mevcut: {avail_col:.2f} USDT). Kaldıraçlı gerçek işlem için Binance uygulamasından "
+                        f"Cüzdan -> Spot -> Transfer menüsünden Çapraz Marjin (Cross Margin) cüzdanınıza USDT aktarın "
+                        f"(Mevcut modunuz kesintisiz devam ediyor)."
+                    )
+                req_lev_raw = payload.get("leverage", st.get_state("cloud_leverage", "2"))
+                try:
+                    lev_m = max(2, min(5, int(req_lev_raw or 2)))
+                except (TypeError, ValueError):
+                    lev_m = 2
+                if lev_m < 2:
+                    lev_m = 2
+                st.set_state("cloud_live_confirmed", "1")
+                st.set_state("cloud_margin_confirmed", "1")
+                st.set_state("cloud_mode", "LIVE_MARGIN")
+                st.set_state("cloud_leverage", str(lev_m))
+                st.set_state("cloud_last_error", "")
+                m_lvl = Decimal(str(m_info.get("margin_level", "999")))
+                m_lvl_str = "Borçsuz (999)" if m_lvl >= Decimal("900") else f"{m_lvl:.2f}"
+                notes.append(
+                    f"Canlı Çapraz Marjin ({lev_m}x Kaldıraç) doğrulandı ve açıldı "
+                    f"(Teminat: {avail_col:.2f} USDT, Marjin Seviyesi: {m_lvl_str})."
+                )
+
+        if any(k in payload for k in ("profile", "leverage", "mode", "max_open_positions", "max_position_size_usdc", "daily_loss_limit_usdc")):
+            active_p = self._active_cloud_params(eng)
+            eff_s: RiskSettings = active_p["settings"]
+            st.save_risk_settings(eff_s)
+            for pos in st.get_open_positions(track=active_p["track"]):
+                if is_substep_dust_position(pos):
+                    continue
+                st.update_position_remaining(
+                    pos.position_id,
+                    quantity=pos.quantity,
+                    cost_basis_usdc=pos.cost_basis_usdc,
+                    entry_fee_usdc=pos.entry_fee_usdc,
+                    stop_loss_price=pos.entry_price * (Decimal("1") - eff_s.stop_loss_pct),
+                    take_profit_price=pos.entry_price * (Decimal("1") + eff_s.take_profit_pct),
+                    update_exit_targets=True,
+                )
 
         if "new_entries_paused" in payload:
             params = self._active_cloud_params(eng)
@@ -1194,7 +1306,8 @@ class CloudBotApplication:
                     closed_ok, close_msg = eng.manual_close_open_position(
                         params["settings"],
                         execution_mode=params["mode"],
-                        ui_live_confirmed=(params["mode"] == "LIVE_SPOT"),
+                        ui_live_confirmed=(params["mode"] in {"LIVE_SPOT", "LIVE_MARGIN"}),
+                        ui_margin_confirmed=(params["mode"] == "LIVE_MARGIN"),
                         symbol=target_sym,
                     )
                     self.state_sync.persist(self.config.db_path)

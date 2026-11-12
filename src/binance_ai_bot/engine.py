@@ -33,7 +33,11 @@ from .domain import (
 from .live_executor import BinanceLiveSpotExecutor, LiveExecutionError
 from .margin_executor import BinanceLiveMarginExecutor
 from .market_data import BinancePublicDataClient, MarketDataError
-from .risk import RiskManager, compute_open_position_unrealized_net_pnl
+from .risk import (
+    RiskManager,
+    compute_accrued_margin_interest,
+    compute_open_position_unrealized_net_pnl,
+)
 from .security import LiveOrderBlockedError
 from .simulator import VirtualExecutionSimulator
 from .storage import SQLiteStorage
@@ -97,6 +101,7 @@ class TradingSystemEngine:
         self.ai_advisor = ai_advisor or GeminiDecisionAdvisor(config, self.storage)
         # Çoklu coin taramasında True yapılır: pasif referans ilk paritede sabit kalır
         self.lock_benchmark_symbol = False
+        self.allow_live_margin = False
         self._latest_bid_map: dict[str, Decimal] = {}
 
     def _collect_position_bids(self, positions, initial=None):
@@ -319,7 +324,12 @@ class TradingSystemEngine:
                 executed_order=None, block_or_info_message=message, error_message=message,
             )
 
-        if execution_mode not in {"PAPER", "LIVE_SPOT"}:
+        allowed_modes = (
+            {"PAPER", "LIVE_SPOT", "LIVE_MARGIN"}
+            if getattr(self, "allow_live_margin", False)
+            else {"PAPER", "LIVE_SPOT"}
+        )
+        if execution_mode not in allowed_modes:
             return blocked("Bu güvenlik sürümü yalnızca Sanal Deneme ve Canlı Spot modlarını destekliyor; canlı marjin kapalıdır.")
         if stop_requested and stop_requested():
             return blocked("Durdurma isteği alındı; emir gönderilmedi.")
@@ -594,14 +604,22 @@ class TradingSystemEngine:
         min_profit_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
 
         # "Al & Kârı Görünce Sat" koruması:
-        # 1) Fiyat net kâr eşiğinin (+min_net_profit_exit_pct) üzerine çıktıysa ve teknik ivme SAT diyorsa anında kârı kilitle.
+        # 1) Fiyat net kâr eşiğinin (+min_net_profit_exit_pct + varsa birikmiş marjin faizi) üzerine çıktıysa ve teknik ivme SAT diyorsa anında kârı kilitle.
         # 2) Fiyat henüz kâr eşiğine ulaşmadıysa ufak mum dalgalanmalarında zararına erken SAT yapma; yükselişi bekle!
+        eff_min_profit_pct = min_profit_pct
         if symbol_open_pos is not None and min_profit_pct > Decimal("0"):
-            min_exit_px = symbol_open_pos.entry_price * (Decimal("1") + min_profit_pct)
+            if (
+                getattr(symbol_open_pos, "borrowed_usdc", Decimal("0")) > Decimal("0")
+                and symbol_open_pos.cost_basis_usdc > Decimal("0")
+            ):
+                hourly_rate = getattr(settings, "hourly_margin_interest_rate", Decimal("0.000005"))
+                accrued_int = compute_accrued_margin_interest(symbol_open_pos, now_utc, hourly_rate)
+                eff_min_profit_pct = min_profit_pct + (accrued_int / symbol_open_pos.cost_basis_usdc)
+            min_exit_px = symbol_open_pos.entry_price * (Decimal("1") + eff_min_profit_pct)
             if best_bid >= min_exit_px and tech_signal.action == "SAT":
                 final_action = "SAT"
                 info_msg = (
-                    f"{market.symbol} kâr bölgesinde (+%{min_profit_pct * Decimal('100'):.2f} üzeri) "
+                    f"{market.symbol} kâr bölgesinde (+%{eff_min_profit_pct * Decimal('100'):.2f} üzeri) "
                     f"ivme yavaşladığı için net kâr kilitleniyor (Giriş: {symbol_open_pos.entry_price:.6g}, Anlık: {best_bid:.6g})."
                 )
             elif final_action == "SAT" and best_bid < min_exit_px:
@@ -675,6 +693,7 @@ class TradingSystemEngine:
                                 ord_res = self.live_margin_executor.execute_live_margin_buy(
                                     filters=market.filters,
                                     approved_qty=risk_chk.approved_quantity,
+                                    approved_notional=risk_chk.approved_notional_usdc,
                                     signal_key=sig_key,
                                     strategy_source=ai_decision.mode_label,
                                     settings=settings,

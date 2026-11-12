@@ -39,15 +39,43 @@ class TradingProfile:
     max_open_positions: int = 1
     min_net_profit_exit_pct: Decimal = Decimal("0")
 
+    def leverage_adjusted_targets(
+        self, leverage: int
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        """
+        Kaldıraç çarpanına (1x..5x) göre:
+        1) Likidasyon fiyatına asla yaklaştırmayan sıkı Zarar-Kes (Stop-Loss),
+        2) Kaldıraçlı tam komisyon + faiz sonrasında ana para (teminat) üzerinde yüksek net kâr
+           bırakırken daha küçük fiyat dalgalarını yakalayan Kâr-Al ve Kâr Kilitleme hedefleri üretir.
+        """
+        eff_lev = max(1, min(5, int(leverage)))
+        if eff_lev <= 1 or self.key != "AL_YUKSELINCE_SAT":
+            return (self.stop_loss_pct, self.take_profit_pct, self.min_net_profit_exit_pct)
+
+        # AL_YUKSELINCE_SAT için kaldıraç kademelerine özel mühendislik tablosu:
+        # - 1x: Fiyat +%0.80 kâr kilidi / +%1.15 TP / -%3.50 SL (Teminatta ~+%0.65 / +%1.00 net kâr)
+        # - 2x: Fiyat +%0.65 kâr kilidi / +%0.90 TP / -%2.20 SL (Teminatta ~+%1.00 / +%1.50 net kâr, SL -%4.4 teminat)
+        # - 3x: Fiyat +%0.55 kâr kilidi / +%0.80 TP / -%1.50 SL (Teminatta ~+%1.20 / +%1.95 net kâr, SL -%4.5 teminat)
+        # - 4x: Fiyat +%0.50 kâr kilidi / +%0.75 TP / -%1.15 SL (Teminatta ~+%1.40 / +%2.40 net kâr, SL -%4.6 teminat)
+        # - 5x: Fiyat +%0.48 kâr kilidi / +%0.70 TP / -%0.95 SL (Teminatta ~+%1.65 / +%2.75 net kâr, SL -%4.75 teminat; likidasyon -%12'den çok uzak)
+        table: dict[int, tuple[Decimal, Decimal, Decimal]] = {
+            2: (Decimal("0.0220"), Decimal("0.0090"), Decimal("0.0065")),
+            3: (Decimal("0.0150"), Decimal("0.0080"), Decimal("0.0055")),
+            4: (Decimal("0.0115"), Decimal("0.0075"), Decimal("0.0050")),
+            5: (Decimal("0.0095"), Decimal("0.0070"), Decimal("0.0048")),
+        }
+        return table.get(eff_lev, (self.stop_loss_pct, self.take_profit_pct, self.min_net_profit_exit_pct))
+
     def apply_to_risk_settings(
         self, base: RiskSettings, *, leverage: int | None = None
     ) -> RiskSettings:
         """
-        Profilin işlem sıklığı ve çıkış seviyelerini uygular; pozisyon büyüklüğü ve günlük zarar
-        eşiği gibi sert sınırlar kullanıcının kayıtlı ayarlarından AYNEN korunur.
+        Profilin işlem sıklığı ve kaldıraç uyumlu çıkış seviyelerini uygular; pozisyon büyüklüğü ve
+        günlük zarar eşiği gibi sert sınırlar kullanıcının kayıtlı ayarlarından AYNEN korunur.
         """
         base_lev = getattr(base, "leverage", 1)
         eff_lev = max(1, min(5, int(leverage if leverage is not None else base_lev)))
+        adj_sl, adj_tp, adj_min_exit = self.leverage_adjusted_targets(eff_lev)
         return RiskSettings(
             max_open_positions=max(base.max_open_positions, self.max_open_positions),
             max_position_size_usdc=base.max_position_size_usdc,
@@ -56,14 +84,14 @@ class TradingProfile:
             daily_limit_exit_policy=base.daily_limit_exit_policy,
             estimated_fee_rate=base.estimated_fee_rate,
             extra_slippage_bps=base.extra_slippage_bps,
-            stop_loss_pct=self.stop_loss_pct,
-            take_profit_pct=self.take_profit_pct,
+            stop_loss_pct=adj_sl,
+            take_profit_pct=adj_tp,
             allow_stablecoin_conversion=False,
             leverage=eff_lev,
             hourly_margin_interest_rate=getattr(
                 base, "hourly_margin_interest_rate", Decimal("0.000005")
             ),
-            min_net_profit_exit_pct=self.min_net_profit_exit_pct,
+            min_net_profit_exit_pct=adj_min_exit,
         )
 
 
