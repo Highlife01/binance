@@ -124,7 +124,7 @@ Panel testleri ekran bileşenlerini doğrular; Windows test ortamındaki yerel s
 ## 7/24 Bulut Kurulumu (`https://tradecebrail.web.app`)
 
 - **Web Kontrol Paneli:** Firebase Hosting `tradecebrail` sitesi (`hosting/tradecebrail/index.html`) — yalnızca doğrulanmış hesap sahibine (`cebrailkara@gmail.com` Google Sign-In) açıktır.
-- **7/24 İşlem Motoru:** Google Cloud Run `tradecebrail-bot` (`europe-west1`, `--min-instances=0`, `--max-instances=1`) + Cloud Scheduler `tradecebrail-bot-tick` (`* * * * *`).
+- **7/24 İşlem Motoru & Sabit Çıkış IP'si:** Google Cloud Run `tradecebrail-bot` (`europe-west1`, `--min-instances=0`, `--max-instances=1`) Direct VPC Egress (`tradecebrail-subnet` -> `tradecebrail-nat` -> sabit IP `34.22.113.161`) üzerinden Binance ile haberleşir + Cloud Scheduler `tradecebrail-bot-tick` (`* * * * *`) her dakika tarama yapar.
 - **Kalıcı Durum & Son 5 Sürüm Kuralı:** SQLite veritabanı her değişiklik sonunda `sqlite3.Connection.backup` ile özel GCS deposuna (`gs://tradecebrail-bot-state-873885134851/sanal_sistem.db`) yedeklenir; `scripts/cleanup-hosting-versions.mjs` her Hosting dağıtımı sonrasında yalnızca son 5 sürümü tutar.
 - **Dağıtım Komutu (yalnızca `tradecebrail` sitesini günceller):**
   ```powershell
