@@ -1,0 +1,8 @@
+google-auth>=2.38,<3
+google-genai>=1.0
+httpx>=0.28,<1
+pandas>=2.2
+pydantic>=2.10,<3
+python-dotenv>=1.0,<2
+requests>=2.32,<3
+tzdata>=2024.2

@@ -5,6 +5,6 @@ description = "Binance Global USDC Spot Sanal Deneme ve Cift Kilitli Canli Karar
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-v --tb=short"

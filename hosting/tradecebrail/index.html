@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TradeCebrail — 7/24 Bulut Alım-Satım Kontrol Paneli</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --card: #111827;
+      --card-2: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --teal: #14b8a6;
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --blue: #3b82f6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 16px;
+    }
+    .container { max-width: 1280px; margin: 0 auto; }
+    .topbar {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; margin-bottom: 16px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand h1 { font-size: 1.25rem; font-weight: 700; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+      border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+    }
+    .badge-green { background: rgba(34,197,94,0.16); color: #4ade80; border: 1px solid rgba(34,197,94,0.35); }
+    .badge-amber { background: rgba(245,158,11,0.16); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }
+    .badge-red { background: rgba(239,68,68,0.16); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }
+    .badge-blue { background: rgba(59,130,246,0.16); color: #60a5fa; border: 1px solid rgba(59,130,246,0.35); }
+
+    button {
+      cursor: pointer; border: 1px solid var(--border); background: var(--card-2);
+      color: var(--text); padding: 9px 14px; border-radius: 10px; font-size: 0.88rem;
+      font-weight: 600; transition: all 0.15s ease;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.12); border-color: #64748b; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #0d9488; border-color: #14b8a6; color: #fff; }
+    .btn-danger { background: #991b1b; border-color: #ef4444; color: #fff; }
+    .btn-blue { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+
+    .login-box {
+      max-width: 480px; margin: 72px auto; padding: 32px; background: var(--card);
+      border: 1px solid var(--border); border-radius: 16px; text-align: center;
+    }
+    .login-box h2 { margin-bottom: 10px; font-size: 1.35rem; }
+    .login-box p { color: var(--muted); margin-bottom: 22px; font-size: 0.94rem; }
+
+    .banner {
+      padding: 14px 18px; border-radius: 12px; margin-bottom: 16px; font-weight: 600;
+      font-size: 0.94rem; border-left: 6px solid var(--teal); background: rgba(15,118,110,0.22);
+    }
+    .banner-live { border-left-color: var(--red); background: rgba(153,27,27,0.28); }
+    .alert {
+      padding: 12px 16px; border-radius: 10px; margin-bottom: 14px; font-size: 0.88rem;
+      background: rgba(245,158,11,0.14); border: 1px solid rgba(245,158,11,0.4); color: #fde68a;
+    }
+
+    .metrics-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+      gap: 12px; margin-bottom: 16px;
+    }
+    .metric-card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+    }
+    .metric-label { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
+    .metric-val { font-size: 1.28rem; font-weight: 700; }
+    .pos { color: #4ade80; }
+    .neg { color: #f87171; }
+
+    .controls-panel {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 16px; margin-bottom: 16px;
+    }
+    .controls-row {
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-top: 10px;
+    }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 0.76rem; color: var(--muted); font-weight: 600; }
+    select, input[type="number"], input[type="text"] {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 10px; font-size: 0.88rem; min-width: 120px;
+    }
+
+    .section {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 16px; margin-bottom: 16px; overflow-x: auto;
+    }
+    .section-head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 12px; gap: 8px; flex-wrap: wrap;
+    }
+    .section h3 { font-size: 1.02rem; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th, td {
+      text-align: left; padding: 9px 10px; border-bottom: 1px solid rgba(51,65,85,0.65);
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 0.76rem; text-transform: uppercase; }
+    td.wrap { white-space: normal; min-width: 220px; max-width: 420px; }
+    .hidden { display: none !important; }
+    .muted { color: var(--muted); font-size: 0.84rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <div class="brand">
+        <span style="font-size:1.6rem;">🛡️</span>
+        <div>
+          <h1>TradeCebrail — 7/24 Bulut Kontrol Paneli</h1>
+          <div class="muted" id="subtitleText">Avrupa Bulut Sunucusu (europe-west1) • Çoklu Coin & Gemini AI</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span id="aliveBadge" class="badge badge-blue">Bağlanıyor...</span>
+        <span id="userEmail" class="muted"></span>
+        <button id="logoutBtn" class="hidden">Çıkış Yap</button>
+      </div>
+    </div>
+
+    <!-- Giris Ekrani -->
+    <div id="authSection" class="login-box">
+      <h2>🔐 Hesap Sahibi Girişi</h2>
+      <p>Bu 7/24 alım-satım paneli özeldir ve yalnızca yetkili Google hesabına (<b>cebrailkara@gmail.com</b>) açıktır.</p>
+      <button id="loginBtn" class="btn-blue" style="width:100%;padding:12px;font-size:0.96rem;">
+        Google ile Güvenli Giriş Yap
+      </button>
+      <div id="authError" class="alert hidden" style="margin-top:16px;text-align:left;"></div>
+    </div>
+
+    <!-- Ana Kontrol Paneli -->
+    <div id="appSection" class="hidden">
+      <div id="modeBanner" class="banner">Yükleniyor...</div>
+      <div id="toastAlert" class="alert hidden"></div>
+
+      <!-- Ust Metrikler -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Toplam Portföy Değeri</div>
+          <div class="metric-val" id="mEquity">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Serbest Nakit / Teminat</div>
+          <div class="metric-val" id="mCash">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Açık Pozisyon Anlık K/Z</div>
+          <div class="metric-val" id="mUnreal">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Gerçekleşmiş Net K/Z</div>
+          <div class="metric-val" id="mRealized">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Bugünkü Net K/Z (İst.)</div>
+          <div class="metric-val" id="mDaily">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Kaldıraç / Borç / Komisyon</div>
+          <div class="metric-val" id="mLevInfo" style="font-size:1.02rem;">—</div>
+        </div>
+      </div>
+
+      <!-- Hizli Eylem ve Ayarlar -->
+      <div class="controls-panel">
+        <div class="section-head">
+          <h3>⚙️ 7/24 Bulut Otomasyon ve Strateji Ayarları</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="scanNowBtn" class="btn-primary">▶️ Şimdi 10 Coini Tara</button>
+            <button id="toggleAutoBtn">⏱️ 7/24 Otomatik: Açık</button>
+            <button id="togglePauseBtn">⏸️ Yeni Alımları Durdur</button>
+            <button id="closeAllBtn" class="btn-danger">🛑 Tüm Açık Pozisyonları Kapat</button>
+          </div>
+        </div>
+
+        <div class="controls-row">
+          <div class="field">
+            <label>Çalışma Modu</label>
+            <select id="selMode">
+              <option value="PAPER">🟢 Sanal Deneme (PAPER)</option>
+              <option value="LIVE_SPOT">🔴 Gerçek Spot (1x)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Profil</label>
+            <select id="selProfile">
+              <option value="HIZLI_30SN">🔥 Hızlı Aktif (1dk Mum)</option>
+              <option value="AKTIF">⚡ Aktif (5dk Mum)</option>
+              <option value="TEMKINLI">🛡️ Temkinli (15dk Mum)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Kaldıraç (Sanal)</label>
+            <select id="selLeverage">
+              <option value="1">1x (Spot)</option>
+              <option value="2">2x (Önerilen)</option>
+              <option value="3">3x</option>
+              <option value="5">5x</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>İşlem Başı Teminat (USDT)</label>
+            <input type="number" id="inpPosSize" min="5" max="250" step="1" value="10" />
+          </div>
+          <div class="field">
+            <label>Maks. Eşzamanlı Coin</label>
+            <input type="number" id="inpMaxOpen" min="1" max="10" step="1" value="5" />
+          </div>
+          <div class="field">
+            <label>Günlük Zarar Sigortası (USDT)</label>
+            <input type="number" id="inpDailyLoss" min="0.5" max="100" step="0.5" value="2.0" />
+          </div>
+          <div class="field">
+            <label>Gemini AI</label>
+            <select id="selAi">
+              <option value="1">🤖 Açık</option>
+              <option value="0">📐 Yalnızca Kural</option>
+            </select>
+          </div>
+          <button id="saveSettingsBtn" class="btn-blue">💾 Ayarları Kaydet</button>
+          <button id="resetPaperBtn" title="Yalnızca sanal portföyü 86 USDT başlangıca sıfırlar">♻️ Sanal Kasayı Sıfırla</button>
+        </div>
+        <div class="muted" id="heartbeatInfo" style="margin-top:10px;"></div>
+      </div>
+
+      <!-- Gercek Binance Cuzdan Ozeti -->
+      <div class="section">
+        <div class="section-head">
+          <h3>💼 Gerçek Binance Cüzdanım (Spot + Simple Earn Varlık Sorgulama)</h3>
+          <button id="checkWalletBtn">🔍 Gerçek Binance Cüzdanımı Sorgula</button>
+        </div>
+        <div id="walletContent" class="muted">
+          Gerçek Binance hesabınızdaki Spot ve Simple Earn (Kazan) varlıklarını görmek için sağdaki düğmeye tıklayın.
+        </div>
+      </div>
+
+      <!-- Acik Pozisyonlar -->
+      <div class="section">
+        <div class="section-head">
+          <h3>📌 Açık Pozisyonlar (<span id="openCount">0</span>)</h3>
+          <span class="muted">Her 10 saniyede bir canlı fiyatlarla güncellenir</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Coin</th>
+              <th>Kaldıraç</th>
+              <th>Miktar</th>
+              <th>Giriş</th>
+              <th>Anlık Fiyat</th>
+              <th>Teminat / Borç</th>
+              <th>Anlık Net K/Z</th>
+              <th>Zarar-Kes / Kâr-Al / Likid.</th>
+              <th>İşlem</th>
+            </tr>
+          </thead>
+          <tbody id="positionsBody">
+            <tr><td colspan="9" class="muted">Açık pozisyon bulunmuyor.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Son Emirler -->
+      <div class="section">
+        <div class="section-head">
+          <h3>📜 Son Gerçekleşen Emirler</h3>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Zaman (TR)</th>
+              <th>Yön</th>
+              <th>Coin</th>
+              <th>Miktar</th>
+              <th>Fiyat</th>
+              <th>Tutar</th>
+              <th>Net K/Z</th>
+              <th>Açıklama</th>
+            </tr>
+          </thead>
+          <tbody id="ordersBody">
+            <tr><td colspan="8" class="muted">Henüz emir kaydı yok.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Son Kararlar -->
+      <div class="section">
+        <div class="section-head">
+          <h3>🧠 Son Teknik & Gemini AI Kararları</h3>
+          <span class="muted" id="aiUsageText"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Zaman (TR)</th>
+              <th>Coin</th>
+              <th>Kural</th>
+              <th>Gemini AI</th>
+              <th>Nihai Karar</th>
+              <th>Kaynak</th>
+              <th>Gerekçe / Not</th>
+            </tr>
+          </thead>
+          <tbody id="decisionsBody">
+            <tr><td colspan="7" class="muted">Henüz analiz kaydı yok.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+    import {
+      getAuth,
+      GoogleAuthProvider,
+      signInWithPopup,
+      signOut,
+      onAuthStateChanged
+    } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+
+    const firebaseConfig = {
+      projectId: "adanahizlitaksi",
+      appId: "1:873885134851:web:9f9b128f323ac9e9569e36",
+      storageBucket: "adanahizlitaksi.firebasestorage.app",
+      apiKey: "AIzaSyCBZ8RYfKYtDUxagYpxYdozlqebnDn5AFc",
+      authDomain: "adanahizlitaksi.firebaseapp.com",
+      messagingSenderId: "873885134851"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+
+    let currentUser = null;
+    let pollTimer = null;
+    let latestDash = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function esc(val) {
+      const div = document.createElement("div");
+      div.textContent = val == null ? "" : String(val);
+      return div.innerHTML;
+    }
+
+    function fmtTrTime(iso) {
+      if (!iso) return "—";
+      try {
+        return new Date(iso).toLocaleString("tr-TR", { timeZone: "Europe/Istanbul" });
+      } catch {
+        return String(iso);
+      }
+    }
+
+    function pnlHtml(valStr, suffix = " USDT") {
+      if (valStr == null || valStr === "") return "—";
+      const num = Number(valStr);
+      if (Number.isNaN(num)) return esc(valStr);
+      const cls = num > 0 ? "pos" : (num < 0 ? "neg" : "");
+      const sign = num > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${num.toFixed(4)}${esc(suffix)}</span>`;
+    }
+
+    function showToast(msg, isError = false) {
+      const el = $("toastAlert");
+      if (!msg) {
+        el.classList.add("hidden");
+        return;
+      }
+      el.textContent = msg;
+      el.style.borderColor = isError ? "rgba(239,68,68,0.55)" : "rgba(20,184,166,0.55)";
+      el.style.color = isError ? "#fecaca" : "#ccfbf1";
+      el.classList.remove("hidden");
+    }
+
+    async function apiCall(path, method = "GET", bodyObj = null) {
+      if (!currentUser) throw new Error("Giriş yapılmadı.");
+      const token = await currentUser.getIdToken();
+      const opts = {
+        method,
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      };
+      if (bodyObj !== null) opts.body = JSON.stringify(bodyObj);
+      const resp = await fetch(path, opts);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(data.error || `Sunucu hatası (${resp.status})`);
+      }
+      return data;
+    }
+
+    function renderDashboard(d) {
+      latestDash = d;
+      const ccy = d.quote_asset || "USDT";
+
+      // Canlilik rozeti
+      const badge = $("aliveBadge");
+      if (d.cloud_auto_enabled && !d.stale) {
+        badge.className = "badge badge-green";
+        badge.textContent = "🟢 7/24 Bulut Aktif";
+      } else if (d.cloud_auto_enabled) {
+        badge.className = "badge badge-amber";
+        badge.textContent = "🟡 Zamanlayıcı Bekleniyor";
+      } else {
+        badge.className = "badge badge-red";
+        badge.textContent = "⏸️ Otomasyon Duraklatıldı";
+      }
+
+      // Ust Banner
+      const banner = $("modeBanner");
+      if (d.mode === "LIVE_SPOT") {
+        banner.className = "banner banner-live";
+        banner.textContent = `⚠️ CANLI SPOT MODU (1x) AKTİF — Gerçek Binance ${ccy} Bakiyesi Kullanılıyor`;
+      } else {
+        banner.className = "banner";
+        banner.textContent = `🛡️ SANAL DENEME MODU (${d.leverage}x Kaldıraç) — Gerçek Binance Bakiyenize Dokunulmaz • 10 Coin 7/24 Bulut Takibi`;
+      }
+
+      if (d.last_error) {
+        showToast(`⚠️ Bilgilendirme: ${d.last_error}`, true);
+      }
+
+      // Metrikler
+      $("mEquity").textContent = d.equity != null ? `${d.equity} ${ccy}` : "—";
+      $("mCash").textContent = `${d.cash || "0.00"} ${ccy}`;
+      $("mUnreal").innerHTML = pnlHtml(d.unrealized_pnl, ` ${ccy}`);
+      $("mRealized").innerHTML = pnlHtml(d.realized_pnl, ` ${ccy}`);
+      $("mDaily").innerHTML = pnlHtml(d.daily_pnl, ` ${ccy}`);
+      $("mLevInfo").textContent = `${d.leverage}x | Borç: ${d.borrowed || "0"} | Kom: ${Number(d.total_fees || 0).toFixed(3)}`;
+
+      // Kontrolleri senkronla (kullanici duzenlemiyorsa)
+      if (document.activeElement.tagName !== "SELECT" && document.activeElement.tagName !== "INPUT") {
+        $("selMode").value = d.mode || "PAPER";
+        $("selProfile").value = d.profile || "HIZLI_30SN";
+        $("selLeverage").value = String(d.leverage || 2);
+        $("selLeverage").disabled = d.mode === "LIVE_SPOT";
+        if (d.risk_settings) {
+          $("inpPosSize").value = Number(d.risk_settings.max_position_size_usdc || 10);
+          $("inpMaxOpen").value = Number(d.risk_settings.max_open_positions || 5);
+          $("inpDailyLoss").value = Number(d.risk_settings.daily_loss_limit_usdc || 2);
+        }
+        $("selAi").value = d.ai_enabled ? "1" : "0";
+      }
+
+      $("toggleAutoBtn").textContent = d.cloud_auto_enabled ? "⏱️ 7/24 Otomatik: AÇIK" : "⏱️ 7/24 Otomatik: KAPALI";
+      $("togglePauseBtn").textContent = d.new_entries_paused ? "🟢 Yeni Alımlara İzin Ver" : "⏸️ Yeni Alımları Durdur";
+
+      const hbText = d.heartbeat_at
+        ? `Son Bulut Taraması: ${fmtTrTime(d.heartbeat_at)} (${d.heartbeat_age_seconds ?? "?"} sn önce) • Taranan: ${(d.scan_symbols || []).join(", ")}`
+        : `Henüz tarama kaydı yok — 'Şimdi 10 Coini Tara' düğmesine basabilir veya 1 dk içinde otomatik başlamasını bekleyebilirsiniz.`;
+      $("heartbeatInfo").textContent = hbText;
+
+      if (d.ai_usage) {
+        $("aiUsageText").textContent = `Gemini (${d.gemini_model || ""}) Bugün: ${d.ai_usage.today_network_calls} çağrı | Önbellek: ${d.ai_usage.cache_hits} | Tahmini Maliyet: $${d.ai_usage.estimated_cost_usd}`;
+      }
+
+      // Acik pozisyonlar
+      const posList = d.open_positions || [];
+      $("openCount").textContent = String(posList.length);
+      const pBody = $("positionsBody");
+      if (!posList.length) {
+        pBody.innerHTML = `<tr><td colspan="9" class="muted">Şu anda açık pozisyon bulunmuyor.</td></tr>`;
+      } else {
+        pBody.innerHTML = posList.map((p) => {
+          const pctTxt = p.unrealized_pnl_pct != null ? ` (${Number(p.unrealized_pnl_pct) > 0 ? "+" : ""}${p.unrealized_pnl_pct}%)` : "";
+          return `<tr>
+            <td><b>${esc(p.symbol)}</b></td>
+            <td><span class="badge badge-blue">${esc(p.leverage)}x</span></td>
+            <td>${esc(p.quantity)}</td>
+            <td>${esc(p.entry_price)}</td>
+            <td>${esc(p.current_bid || "—")}</td>
+            <td>${esc(p.cost_basis)} / ${esc(p.borrowed)} ${esc(ccy)}</td>
+            <td>${pnlHtml(p.unrealized_pnl, "")}${esc(pctTxt)}</td>
+            <td>ZK: ${esc(p.stop_loss_price || "—")} | KA: ${esc(p.take_profit_price || "—")} | Lik: ${esc(p.liquidation_price || "—")}</td>
+            <td><button class="btn-danger btn-close-one" data-sym="${esc(p.symbol)}" style="padding:5px 10px;font-size:0.78rem;">Sat / Kapat</button></td>
+          </tr>`;
+        }).join("");
+        pBody.querySelectorAll(".btn-close-one").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const sym = btn.getAttribute("data-sym");
+            btn.disabled = true;
+            try {
+              const res = await apiCall("/api/close-positions", "POST", { symbol: sym });
+              showToast(res.message || `${sym} kapatıldı.`);
+              if (res.dashboard) renderDashboard(res.dashboard);
+            } catch (e) {
+              showToast(e.message, true);
+            } finally {
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      // Son Emirler
+      const orders = d.recent_orders || [];
+      $("ordersBody").innerHTML = orders.length ? orders.map((o) => {
+        const badgeCls = o.side === "BUY" ? "badge-green" : "badge-amber";
+        const sideTr = o.side === "BUY" ? "ALIM" : "SATIŞ";
+        return `<tr>
+          <td>${esc(fmtTrTime(o.created_at_iso))}</td>
+          <td><span class="badge ${badgeCls}">${sideTr}</span></td>
+          <td><b>${esc(o.symbol)}</b></td>
+          <td>${esc(o.filled_qty)}</td>
+          <td>${esc(o.avg_fill_price)}</td>
+          <td>${esc(o.gross_quote_usdc)} ${esc(ccy)}</td>
+          <td>${o.side === "SELL" ? pnlHtml(o.realized_pnl_usdc, "") : "—"}</td>
+          <td class="wrap">${esc(o.explanation)}</td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="8" class="muted">Henüz gerçekleşen emir bulunmuyor.</td></tr>`;
+
+      // Son Kararlar
+      const decs = d.recent_decisions || [];
+      $("decisionsBody").innerHTML = decs.length ? decs.map((r) => {
+        const fCls = r.final_action === "AL" ? "badge-green" : (r.final_action === "SAT" ? "badge-amber" : "badge-blue");
+        const note = r.block_reason ? `[Engel: ${r.block_reason}] ${r.ai_reason}` : r.ai_reason;
+        return `<tr>
+          <td>${esc(fmtTrTime(r.created_at_iso))}</td>
+          <td><b>${esc(r.symbol)}</b> (${esc(r.interval)})</td>
+          <td>${esc(r.rule_action)}</td>
+          <td>${esc(r.ai_action)}</td>
+          <td><span class="badge ${fCls}">${esc(r.final_action)}</span></td>
+          <td>${esc(r.mode_label)}</td>
+          <td class="wrap">${esc(note)}</td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="7" class="muted">Henüz karar kaydı bulunmuyor.</td></tr>`;
+    }
+
+    async function refreshDashboard() {
+      if (!currentUser) return;
+      try {
+        const data = await apiCall("/api/dashboard");
+        renderDashboard(data);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    $("loginBtn").addEventListener("click", async () => {
+      $("authError").classList.add("hidden");
+      try {
+        await signInWithPopup(auth, provider);
+      } catch (err) {
+        $("authError").textContent = `Giriş hatası: ${err.message}`;
+        $("authError").classList.remove("hidden");
+      }
+    });
+
+    $("logoutBtn").addEventListener("click", async () => {
+      await signOut(auth);
+    });
+
+    $("scanNowBtn").addEventListener("click", async () => {
+      const btn = $("scanNowBtn");
+      btn.disabled = true;
+      btn.textContent = "⏳ Taranıyor...";
+      try {
+        const res = await apiCall("/api/tick", "POST", {});
+        showToast(res.message || "Tarama tamamlandı.");
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "▶️ Şimdi 10 Coini Tara";
+      }
+    });
+
+    $("toggleAutoBtn").addEventListener("click", async () => {
+      if (!latestDash) return;
+      try {
+        const res = await apiCall("/api/settings", "POST", {
+          cloud_auto_enabled: !latestDash.cloud_auto_enabled
+        });
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    $("togglePauseBtn").addEventListener("click", async () => {
+      if (!latestDash) return;
+      try {
+        const res = await apiCall("/api/settings", "POST", {
+          new_entries_paused: !latestDash.new_entries_paused
+        });
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    $("closeAllBtn").addEventListener("click", async () => {
+      if (!confirm("Açık pozisyonların tamamını anlık piyasa fiyatından kapatmak istediğinize emin misiniz?")) return;
+      try {
+        const res = await apiCall("/api/close-positions", "POST", {});
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    $("saveSettingsBtn").addEventListener("click", async () => {
+      const reqMode = $("selMode").value;
+      let confirmText = "";
+      if (reqMode === "LIVE_SPOT" && (!latestDash || latestDash.mode !== "LIVE_SPOT")) {
+        confirmText = prompt("DİKKAT: Gerçek Binance Spot (1x) moduna geçmek için büyük harflerle EVET yazın:") || "";
+        if (confirmText.trim().toUpperCase() !== "EVET") return;
+      }
+      try {
+        const res = await apiCall("/api/settings", "POST", {
+          mode: reqMode,
+          confirm_text: confirmText,
+          profile: $("selProfile").value,
+          leverage: Number($("selLeverage").value),
+          max_position_size_usdc: $("inpPosSize").value,
+          max_open_positions: Number($("inpMaxOpen").value),
+          daily_loss_limit_usdc: $("inpDailyLoss").value,
+          ai_enabled: $("selAi").value === "1"
+        });
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    $("resetPaperBtn").addEventListener("click", async () => {
+      const ans = prompt("Sanal (PAPER) portföyü 86.00 USDT başlangıç bakiyesine sıfırlamak için SIFIRLA yazın (Gerçek hesaba dokunulmaz):");
+      if (!ans || ans.trim().toUpperCase() !== "SIFIRLA") return;
+      try {
+        const res = await apiCall("/api/reset-paper", "POST", { confirm: "SIFIRLA" });
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    $("checkWalletBtn").addEventListener("click", async () => {
+      const btn = $("checkWalletBtn");
+      const box = $("walletContent");
+      btn.disabled = true;
+      box.textContent = "Gerçek Binance cüzdanınız sorgulanıyor...";
+      try {
+        const w = await apiCall("/api/wallet", "GET");
+        if (!w.ok) {
+          box.innerHTML = `<div class="alert" style="margin:0;">${esc(w.error)}</div>`;
+          return;
+        }
+        let html = `<div style="margin-bottom:10px;color:#f8fafc;">
+          <b>Toplam Cüzdan Değeri: ~${esc(w.total_usdt)} USDT</b>
+          (Spot: ${esc(w.spot_usdt)} USDT | Simple Earn / Kazan: ${esc(w.earn_usdt)} USDT)
+        </div>`;
+        if (Number(w.earn_usdt) > 1 && Number(w.spot_usdt) < 5) {
+          html += `<div class="alert">
+            💡 <b>Bilgi:</b> Varlıklarınızın büyük kısmı (<b>~${esc(w.earn_usdt)} USDT</b>) Binance <b>Simple Earn (Otomatik Katılım / Kazan)</b> hesabında duruyor. Spot'ta işlem açmak isterseniz Binance uygulamasından <b>Kazan (Earn) → Geri Al (Redeem)</b> yapıp Otomatik Katılımı kapatabilirsiniz.
+          </div>`;
+        }
+        if (w.rows && w.rows.length) {
+          html += `<table><thead><tr><th>Cüzdan Yeri</th><th>Varlık</th><th>Miktar</th><th>Fiyat (USDT)</th><th>Değer (USDT)</th></tr></thead><tbody>` +
+            w.rows.map((r) => `<tr>
+              <td>${esc(r.location)}</td>
+              <td><b>${esc(r.asset)}</b></td>
+              <td>${esc(r.quantity)}</td>
+              <td>${esc(r.price_usdt || "—")}</td>
+              <td><b>~${esc(r.value_usdt)} USDT</b></td>
+            </tr>`).join("") + `</tbody></table>`;
+        }
+        box.innerHTML = html;
+      } catch (err) {
+        box.innerHTML = `<div class="alert" style="margin:0;">${esc(err.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    onAuthStateChanged(auth, async (user) => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      currentUser = user;
+      if (!user) {
+        $("authSection").classList.remove("hidden");
+        $("appSection").classList.add("hidden");
+        $("logoutBtn").classList.add("hidden");
+        $("userEmail").textContent = "";
+        $("aliveBadge").textContent = "Giriş Bekleniyor";
+        $("aliveBadge").className = "badge badge-blue";
+        return;
+      }
+      $("userEmail").textContent = user.email || "";
+      $("logoutBtn").classList.remove("hidden");
+      $("authSection").classList.add("hidden");
+      $("appSection").classList.remove("hidden");
+      await refreshDashboard();
+      pollTimer = setInterval(refreshDashboard, 10000);
+    });
+  </script>
+</body>
+</html>

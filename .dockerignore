@@ -1,0 +1,23 @@
+# Gizli dosyalar, sanal ortam ve yerel veritabanlari ASLA imaja girmez
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.env
+.env.*
+data/
+logs/
+tests/
+hosting/
+scripts/
+.firebase/
+firebase-debug.log
+*.bat
+/app.py
+/bot_calistir.py
+/README.md
+!cloud/api/app.py

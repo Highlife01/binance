@@ -645,6 +645,99 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+    # --- Gerçek Binance Cüzdan Özeti (Spot + Simple Earn / Kazan Tüm Varlıklar) ---
+    if "PYTEST_CURRENT_TEST" not in os.environ and cfg.enable_live_trading and cfg.has_binance_live_keys:
+        with st.expander("💼 Gerçek Binance Cüzdanım — Spot + Simple Earn (Kazan) Tüm Varlıklarım", expanded=True):
+            w_col1, w_col2 = st.columns([4, 1.2])
+            with w_col2:
+                refresh_wallet_btn = st.button("🔄 Cüzdanı Yenile", width="stretch", key="btn_refresh_real_wallet")
+            if refresh_wallet_btn or "real_wallet_snapshot" not in st.session_state:
+                try:
+                    import httpx
+
+                    acc_raw = engine.live_executor._request_signed(
+                        "GET", "/api/v3/account", ui_live_confirmed=True
+                    )
+                    px_map: dict[str, Decimal] = {}
+                    try:
+                        resp_px = httpx.get(
+                            f"{cfg.binance_public_base_url}/api/v3/ticker/bookTicker", timeout=8.0
+                        )
+                        if resp_px.status_code == 200:
+                            px_map = {
+                                str(item["symbol"]): Decimal(str(item["bidPrice"]))
+                                for item in resp_px.json()
+                                if Decimal(str(item.get("bidPrice", "0"))) > 0
+                            }
+                    except Exception:
+                        px_map = {}
+
+                    wallet_rows: list[dict[str, Any]] = []
+                    spot_total_usd = Decimal("0")
+                    earn_total_usd = Decimal("0")
+                    for b in acc_raw.get("balances", []):
+                        free_q = Decimal(str(b.get("free", "0")))
+                        lock_q = Decimal(str(b.get("locked", "0")))
+                        tot_q = free_q + lock_q
+                        if tot_q <= Decimal("0"):
+                            continue
+                        raw_asset = str(b.get("asset", "")).upper()
+                        is_earn = raw_asset.startswith("LD") and len(raw_asset) > 2
+                        underlying = raw_asset[2:] if is_earn else raw_asset
+                        wallet_loc = "🟡 Simple Earn (Kazan / Faiz)" if is_earn else "🟢 Spot Cüzdan"
+                        if underlying in {"USDT", "USDC", "FDUSD"}:
+                            unit_px = Decimal("1")
+                            usd_val = tot_q
+                        else:
+                            unit_px = px_map.get(f"{underlying}USDT", Decimal("0"))
+                            usd_val = tot_q * unit_px
+                        if is_earn:
+                            earn_total_usd += usd_val
+                        else:
+                            spot_total_usd += usd_val
+                        if usd_val >= Decimal("0.01") or tot_q >= Decimal("0.01"):
+                            wallet_rows.append(
+                                {
+                                    "Cüzdan Yeri": wallet_loc,
+                                    "Varlık": f"{underlying} ({raw_asset})" if is_earn else raw_asset,
+                                    "Miktar": f"{tot_q:.8f}".rstrip("0").rstrip("."),
+                                    "Anlık Fiyat (USDT)": f"{unit_px:.4f}" if unit_px > 0 else "-",
+                                    "Yaklaşık Değer (USDT)": round(float(usd_val), 2),
+                                }
+                            )
+                    wallet_rows.sort(key=lambda x: x["Yaklaşık Değer (USDT)"], reverse=True)
+                    st.session_state["real_wallet_snapshot"] = {
+                        "ok": True,
+                        "rows": wallet_rows,
+                        "spot_usd": spot_total_usd,
+                        "earn_usd": earn_total_usd,
+                        "total_usd": spot_total_usd + earn_total_usd,
+                        "updated": datetime.now(cfg.tz).strftime("%H:%M:%S"),
+                    }
+                except Exception as exc_w:
+                    st.session_state["real_wallet_snapshot"] = {"ok": False, "err": str(exc_w)}
+
+            wsnap = st.session_state.get("real_wallet_snapshot", {})
+            if wsnap.get("ok"):
+                with w_col1:
+                    st.markdown(
+                        f"**Gerçek Hesap Toplamı:** **`~{wsnap['total_usd']:.2f} USDT`** "
+                        f"*(Spot: `{wsnap['spot_usd']:.2f} USDT` | Simple Earn / Kazan: `{wsnap['earn_usd']:.2f} USDT` — Son sorgu: {wsnap['updated']})*"
+                    )
+                if wsnap["earn_usd"] > Decimal("1.0") and wsnap["spot_usd"] < Decimal("5.0"):
+                    st.warning(
+                        "⚠️ **Paranız Kaybolmadı — Binance Simple Earn (Otomatik Katılım) Devrede!**\n\n"
+                        f"Spot cüzdanınız `{wsnap['spot_usd']:.2f} USDT` görünüyor çünkü Binance uygulamanızdaki "
+                        f"**Auto-Subscribe (Otomatik Katılım)** ayarı açık kalmış ve **`~{wsnap['earn_usd']:.2f} USDT`** tutarındaki "
+                        "varlıklarınız (`LDUSDT`, `LDXRP` vb.) gece otomatik olarak **Earn (Kazan / Esnek Birikim)** hesabına taşınmış.\n"
+                        "- Gerçek parayla işlem açabilmek için Binance mobil uygulamasından **Cüzdanlar -> Kazan (Earn)** sekmesine girip "
+                        "**Otomatik Katılım (Auto-Subscribe)** düğmesini kapatın ve **Geri Al (Redeem -> Spot Cüzdanı)** yapın."
+                    )
+                if wsnap["rows"]:
+                    st.dataframe(pd.DataFrame(wsnap["rows"]), width="stretch", hide_index=True)
+            elif wsnap.get("err"):
+                st.info(f"Gerçek cüzdan özeti şu anda alınamadı: {wsnap['err']}")
+
     # --- Hızlı Eylem Düğmeleri ---
     paused, pause_reason = storage.is_new_entries_paused(track=active_track)
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1.4, 1.4, 1.4, 2.0])

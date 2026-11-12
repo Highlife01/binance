@@ -120,3 +120,13 @@ Test paketi gerçek Binance/Gemini hesabına bağlanmadan sahte yanıtlar ve ge�
 ```
 
 Panel testleri ekran bileşenlerini doğrular; Windows test ortamındaki yerel socket kurulumundan bağımsız bir çizim adaptörü kullanır. Gerçek sunucu bağlantısını veya gerçek emir gönderimini doğruladıkları anlamına gelmez. Kod güncellemeleri çalışan eski bot sürecine kendiliğinden yüklenmez; güncel kodu kullanmak için süreç yeniden başlatılmalıdır.
+
+## 7/24 Bulut Kurulumu (`https://tradecebrail.web.app`)
+
+- **Web Kontrol Paneli:** Firebase Hosting `tradecebrail` sitesi (`hosting/tradecebrail/index.html`) — yalnızca doğrulanmış hesap sahibine (`cebrailkara@gmail.com` Google Sign-In) açıktır.
+- **7/24 İşlem Motoru:** Google Cloud Run `tradecebrail-bot` (`europe-west1`, `--min-instances=0`, `--max-instances=1`) + Cloud Scheduler `tradecebrail-bot-tick` (`* * * * *`).
+- **Kalıcı Durum & Son 5 Sürüm Kuralı:** SQLite veritabanı her değişiklik sonunda `sqlite3.Connection.backup` ile özel GCS deposuna (`gs://tradecebrail-bot-state-873885134851/sanal_sistem.db`) yedeklenir; `scripts/cleanup-hosting-versions.mjs` her Hosting dağıtımı sonrasında yalnızca son 5 sürümü tutar.
+- **Dağıtım Komutu (yalnızca `tradecebrail` sitesini günceller):**
+  ```powershell
+  firebase deploy --only hosting:tradecebrail --project adanahizlitaksi
+  ```
