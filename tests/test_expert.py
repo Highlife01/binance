@@ -167,3 +167,74 @@ def test_engine_blocks_reentry_after_two_losses(tmp_path: Path):
     btc_note = next(it["note"] for it in summary["items"] if it["symbol"] == "BTCUSDT")
     assert "bekletme" in btc_note
     assert all(p.symbol != "BTCUSDT" for p in eng.storage.get_open_positions(track="MAIN"))
+
+
+# ---------------------------------------------------------------------------
+# Marjin maliyet tabanı (phantom loss) düzeltmesi
+# ---------------------------------------------------------------------------
+import dataclasses
+
+from binance_ai_bot.domain import RiskSettings
+
+
+def test_margin_buy_scales_cost_basis_when_base_fee_shaves_a_step(tmp_path: Path):
+    app, _, market = _make_app(tmp_path)
+    eng = app._get_engine()
+    flt = dataclasses.replace(
+        market._filters("BTCUSDT"),
+        step_size=Decimal("0.00001"), market_step_size=Decimal("0.00001"),
+        min_qty=Decimal("0.00001"), market_min_qty=Decimal("0.00001"),
+        min_notional=Decimal("5"),
+    )
+    ex = eng.live_margin_executor
+    ex.fetch_live_margin_balances = lambda **kw: {  # type: ignore[method-assign]
+        "margin_level": Decimal("999"), "quote_free": Decimal("5"), "quote_borrowed": Decimal("0"),
+        "quote_interest": Decimal("0"), "quote_net": Decimal("5"), "available_collateral": Decimal("5"),
+        "trade_enabled": True, "borrow_enabled": True, "free_by_asset": {"BTC": Decimal("0.00012987")},
+    }
+
+    def fake_signed(method, path, *args, **kwargs):
+        if path == "/sapi/v1/margin/maxBorrowable":
+            return {"amount": "100"}
+        if path == "/sapi/v1/margin/order":
+            return {
+                "executedQty": "0.00013", "cummulativeQuoteQty": "9.3273336", "status": "FILLED", "orderId": 1,
+                "fills": [{"commission": "0.00000013", "commissionAsset": "BTC", "qty": "0.00013", "price": "71748.72"}],
+            }
+        return {}
+
+    ex._request_signed = fake_signed  # type: ignore[method-assign]
+    settings = RiskSettings(leverage=2, stop_loss_pct=Decimal("0.02"), take_profit_pct=Decimal("0.01"))
+    ex.execute_live_margin_buy(
+        filters=flt, approved_qty=Decimal("0.00013"), signal_key="PH-1", strategy_source="TEST",
+        settings=settings, ui_live_confirmed=True, ui_margin_confirmed=True,
+    )
+    pos = eng.storage.get_open_positions(track="LIVE_MARGIN")[0]
+    assert pos.quantity == Decimal("0.00012")
+    # maliyet tabanı kayda alınan miktarla tutarlı olmalı (eski hata: 9.33 ~ 0.00013 BTC maliyeti)
+    assert abs(pos.cost_basis_usdc - pos.quantity * pos.entry_price) < Decimal("0.02")
+    assert abs(pos.borrowed_usdc - pos.cost_basis_usdc / 2) < Decimal("0.01")
+
+
+def test_margin_cost_fix_migration_corrects_history(tmp_path: Path):
+    app, _, _ = _make_app(tmp_path)
+    eng = app._get_engine()
+    now = datetime.now(timezone.utc)
+    pos = Position(
+        position_id="OLD-1", symbol="BTCUSDT", quantity=Decimal("0.00012"), entry_price=Decimal("71748.72"),
+        cost_basis_usdc=Decimal("9.3273336"), entry_fee_usdc=Decimal("0.0093"), opened_at_iso=now.isoformat(),
+        signal_key="old", strategy_source="TEST", stop_loss_price=Decimal("1"), take_profit_price=Decimal("2"),
+        status="OPEN", leverage=2, borrowed_usdc=Decimal("4.6636668"),
+    )
+    eng.storage.insert_position(pos, track="LIVE_MARGIN")
+    eng.storage.update_position_closed(
+        "OLD-1", closed_at_iso=now.isoformat(), closed_istanbul_date=eng.storage.istanbul_date_str(now),
+        exit_price=Decimal("70136.46"), exit_fee_usdc=Decimal("0.0084"),
+        realized_pnl_usdc=Decimal("-0.9287"), close_reason="ZARAR_KES",
+    )
+    eng.storage.set_state("margin_cost_fix_v1", "")
+    app._ensure_cloud_defaults(eng.storage)
+    fixed = eng.storage.get_position("OLD-1", track="LIVE_MARGIN")
+    assert abs(fixed.cost_basis_usdc - Decimal("0.00012") * Decimal("71748.72")) < Decimal("0.001")
+    assert fixed.realized_pnl_usdc > Decimal("-0.25")  # sahte zarar (≈0.72 USDT) geri alındı
+    assert eng.storage.get_state("margin_cost_fix_v1", "") == "1"

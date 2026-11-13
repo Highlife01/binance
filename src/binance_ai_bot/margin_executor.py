@@ -322,6 +322,7 @@ class BinanceLiveMarginExecutor:
         )
 
         executed_qty = Decimal(str(resp.get("executedQty", "0")))
+        gross_executed_qty = executed_qty
         cumm_quote = Decimal(str(resp.get("cummulativeQuoteQty", "0")))
         avg_price = (cumm_quote / executed_qty) if executed_qty > 0 else Decimal("0")
 
@@ -345,8 +346,13 @@ class BinanceLiveMarginExecutor:
         raw_status = str(resp.get("status", "FILLED")).upper()
         mapped_status = "PARTIALLY_FILLED" if raw_status == "PARTIALLY_FILLED" else "FILLED"
 
-        collateral_part = cumm_quote / Decimal(lev)
-        borrowed_part = cumm_quote - collateral_part
+        # Baz varlık komisyonu / adım yuvarlaması yüzünden kayda alınan miktar azalırsa maliyet tabanı da
+        # aynı oranda küçültülür; aksi halde artakalan küsurat sahte zarar (phantom loss) olarak yazılırdı.
+        kept_ratio = (eff_qty / gross_executed_qty) if gross_executed_qty > 0 else Decimal("1")
+        kept_ratio = min(Decimal("1"), max(Decimal("0"), kept_ratio))
+        pos_cost = cumm_quote * kept_ratio
+        collateral_part = pos_cost / Decimal(lev)
+        borrowed_part = pos_cost - collateral_part
 
         if eff_qty > 0:
             stop_px = avg_price * (Decimal("1") - settings.stop_loss_pct) if settings.stop_loss_pct > 0 else None
@@ -357,7 +363,7 @@ class BinanceLiveMarginExecutor:
                 symbol=filters.symbol,
                 quantity=eff_qty,
                 entry_price=avg_price,
-                cost_basis_usdc=cumm_quote,
+                cost_basis_usdc=pos_cost,
                 entry_fee_usdc=fee_usdc,
                 opened_at_iso=now_iso,
                 signal_key=signal_key,

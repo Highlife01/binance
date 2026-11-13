@@ -411,6 +411,39 @@ class CloudBotApplication:
                     )
             storage.set_state("profit_target_v2_15usdt", "1")
             changed = True
+        if storage.get_state("margin_cost_fix_v1", "") != "1":
+            # Baz varlık komisyonu yüzünden kayda alınan miktar azaldığı halde maliyet tabanı tam kalmıştı;
+            # bu, kâr/zarara sahte (phantom) zarar yazıyordu. Mevcut kayıtlar gerçek maliyete göre düzeltilir.
+            with storage.atomic() as conn:
+                rows = conn.execute(
+                    "SELECT position_id, status, quantity, entry_price, cost_basis_usdc, borrowed_usdc, realized_pnl_usdc "
+                    "FROM positions WHERE portfolio_track = 'LIVE_MARGIN'"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        qty = Decimal(str(row[2]))
+                        entry = Decimal(str(row[3]))
+                        cost = Decimal(str(row[4]))
+                        borrowed = Decimal(str(row[5] or "0"))
+                        true_cost = qty * entry
+                    except (InvalidOperation, TypeError):
+                        continue
+                    if cost <= 0 or true_cost <= 0 or cost <= true_cost * Decimal("1.005"):
+                        continue
+                    ratio = true_cost / cost
+                    if str(row[1]).upper() == "CLOSED":
+                        pnl = Decimal(str(row[6] or "0")) + (cost - true_cost)
+                        conn.execute(
+                            "UPDATE positions SET cost_basis_usdc = ?, borrowed_usdc = ?, realized_pnl_usdc = ? WHERE position_id = ?",
+                            (str(true_cost), str(borrowed * ratio), str(pnl), row[0]),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE positions SET cost_basis_usdc = ?, borrowed_usdc = ? WHERE position_id = ?",
+                            (str(true_cost), str(borrowed * ratio), row[0]),
+                        )
+            storage.set_state("margin_cost_fix_v1", "1")
+            changed = True
         return changed
 
     def _active_cloud_params(self, eng: TradingSystemEngine) -> dict[str, Any]:
