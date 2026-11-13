@@ -58,6 +58,13 @@ def test_dashboard_dom_ids_and_required_controls() -> None:
         "perfSummary",
         "perfReasons",
         "perfFooter",
+        "universeMeta",
+        "refreshRadarBtn",
+        "watchPills",
+        "addSymInp",
+        "addSymBtn",
+        "gainersMeta",
+        "gainersRadar",
         "perfUniverse",
         "scanNowBtn",
         "toggleAutoBtn",
@@ -102,6 +109,10 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "renderWalletData" in js
     assert "handleMarginLiqClick" in js
     assert "autoLoadWalletOnce" in js
+    assert "/api/radar-refresh" in js
+    assert "updateWatchSymbol" in js
+    assert "add_scan_symbol" in js
+    assert "remove_scan_symbol" in js
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:

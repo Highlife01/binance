@@ -446,6 +446,16 @@ class CloudBotApplication:
             changed = True
         return changed
 
+    @staticmethod
+    def _parse_scan_symbols(raw: str) -> list[str]:
+        """Virgülle ayrılmış USDT tarama listesini doğrular ve varsayılana yedekler."""
+        parsed = [
+            s.strip().upper()
+            for s in str(raw or "").split(",")
+            if _SYMBOL_RE.fullmatch(s.strip().upper()) and s.strip().upper().endswith("USDT")
+        ]
+        return parsed or list(DEFAULT_SCAN_SYMBOLS)
+
     def _active_cloud_params(self, eng: TradingSystemEngine) -> dict[str, Any]:
         st = eng.storage
         raw_mode = st.get_state("cloud_mode", "PAPER").strip().upper()
@@ -497,13 +507,7 @@ class CloudBotApplication:
             max_open_positions=max(1, min(10, int(saved_risk.max_open_positions))),
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
-        symbols = [
-            s.strip().upper()
-            for s in raw_syms.split(",")
-            if _SYMBOL_RE.fullmatch(s.strip().upper()) and s.strip().upper().endswith("USDT")
-        ]
-        if not symbols:
-            symbols = list(DEFAULT_SCAN_SYMBOLS)
+        symbols = self._parse_scan_symbols(raw_syms)
         ai_enabled = (st.get_state("cloud_ai_enabled", "1") == "1") and eng.config.has_gemini_key
         ai_force = (st.get_state("cloud_ai_force", "0") == "1") and ai_enabled
         ai_mode = "2" if ai_force else ("1" if ai_enabled else "0")
@@ -542,42 +546,94 @@ class CloudBotApplication:
                 pass
         return bids
 
+    def _refresh_market_radar(
+        self, eng: TradingSystemEngine, *, force: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Fırsat Evreni ve Günün Yükselenleri Radarını en fazla 5 dakikada bir (veya zorla) yeniler."""
+        st = eng.storage
+        raw_uni = st.get_state("cloud_universe_json", "")
+        raw_gain = st.get_state("cloud_gainers_json", "")
+        try:
+            last_ts = float(st.get_state("cloud_universe_ts", "0") or "0")
+        except ValueError:
+            last_ts = 0.0
+
+        stale_radar = force or not raw_uni or not raw_gain or (time.time() - last_ts) > 300
+        if stale_radar:
+            fetch_radar = getattr(eng.market_client, "fetch_market_radar", None)
+            fetch_opp = getattr(eng.market_client, "fetch_usdt_opportunities", None)
+            try:
+                if fetch_radar is not None:
+                    ranked_new, gainers_new = fetch_radar(universe_limit=30, gainers_limit=15)
+                elif fetch_opp is not None:
+                    ranked_new, gainers_new = fetch_opp(limit=30), []
+                else:
+                    ranked_new, gainers_new = [], []
+                if ranked_new or gainers_new:
+                    if ranked_new:
+                        raw_uni = json.dumps(ranked_new, ensure_ascii=False)
+                        st.set_state("cloud_universe_json", raw_uni)
+                    if gainers_new or force:
+                        raw_gain = json.dumps(gainers_new, ensure_ascii=False)
+                        st.set_state("cloud_gainers_json", raw_gain)
+                    st.set_state("cloud_universe_ts", str(time.time()))
+            except Exception as exc:
+                logging.warning("Piyasa radarı güncellenemedi: %s", _safe_text(exc, 120))
+                if force:
+                    raise
+
+        try:
+            ranked = json.loads(raw_uni) if raw_uni else []
+        except ValueError:
+            ranked = []
+        try:
+            gainers = json.loads(raw_gain) if raw_gain else []
+        except ValueError:
+            gainers = []
+        return (
+            ranked if isinstance(ranked, list) else [],
+            gainers if isinstance(gainers, list) else [],
+        )
+
     def _dynamic_scan_symbols(self, eng: TradingSystemEngine, core: list[str]) -> list[str]:
         """
-        Sabit 10 coin yerine likit + hareketli + dar spreadli geniş fırsat evrenini (30 parite) 30 dakikada bir
-        puanlar; tick başına tarama bütçesini (CPU/maliyet) sabit tutarak döngüsel (round-robin) tarar.
+        5M+ hacimli, dar spreadli ve pozitif ivmeli geniş fırsat evrenini (30 parite) 5 dakikada bir
+        puanlar; erken/orta yükselenleri de taramaya katar ve CPU bütçesini koruyarak döngüsel tarar.
         Veri alınamazsa çekirdek listeye geri döner (fail-safe).
         """
         st = eng.storage
         if st.get_state("cloud_dynamic_scan", "1") != "1":
             return core
-        fetch = getattr(eng.market_client, "fetch_usdt_opportunities", None)
-        if fetch is None:
+        has_radar = getattr(eng.market_client, "fetch_market_radar", None) is not None
+        has_opp = getattr(eng.market_client, "fetch_usdt_opportunities", None) is not None
+        if not has_radar and not has_opp:
             return core
-        raw = st.get_state("cloud_universe_json", "")
-        try:
-            last_ts = float(st.get_state("cloud_universe_ts", "0") or "0")
-        except ValueError:
-            last_ts = 0.0
-        if not raw or (time.time() - last_ts) > 1800:
-            try:
-                ranked_new = fetch(limit=30)
-                if ranked_new:
-                    raw = json.dumps(ranked_new, ensure_ascii=False)
-                    st.set_state("cloud_universe_json", raw)
-                    st.set_state("cloud_universe_ts", str(time.time()))
-            except Exception as exc:
-                logging.warning("Fırsat evreni güncellenemedi: %s", _safe_text(exc, 120))
-        try:
-            ranked = json.loads(raw) if raw else []
-        except ValueError:
-            ranked = []
-        universe = [
-            str(r.get("symbol", "")).upper()
-            for r in ranked
-            if _SYMBOL_RE.fullmatch(str(r.get("symbol", "")).upper())
-            and str(r.get("symbol", "")).upper().endswith("USDT")
-        ]
+        ranked, gainers = self._refresh_market_radar(eng, force=False)
+        universe: list[str] = []
+        seen_u: set[str] = set()
+        for r in ranked:
+            sym = str(r.get("symbol", "")).upper()
+            if _SYMBOL_RE.fullmatch(sym) and sym.endswith("USDT") and sym not in seen_u:
+                seen_u.add(sym)
+                universe.append(sym)
+        # Radardaki erken/güçlü yükselenleri (+%2..+%35, >=5M USDT hacim) en fazla 4 ek aday olarak havuza ekle
+        added_gainers = 0
+        for g in gainers:
+            if added_gainers >= 4:
+                break
+            sym = str(g.get("symbol", "")).upper()
+            chg = float(g.get("change_pct_24h", 0) or 0)
+            qvol = float(g.get("quote_volume_24h", 0) or 0)
+            if (
+                _SYMBOL_RE.fullmatch(sym)
+                and sym.endswith("USDT")
+                and sym not in seen_u
+                and 2.0 <= chg <= 35.0
+                and qvol >= 5_000_000
+            ):
+                seen_u.add(sym)
+                universe.append(sym)
+                added_gainers += 1
         if not universe:
             return core
         try:
@@ -984,9 +1040,13 @@ class CloudBotApplication:
         }
         month_key = f"cloud_cpu_sec:{now_dt.isoformat()[:7]}"
         try:
-            universe_rows = json.loads(st.get_state("cloud_universe_json", "") or "[]")[:15]
+            universe_rows = json.loads(st.get_state("cloud_universe_json", "") or "[]")[:24]
         except ValueError:
             universe_rows = []
+        try:
+            gainers_rows = json.loads(st.get_state("cloud_gainers_json", "") or "[]")[:15]
+        except ValueError:
+            gainers_rows = []
         universe_ts = st.get_state("cloud_universe_ts", "") or None
         try:
             cpu_used = float(st.get_state(month_key, "0") or "0")
@@ -1027,6 +1087,7 @@ class CloudBotApplication:
             "cpu_usage": cpu_payload,
             "telegram_enabled": self.notifier.enabled,
             "universe": universe_rows,
+            "gainers": gainers_rows,
             "universe_updated_ts": universe_ts,
             "ai_force": params["ai_force"],
             "ai_mode": params["ai_mode"],
@@ -1287,6 +1348,43 @@ class CloudBotApplication:
             )
             notes.append("Yeni alımlar duraklatıldı." if pause_flag else "Yeni alım kilidi kaldırıldı.")
 
+        raw_add = payload.get("add_scan_symbol")
+        if isinstance(raw_add, str) and raw_add.strip():
+            sym = re.sub(r"[^A-Z0-9]", "", raw_add.strip().upper())
+            if not sym.endswith("USDT"):
+                sym = f"{sym}USDT"
+            if not _SYMBOL_RE.fullmatch(sym) or len(sym) <= 4:
+                raise ValueError("Geçerli bir coin veya USDT paritesi girin (ör. SHELL veya SHELLUSDT).")
+            discover = getattr(eng.market_client, "discover_spot_pairs", None)
+            if discover is not None:
+                spot_map = discover(quote_asset="USDT")
+                if spot_map and sym not in spot_map:
+                    raise ValueError(f"{sym} Binance Spot USDT piyasasında bulunamadı.")
+            cur_list = self._parse_scan_symbols(
+                st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
+            )
+            if sym not in cur_list:
+                if len(cur_list) >= 20:
+                    raise ValueError("Sabit izleme listesinde en fazla 20 coin bulunabilir.")
+                cur_list.append(sym)
+                st.set_state("cloud_scan_symbols", ",".join(cur_list))
+                notes.append(f"{sym} sabit tarama listesine eklendi.")
+            else:
+                notes.append(f"{sym} zaten sabit tarama listesinde.")
+
+        raw_rem = payload.get("remove_scan_symbol")
+        if isinstance(raw_rem, str) and raw_rem.strip():
+            sym = raw_rem.strip().upper()
+            cur_list = self._parse_scan_symbols(
+                st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
+            )
+            if sym in cur_list:
+                if len(cur_list) <= 1:
+                    raise ValueError("Sabit tarama listesinde en az 1 parite kalmalıdır.")
+                cur_list = [s for s in cur_list if s != sym]
+                st.set_state("cloud_scan_symbols", ",".join(cur_list))
+                notes.append(f"{sym} sabit tarama listesinden çıkarıldı.")
+
         self.state_sync.persist(self.config.db_path)
         return " ".join(notes) if notes else "Ayarlar güncellendi."
 
@@ -1482,6 +1580,7 @@ class CloudBotApplication:
             "/api/dashboard",
             "/api/wallet",
             "/api/tick",
+            "/api/radar-refresh",
             "/api/settings",
             "/api/close-positions",
             "/api/margin-liquidate",
@@ -1537,6 +1636,17 @@ class CloudBotApplication:
                             "ok": True,
                             "message": f"{tick_summary['scanned_count']} parite tarandı ({tick_summary['orders_executed']} işlem).",
                             "summary": tick_summary,
+                            "dashboard": self._build_dashboard(eng),
+                        },
+                    )
+                if route == "/api/radar-refresh":
+                    ranked, gainers = self._refresh_market_radar(eng, force=True)
+                    self.state_sync.persist(self.config.db_path)
+                    return respond(
+                        200,
+                        {
+                            "ok": True,
+                            "message": f"Piyasa radarı güncellendi: {len(gainers)} yükselen coin, {len(ranked)} fırsat adayı bulundu.",
                             "dashboard": self._build_dashboard(eng),
                         },
                     )

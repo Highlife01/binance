@@ -451,23 +451,44 @@ class BinancePublicDataClient:
         )
         return extract_closed_candles(raw_klines, server_time_ms=int(time.time() * 1000))
 
+    def fetch_market_radar(
+        self,
+        universe_limit: int = 30,
+        gainers_limit: int = 15,
+        *,
+        min_quote_volume: float = 5_000_000.0,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Tek ticker çağrısıyla hem dengeli Fırsat Evrenini hem Günün Yükselenleri Radarını üretir."""
+        from .expert import rank_top_gainers, score_universe
+
+        usdt_map = self.discover_spot_pairs(quote_asset="USDT", allow_stablecoin_conversion=False)
+        tickers, _ = self._get_json("/api/v3/ticker/24hr")
+        ranked = score_universe(
+            tickers,
+            tradable_usdt=usdt_map,
+            min_quote_volume=min_quote_volume,
+            limit=universe_limit,
+        )
+        gainers = rank_top_gainers(
+            tickers,
+            tradable_usdt=usdt_map,
+            limit=gainers_limit,
+        )
+        return ranked, gainers
+
     def fetch_usdt_opportunities(
         self,
         limit: int = 30,
         *,
-        min_quote_volume: float = 25_000_000.0,
+        min_quote_volume: float = 5_000_000.0,
     ) -> list[dict[str, Any]]:
-        """24 saatlik ticker ile likit, hareketli ve dar spreadli Spot USDT fırsat evrenini puanlar."""
-        from .expert import score_universe
-
-        usdt_map = self.discover_spot_pairs(quote_asset="USDT", allow_stablecoin_conversion=False)
-        tickers, _ = self._get_json("/api/v3/ticker/24hr")
-        return score_universe(
-            tickers,
-            tradable_usdt=usdt_map,
+        """24 saatlik ticker ile likit, ivmeli ve dar spreadli Spot USDT fırsat evrenini puanlar."""
+        ranked, _ = self.fetch_market_radar(
+            universe_limit=limit,
+            gainers_limit=15,
             min_quote_volume=min_quote_volume,
-            limit=limit,
         )
+        return ranked
 
     def fetch_order_book(self, symbol: str, depth_limit: int = 20) -> OrderBookSnapshot:
         """Gerçekçi likidite ve kayma hesabı için emir defteri kademelerini çeker."""

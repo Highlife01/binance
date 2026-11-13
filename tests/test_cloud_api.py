@@ -673,3 +673,32 @@ def test_engine_automatically_values_bnb_commission_and_unblocks_next_live_buy(t
     pos = st.get_open_positions(track="LIVE_SPOT")[0]
     assert pos.entry_fee_usdc == Decimal("0.00001100") * Decimal("650.00")
 
+
+def test_radar_refresh_and_scan_symbol_watchlist(tmp_path: Path):
+    app, sync, market = _make_app(tmp_path)
+    market.discover_spot_pairs = lambda **kw: {  # type: ignore[method-assign]
+        sym: market._filters(sym) for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "SHELLUSDT")
+    }
+    market.fetch_market_radar = lambda **kw: (  # type: ignore[method-assign]
+        [{"symbol": "SHELLUSDT", "score": 0.72, "quote_volume_24h": 12_000_000, "range_pct_24h": 14.0, "change_pct_24h": 18.5, "spread_pct": 0.05}],
+        [{"symbol": "SHELLUSDT", "last_price": 0.55, "change_pct_24h": 18.5, "quote_volume_24h": 12_000_000, "range_pct_24h": 14.0, "spread_pct": 0.05, "tag": "GUCLU_TREND"}],
+    )
+    headers = {"Authorization": "Bearer owner-token", "Origin": "https://tradecebrail.web.app"}
+
+    r_rad = app.handle("POST", "/api/radar-refresh", headers, b"{}")
+    assert r_rad.status == 200
+    assert r_rad.body["dashboard"]["gainers"][0]["symbol"] == "SHELLUSDT"
+    assert r_rad.body["dashboard"]["universe"][0]["symbol"] == "SHELLUSDT"
+
+    r_add = app.handle("POST", "/api/settings", headers, json.dumps({"add_scan_symbol": "SHELL"}).encode())
+    assert r_add.status == 200
+    assert "SHELLUSDT" in r_add.body["dashboard"]["scan_symbols"]
+
+    r_bad = app.handle("POST", "/api/settings", headers, json.dumps({"add_scan_symbol": "NOPEUSDT"}).encode())
+    assert r_bad.status == 400
+
+    r_rem = app.handle("POST", "/api/settings", headers, json.dumps({"remove_scan_symbol": "SHELLUSDT"}).encode())
+    assert r_rem.status == 200
+    assert "SHELLUSDT" not in r_rem.body["dashboard"]["scan_symbols"]
+    assert sync.persist_calls >= 3
+

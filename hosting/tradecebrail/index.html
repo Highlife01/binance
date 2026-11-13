@@ -669,6 +669,48 @@
       color: var(--muted);
     }
 
+    .watch-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+    }
+
+    .watch-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 650;
+      background: rgba(20, 184, 166, 0.12);
+      border: 1px solid rgba(20, 184, 166, 0.32);
+      color: #99f6e4;
+    }
+
+    .watch-pill button {
+      background: transparent;
+      border: none;
+      color: inherit;
+      padding: 0 2px;
+      font-size: 0.84rem;
+      line-height: 1;
+      opacity: 0.75;
+    }
+
+    .watch-pill button:hover { opacity: 1; transform: none; filter: none; }
+
+    .gainer-card {
+      border-color: rgba(34, 197, 94, 0.28);
+      background: linear-gradient(165deg, rgba(34, 197, 94, 0.08), rgba(15, 23, 42, 0.85));
+    }
+
     /* Controls Form Grid */
     .controls-row {
       display: grid;
@@ -966,12 +1008,34 @@
         </section>
       </div>
 
-      <!-- Dinamik Fırsat Evreni -->
+      <!-- Dinamik Fırsat Evreni & Günün Yükselenleri Radarı -->
       <section class="section">
         <div class="section-head">
-          <h3>🔎 Dinamik Fırsat Evreni &amp; Taranan Adaylar</h3>
-          <span class="muted num" id="universeMeta">Piyasa taranıyor...</span>
+          <h3>🔎 Dinamik Fırsat Evreni &amp; 🚀 Günün Yükselenleri Radarı</h3>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span class="muted num" id="universeMeta">Piyasa taranıyor...</span>
+            <button id="refreshRadarBtn" type="button" class="toggle-chip" title="Binance Spot'tan yükselenleri ve fırsat evrenini anında yenile">🔄 Radarı Güncelle</button>
+          </div>
         </div>
+
+        <div class="watch-bar">
+          <span style="font-size:0.75rem;color:var(--muted);font-weight:650;">Sabit Takip Listem:</span>
+          <div id="watchPills" style="display:flex;flex-wrap:wrap;gap:5px;flex:1;"></div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input type="text" id="addSymInp" placeholder="Ör. SHELL" maxlength="16" style="width:110px;padding:4px 8px;font-size:0.76rem;text-transform:uppercase;" aria-label="Takip listesine coin ekle" />
+            <button id="addSymBtn" type="button" class="btn-active-teal" style="padding:4px 10px;font-size:0.75rem;">+ Taramaya Ekle</button>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
+          <div style="font-size:0.84rem;font-weight:700;color:#e2e8f0;">🚀 Günün En Çok Yükselenleri (Binance Spot Top Gainers · 2M+ Hacim)</div>
+          <span class="muted num" id="gainersMeta" style="font-size:0.76rem;">—</span>
+        </div>
+        <div id="gainersRadar" class="universe-grid" style="margin-bottom:14px;">
+          <div class="muted">Yükselenler radarı ilk taramada (en fazla 1 dk) dolacaktır — isterseniz "🔄 Radarı Güncelle"ye tıklayın.</div>
+        </div>
+
+        <div style="font-size:0.84rem;font-weight:700;color:#e2e8f0;margin-bottom:8px;">⚡ Dengeli Momentum &amp; Skorlu Fırsat Evreni (5M+ USDT · Otomatik Tarama)</div>
         <div id="perfUniverse" class="universe-grid">
           <div class="muted">Henüz fırsat evreni verisi yok — tarama tamamlandığında burada skorlu coin kartları görünür.</div>
         </div>
@@ -1582,15 +1646,71 @@
 
     function renderUniverse(d) {
       const uni = Array.isArray(d.universe) ? d.universe : [];
-      const activeSet = new Set(d.scan_symbols || []);
-      const sig = JSON.stringify([uni, d.universe_updated_ts, d.scan_symbols]);
+      const gainers = Array.isArray(d.gainers) ? d.gainers : [];
+      const scanSyms = Array.isArray(d.scan_symbols) ? d.scan_symbols : [];
+      const activeSet = new Set(scanSyms);
+      const sig = JSON.stringify([uni, gainers, d.universe_updated_ts, scanSyms]);
       if (renderSigs.universe === sig) return;
       renderSigs.universe = sig;
 
       const tsTxt = fmtUnixTs(d.universe_updated_ts);
       $("universeMeta").textContent = uni.length
-        ? `${uni.length} aday • ${activeSet.size} aktif taramada${tsTxt ? ` • Güncelleme: ${tsTxt}` : ""}`
+        ? `${uni.length} fırsat • ${activeSet.size} sabit takip${tsTxt ? ` • Güncelleme: ${tsTxt}` : ""}`
         : "Fırsat evreni güncelleniyor...";
+
+      const pillsBox = $("watchPills");
+      if (pillsBox) {
+        pillsBox.innerHTML = scanSyms.map((s) => {
+          const shortSym = String(s || "").replace("USDT", "");
+          return `<span class="watch-pill num">${esc(shortSym)}<button type="button" class="btn-watch-toggle" data-action="remove" data-sym="${esc(s)}" title="${esc(s)} çıkar">×</button></span>`;
+        }).join("");
+      }
+
+      const gBox = $("gainersRadar");
+      const gMeta = $("gainersMeta");
+      if (gMeta) {
+        gMeta.textContent = gainers.length ? `En hızlı artan ${gainers.length} USDT paritesi` : "İlk yenileme bekleniyor";
+      }
+      if (gBox) {
+        if (!gainers.length) {
+          gBox.innerHTML = `<div class="muted">Yükselenler radarı henüz dolmadı — "🔄 Radarı Güncelle" düğmesine basarak anlık Binance taraması çekebilirsiniz.</div>`;
+        } else {
+          gBox.innerHTML = gainers.map((g) => {
+            const inWatch = activeSet.has(g.symbol);
+            const symShort = String(g.symbol || "").replace("USDT", "");
+            const chg = Number(g.change_pct_24h || 0);
+            const tag = String(g.tag || "");
+            const tagBadge = tag === "ERKEN_IVME"
+              ? `<span class="badge badge-teal" style="padding:2px 6px;font-size:0.66rem;">ERKEN İVME</span>`
+              : tag === "ASIRI_PUMP"
+                ? `<span class="badge badge-amber" style="padding:2px 6px;font-size:0.66rem;">AŞIRI PUMP</span>`
+                : `<span class="badge badge-green" style="padding:2px 6px;font-size:0.66rem;">GÜÇLÜ TREND</span>`;
+            const pxTxt = g.last_price != null ? `$${esc(g.last_price)}` : "—";
+            return `
+              <div class="uni-card gainer-card">
+                <div class="uni-top">
+                  <div class="uni-sym">
+                    ${inWatch ? `<span class="uni-dot" title="Sabit takip listenizde"></span>` : ""}
+                    ${esc(symShort)}
+                  </div>
+                  <span class="pos num" style="font-weight:750;font-size:0.84rem;">+${chg.toFixed(1)}%</span>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:6px;">
+                  ${tagBadge}
+                  <span class="mono muted" style="font-size:0.72rem;">${pxTxt}</span>
+                </div>
+                <div class="uni-meta num" style="margin-bottom:7px;">
+                  <span>Hacim: <b>${esc(fmtCompactUsd(g.quote_volume_24h))}</b></span>
+                  <span style="text-align:right;">Spread: %${Number(g.spread_pct || 0).toFixed(2)}</span>
+                </div>
+                <button type="button" class="${inWatch ? "btn-ghost" : "btn-active-teal"} btn-watch-toggle" data-action="${inWatch ? "remove" : "add"}" data-sym="${esc(g.symbol)}" style="width:100%;padding:4px 8px;font-size:0.72rem;">
+                  ${inWatch ? "✓ Sabit Taramada" : "+ Taramaya Ekle"}
+                </button>
+              </div>
+            `;
+          }).join("");
+        }
+      }
 
       const box = $("perfUniverse");
       if (!uni.length) {
@@ -1618,12 +1738,15 @@
               </span>
             </div>
             <div class="uni-score-track"><div class="uni-score-fill" style="width:${scorePct.toFixed(0)}%"></div></div>
-            <div class="uni-meta num">
+            <div class="uni-meta num" style="margin-bottom:6px;">
               <span>24s: <b class="${chgCls}">${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%</b></span>
               <span style="text-align:right;">Aralık: <b>${Number(u.range_pct_24h || 0).toFixed(1)}%</b></span>
               <span>Spread: %${Number(u.spread_pct || 0).toFixed(2)}</span>
               <span style="text-align:right;">${esc(fmtCompactUsd(u.quote_volume_24h))}</span>
             </div>
+            <button type="button" class="${isActive ? "btn-ghost" : "btn-active-teal"} btn-watch-toggle" data-action="${isActive ? "remove" : "add"}" data-sym="${esc(u.symbol)}" style="width:100%;padding:3px 7px;font-size:0.71rem;">
+              ${isActive ? "✓ Taramada" : "+ Sabite Ekle"}
+            </button>
           </div>
         `;
       }).join("");
@@ -2072,6 +2195,63 @@
       } finally {
         setBtnBusy(btn, false);
       }
+    });
+
+    async function updateWatchSymbol(sym, action, btn = null) {
+      if (!sym) return;
+      const body = action === "remove" ? { remove_scan_symbol: sym } : { add_scan_symbol: sym };
+      if (btn) setBtnBusy(btn, true, "⏳...");
+      try {
+        const res = await apiCall("/api/settings", "POST", body, 20000);
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+        return true;
+      } catch (err) {
+        showToast(err.message, true);
+        return false;
+      } finally {
+        if (btn) setBtnBusy(btn, false);
+      }
+    }
+
+    $("refreshRadarBtn").addEventListener("click", async () => {
+      const btn = $("refreshRadarBtn");
+      setBtnBusy(btn, true, "⏳ Yenileniyor...");
+      try {
+        const res = await apiCall("/api/radar-refresh", "POST", {}, 25000);
+        showToast(res.message);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        setBtnBusy(btn, false);
+      }
+    });
+
+    $("addSymBtn").addEventListener("click", async () => {
+      const inp = $("addSymInp");
+      const raw = (inp.value || "").trim().toUpperCase();
+      if (!raw) return;
+      const ok = await updateWatchSymbol(raw, "add", $("addSymBtn"));
+      if (ok) inp.value = "";
+    });
+
+    $("addSymInp").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        $("addSymBtn").click();
+      }
+    });
+
+    [$("watchPills"), $("gainersRadar"), $("perfUniverse")].forEach((el) => {
+      if (!el) return;
+      el.addEventListener("click", (e) => {
+        const btn = e.target.closest(".btn-watch-toggle");
+        if (!btn) return;
+        const sym = btn.getAttribute("data-sym");
+        const action = btn.getAttribute("data-action") || "add";
+        updateWatchSymbol(sym, action, btn);
+      });
     });
 
     $("selMode").addEventListener("change", applyModeLeverageRules);

@@ -13,6 +13,7 @@ from binance_ai_bot.expert import (
     dynamic_exits,
     loss_streak_cooldown,
     pick_scan_symbols,
+    rank_top_gainers,
     regime_block,
     risk_capped_notional,
     score_universe,
@@ -238,3 +239,45 @@ def test_margin_cost_fix_migration_corrects_history(tmp_path: Path):
     assert abs(fixed.cost_basis_usdc - Decimal("0.00012") * Decimal("71748.72")) < Decimal("0.001")
     assert fixed.realized_pnl_usdc > Decimal("-0.25")  # sahte zarar (≈0.72 USDT) geri alındı
     assert eng.storage.get_state("margin_cost_fix_v1", "") == "1"
+
+
+def test_score_universe_catches_midcap_momentum_and_rank_top_gainers_works():
+    flt = lambda base, mn="5": SimpleNamespace(base_asset=base, min_notional=Decimal(mn))  # noqa: E731
+    tradable = {
+        "BTCUSDT": flt("BTC"),
+        "SHELLUSDT": flt("SHELL"),
+        "PUMPUSDT": flt("PUMP"),
+        "BTCDOWNUSDT": flt("BTCDOWN"),
+        "TINYUSDT": flt("TINY"),
+    }
+
+    def tick(sym, vol, hi, lo, last, bid, ask, chg):
+        return {
+            "symbol": sym,
+            "quoteVolume": str(vol),
+            "highPrice": str(hi),
+            "lowPrice": str(lo),
+            "lastPrice": str(last),
+            "bidPrice": str(bid),
+            "askPrice": str(ask),
+            "priceChangePercent": str(chg),
+        }
+
+    tickers = [
+        tick("BTCUSDT", 2_000_000_000, 71_000, 67_000, 68_500, 68_499, 68_501, -3.5),
+        tick("SHELLUSDT", 12_000_000, 0.58, 0.45, 0.55, 0.5498, 0.5502, 18.5),  # orta hacim + ivmeli (%0.07 spread)
+        tick("PUMPUSDT", 4_000_000, 2.20, 1.10, 2.00, 1.999, 2.001, 48.0),    # >%2M ama <%5M -> radar görür, evren almaz
+        tick("BTCDOWNUSDT", 50_000_000, 10, 6, 9, 8.999, 9.001, 25.0),        # kaldıraçlı token -> elenir
+        tick("TINYUSDT", 400_000, 1.5, 1.0, 1.4, 1.399, 1.401, 30.0),          # çok sığ (<2M) -> elenir
+    ]
+    ranked = score_universe(tickers, tradable_usdt=tradable)
+    syms = [r["symbol"] for r in ranked]
+    assert "SHELLUSDT" in syms
+    assert syms[0] == "SHELLUSDT"  # pozitif ivmeli orta hacimli coin eksideki devden yüksek skor almalı
+    assert "PUMPUSDT" not in syms
+    assert "BTCDOWNUSDT" not in syms
+
+    gainers = rank_top_gainers(tickers, tradable_usdt=tradable)
+    assert [g["symbol"] for g in gainers] == ["PUMPUSDT", "SHELLUSDT"]
+    assert gainers[0]["tag"] == "ASIRI_PUMP"
+    assert gainers[1]["tag"] == "GUCLU_TREND"

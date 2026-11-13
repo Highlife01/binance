@@ -163,23 +163,17 @@ def loss_streak_cooldown(
 
 
 # ---------------------------------------------------------------------------
-# Fırsat evreni: likit + hareketli + dar spreadli USDT pariteleri
+# Fırsat evreni ve Günün Yükselenleri radarı: likit + hareketli + ivmeli USDT
 # ---------------------------------------------------------------------------
-def score_universe(
+def _iter_valid_usdt_tickers(
     tickers: Iterable[dict[str, Any]],
     *,
     tradable_usdt: dict[str, Any],
-    min_quote_volume: float = 25_000_000.0,
-    max_spread: float = 0.0008,
-    max_min_notional: float = 10.0,
-    limit: int = 30,
-) -> list[dict[str, Any]]:
-    """
-    24 saatlik ticker verisinden alım-satım fırsatı puanı üretir:
-    likidite (hacim) + günlük hareket aralığı (kısa vadeli kâr potansiyeli) + dar spread.
-    Aşırı pump (>%30), kaldıraçlı token, stabilcoin ve düşük hacimli pariteler elenir.
-    """
-    ranked: list[dict[str, Any]] = []
+    min_quote_volume: float,
+    max_spread: float,
+    max_min_notional: float,
+) -> Iterable[dict[str, float | str]]:
+    """24 saatlik ticker kayıtlarını doğrular; kaldıraçlı token, sığ hacim ve aşırı spreadi eler."""
     for t in tickers:
         sym = str(t.get("symbol", "")).upper()
         flt = tradable_usdt.get(sym)
@@ -200,7 +194,7 @@ def score_universe(
             continue
         if last <= 0 or low <= 0 or bid <= 0 or ask <= 0:
             continue
-        if qvol < min_quote_volume or abs(chg) > 30.0:
+        if qvol < min_quote_volume:
             continue
         if float(getattr(flt, "min_notional", 0)) > max_min_notional:
             continue
@@ -209,15 +203,59 @@ def score_universe(
         if spread > max_spread:
             continue
         range_pct = (high - low) / last * 100.0
-        if range_pct < 1.5 or range_pct > 25.0:
+        yield {
+            "symbol": sym,
+            "last": last,
+            "chg": chg,
+            "range_pct": range_pct,
+            "qvol": qvol,
+            "spread": spread,
+        }
+
+
+def score_universe(
+    tickers: Iterable[dict[str, Any]],
+    *,
+    tradable_usdt: dict[str, Any],
+    min_quote_volume: float = 5_000_000.0,
+    max_spread: float = 0.0015,
+    max_min_notional: float = 10.0,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """
+    24 saatlik ticker verisinden dengeli momentum + fırsat puanı üretir:
+    likidite (hacim) + günlük hareket aralığı + pozitif yükseliş ivmesi + dar spread.
+    Sert düşen bıçak (<-%25), aşırı dikey mania (>+%55), kaldıraçlı token ve sığ pariteler elenir.
+    """
+    ranked: list[dict[str, Any]] = []
+    for c in _iter_valid_usdt_tickers(
+        tickers,
+        tradable_usdt=tradable_usdt,
+        min_quote_volume=min_quote_volume,
+        max_spread=max_spread,
+        max_min_notional=max_min_notional,
+    ):
+        chg = float(c["chg"])
+        range_pct = float(c["range_pct"])
+        qvol = float(c["qvol"])
+        spread = float(c["spread"])
+        if chg < -25.0 or chg > 55.0:
             continue
-        liq = max(0.0, min((math.log10(qvol) - 7.0) / 3.0, 1.0))
-        vol_score = min(range_pct, 10.0) / 10.0
+        if range_pct < 1.5 or range_pct > 55.0:
+            continue
+        liq = max(0.0, min((math.log10(qvol) - 6.7) / 2.8, 1.0))
+        vol_score = min(range_pct, 15.0) / 15.0
+        if chg <= 0.0:
+            mom_score = 0.10
+        elif chg <= 25.0:
+            mom_score = min(chg / 15.0, 1.0)
+        else:
+            mom_score = max(0.35, 1.0 - (chg - 25.0) / 60.0)
         spread_score = 1.0 - min(spread / max_spread, 1.0)
-        score = 0.45 * liq + 0.40 * vol_score + 0.15 * spread_score
+        score = 0.30 * liq + 0.30 * vol_score + 0.25 * mom_score + 0.15 * spread_score
         ranked.append(
             {
-                "symbol": sym,
+                "symbol": str(c["symbol"]),
                 "score": round(score, 4),
                 "quote_volume_24h": round(qvol),
                 "range_pct_24h": round(range_pct, 2),
@@ -227,6 +265,52 @@ def score_universe(
         )
     ranked.sort(key=lambda r: r["score"], reverse=True)
     return ranked[: max(1, limit)]
+
+
+def rank_top_gainers(
+    tickers: Iterable[dict[str, Any]],
+    *,
+    tradable_usdt: dict[str, Any],
+    min_quote_volume: float = 2_000_000.0,
+    max_spread: float = 0.0025,
+    max_min_notional: float = 10.0,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    """
+    Binance Spot USDT çiftleri içinden son 24 saatte en çok yükselen (yeterli hacimli ve
+    makul spreadli) coinleri Günün Yükselenleri Radarı için sıralar.
+    """
+    gainers: list[dict[str, Any]] = []
+    for c in _iter_valid_usdt_tickers(
+        tickers,
+        tradable_usdt=tradable_usdt,
+        min_quote_volume=min_quote_volume,
+        max_spread=max_spread,
+        max_min_notional=max_min_notional,
+    ):
+        chg = float(c["chg"])
+        if chg < 2.0:
+            continue
+        if chg <= 15.0:
+            tag = "ERKEN_IVME"
+        elif chg <= 35.0:
+            tag = "GUCLU_TREND"
+        else:
+            tag = "ASIRI_PUMP"
+        last = float(c["last"])
+        gainers.append(
+            {
+                "symbol": str(c["symbol"]),
+                "last_price": round(last, 6 if last < 1 else 4),
+                "change_pct_24h": round(chg, 2),
+                "quote_volume_24h": round(float(c["qvol"])),
+                "range_pct_24h": round(float(c["range_pct"]), 2),
+                "spread_pct": round(float(c["spread"]) * 100.0, 4),
+                "tag": tag,
+            }
+        )
+    gainers.sort(key=lambda r: (r["change_pct_24h"], r["quote_volume_24h"]), reverse=True)
+    return gainers[: max(1, limit)]
 
 
 def pick_scan_symbols(
