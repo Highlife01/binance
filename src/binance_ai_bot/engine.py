@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import wraps
 import json
+import time
 from typing import Any, Callable
 
 from .ai_advisor import GeminiDecisionAdvisor
@@ -29,6 +30,16 @@ from .domain import (
     SimulatedOrderResult,
     TechnicalSignal,
     is_substep_dust_position,
+    quantize_down,
+)
+from .expert import (
+    atr_pct_of_price,
+    coin_knife_block,
+    dynamic_exits,
+    loss_streak_cooldown,
+    regime_block,
+    risk_capped_notional,
+    trend_info,
 )
 from .live_executor import BinanceLiveSpotExecutor, LiveExecutionError
 from .margin_executor import BinanceLiveMarginExecutor
@@ -102,6 +113,7 @@ class TradingSystemEngine:
         # Çoklu coin taramasında True yapılır: pasif referans ilk paritede sabit kalır
         self.lock_benchmark_symbol = False
         self.allow_live_margin = False
+        self._candle_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._latest_bid_map: dict[str, Decimal] = {}
 
     def _collect_position_bids(self, positions, initial=None):
@@ -622,6 +634,9 @@ class TradingSystemEngine:
         skip_ai_prefilter = (
             ai_only_on_rule_signal and not has_open_pos and tech_signal.action != "AL"
         )
+        ai_context_notes: list[str] | None = None
+        if getattr(settings, "expert_mode", False) and ai_enabled_by_user and not skip_ai_prefilter:
+            ai_context_notes = self._expert_context_notes(market.symbol) or None
         ai_decision = self.ai_advisor.evaluate(
             market=market,
             tech_signal=tech_signal,
@@ -630,6 +645,7 @@ class TradingSystemEngine:
             ai_enabled_by_user=ai_enabled_by_user and not skip_ai_prefilter,
             daily_call_limit_override=daily_ai_limit_override,
             min_interval_override_sec=min_ai_interval_override,
+            external_notes=ai_context_notes,
         )
         if skip_ai_prefilter and ai_enabled_by_user:
             ai_decision = dataclasses.replace(ai_decision, mode_label="KURAL_ON_ELEME")
@@ -699,6 +715,11 @@ class TradingSystemEngine:
                         f"%{settings.max_entry_spread_pct * Decimal('100'):.3f}); maliyet kârı yiyeceği için alım atlandı."
                     )
                     info_msg = block_reason
+                elif getattr(settings, "expert_mode", False) and (
+                    expert_why := self._expert_entry_block(market.symbol, active_track, now_utc)
+                ):
+                    block_reason = f"Uzman filtre: {expert_why}; alım atlandı."
+                    info_msg = block_reason
                 else:
                     risk_chk = self.risk_manager.check_buy_entry(
                         filters=market.filters,
@@ -712,16 +733,23 @@ class TradingSystemEngine:
                         block_reason = risk_chk.reason
                         info_msg = f"AL sinyali risk denetiminde durduruldu: {risk_chk.reason}"
                     else:
+                        buy_settings = settings
+                        buy_qty = risk_chk.approved_quantity
+                        buy_notional = risk_chk.approved_notional_usdc
+                        if getattr(settings, "expert_mode", False):
+                            buy_settings, buy_qty, buy_notional = self._expert_adjust_buy(
+                                settings, market, tech_signal, risk_chk, bid_map, active_track
+                            )
                         sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
                         if is_live_spot:
                             try:
                                 ord_res = self.live_executor.execute_live_market_buy(
                                     filters=market.filters,
-                                    approved_qty=risk_chk.approved_quantity,
-                                    approved_notional=risk_chk.approved_notional_usdc,
+                                    approved_qty=buy_qty,
+                                    approved_notional=buy_notional,
                                     signal_key=sig_key,
                                     strategy_source=ai_decision.mode_label,
-                                    settings=settings,
+                                    settings=buy_settings,
                                     ui_live_confirmed=ui_live_confirmed,
                                     stop_requested=stop_requested,
                                 )
@@ -742,11 +770,11 @@ class TradingSystemEngine:
                             try:
                                 ord_res = self.live_margin_executor.execute_live_margin_buy(
                                     filters=market.filters,
-                                    approved_qty=risk_chk.approved_quantity,
-                                    approved_notional=risk_chk.approved_notional_usdc,
+                                    approved_qty=buy_qty,
+                                    approved_notional=buy_notional,
                                     signal_key=sig_key,
                                     strategy_source=ai_decision.mode_label,
-                                    settings=settings,
+                                    settings=buy_settings,
                                     ui_live_confirmed=ui_live_confirmed,
                                     ui_margin_confirmed=ui_margin_confirmed,
                                 )
@@ -759,10 +787,10 @@ class TradingSystemEngine:
                             ord_res = self.simulator.execute_buy(
                                 filters=market.filters,
                                 order_book=market.order_book,
-                                requested_qty=risk_chk.approved_quantity,
+                                requested_qty=buy_qty,
                                 signal_key=sig_key,
                                 strategy_source=ai_decision.mode_label,
-                                settings=settings,
+                                settings=buy_settings,
                                 now_utc=now_utc,
                                 track="MAIN",
                             )
@@ -966,6 +994,98 @@ class TradingSystemEngine:
                 )
 
         return any_closed, " | ".join(messages)
+
+    def _htf_candles(self, symbol: str, interval: str = "15m", ttl_sec: float = 240.0):
+        """Üst zaman dilimi mumları (önbellekli). Veri yoksa None -> filtre devre dışı (fail-open)."""
+        fetch = getattr(self.market_client, "fetch_closed_candles", None)
+        if fetch is None:
+            return None
+        key = (symbol, interval)
+        now_mono = time.monotonic()
+        cached = self._candle_cache.get(key)
+        if cached and (now_mono - cached[0]) < ttl_sec:
+            return cached[1]
+        try:
+            candles = fetch(symbol, interval, 60)
+        except Exception:
+            return None
+        self._candle_cache[key] = (now_mono, candles)
+        return candles
+
+    def _expert_entry_block(self, symbol: str, track: str, now_utc: datetime) -> str | None:
+        """Uzman trader ön elemesi: zarar serisi bekletmesi, düşen bıçak ve BTC risk-off filtresi."""
+        cooldown = loss_streak_cooldown(self.storage.get_recent_closed_pnls(track, symbol, 4), now_utc)
+        if cooldown:
+            return f"{symbol} {cooldown}"
+        coin_candles = self._htf_candles(symbol)
+        if coin_candles:
+            why = coin_knife_block(trend_info(coin_candles))
+            if why:
+                return f"{symbol}: {why}"
+        btc_candles = coin_candles if symbol == "BTCUSDT" else self._htf_candles("BTCUSDT")
+        if btc_candles:
+            why = regime_block(trend_info(btc_candles))
+            if why:
+                return why
+        return None
+
+    def _expert_context_notes(self, symbol: str) -> list[str]:
+        """Yapay zekâya (güvenilmeyen not olarak) trend ve rejim bağlamı."""
+        notes: list[str] = []
+        coin_candles = self._htf_candles(symbol)
+        if coin_candles:
+            notes.append(f"{symbol} 15dk trend: {trend_info(coin_candles).label()}")
+        btc_candles = coin_candles if symbol == "BTCUSDT" else self._htf_candles("BTCUSDT")
+        if btc_candles:
+            notes.append(f"BTC 15dk trend: {trend_info(btc_candles).label()}")
+        return notes
+
+    def _expert_adjust_buy(
+        self,
+        settings: RiskSettings,
+        market: MarketBundle,
+        tech_signal: TechnicalSignal,
+        risk_chk: Any,
+        bid_map: dict[str, Decimal],
+        track: str,
+    ) -> tuple[RiskSettings, Decimal, Decimal]:
+        """ATR tabanlı dinamik stop/hedef ve risk bazlı pozisyon büyüklüğü (asla büyütmez, yalnızca küçültür)."""
+        qty = risk_chk.approved_quantity
+        notional = risk_chk.approved_notional_usdc
+        atr_pct = atr_pct_of_price(tech_signal.atr_14, tech_signal.close_price)
+        sl, tp = dynamic_exits(
+            base_sl=settings.stop_loss_pct,
+            base_tp=settings.take_profit_pct,
+            atr_pct=atr_pct,
+            leverage=settings.leverage,
+        )
+        adjusted = dataclasses.replace(settings, stop_loss_pct=sl, take_profit_pct=tp)
+        risk_pct = getattr(settings, "risk_per_trade_pct", Decimal("0"))
+        price = market.order_book.best_ask or tech_signal.close_price
+        if risk_pct > Decimal("0") and price > Decimal("0") and notional > Decimal("0"):
+            try:
+                equity = self.get_portfolio_summary(settings, bid_map, track=track)["total_equity_usdc"]
+                capped = risk_capped_notional(
+                    equity=equity,
+                    risk_pct=risk_pct,
+                    sl_pct=sl,
+                    fee_rate=settings.estimated_fee_rate,
+                    approved_notional=notional,
+                )
+            except Exception:
+                capped = notional
+            if capped < notional:
+                target = max(capped, market.filters.min_notional * Decimal("1.05"))
+                if target < notional:
+                    new_qty = quantize_down(target / price, market.filters.market_step_size)
+                    if (
+                        new_qty >= max(market.filters.min_qty, market.filters.market_min_qty)
+                        and new_qty * price >= market.filters.min_notional
+                        and new_qty < qty
+                    ):
+                        qty = new_qty
+                        notional = new_qty * price
+        return adjusted, qty, notional
 
     def _resolve_live_unvalued_commissions(self, quote_ccy: str, settings: RiskSettings) -> None:
         """

@@ -713,6 +713,21 @@ class SQLiteStorage:
 
             return realized_today, open_entry_fees_today
 
+    def get_recent_closed_pnls(
+        self, track: str, symbol: str, limit: int = 4
+    ) -> list[tuple[str, Decimal]]:
+        """Bir paritenin son kapanmış pozisyonları (en yeni -> en eski): (kapanış ISO, net K/Z)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT closed_at_iso, realized_pnl_usdc FROM positions
+                WHERE portfolio_track = ? AND symbol = ? AND status = 'CLOSED' AND closed_at_iso IS NOT NULL
+                ORDER BY closed_at_iso DESC LIMIT ?
+                """,
+                (track, symbol, limit),
+            ).fetchall()
+        return [(str(r["closed_at_iso"]), Decimal(str(r["realized_pnl_usdc"] or "0"))) for r in rows]
+
     def get_performance_stats(self, track: str, istanbul_date: str) -> dict[str, Any]:
         """Kapanmış pozisyonlardan net (komisyon dahil) performans özeti ve kapanış nedeni dağılımı."""
         with self._connect() as conn:

@@ -412,6 +412,32 @@ class BinancePublicDataClient:
         ranked.sort(key=lambda x: x["quote_volume_24h"], reverse=True)
         return ranked[:limit]
 
+    def fetch_closed_candles(self, symbol: str, interval: str, limit: int = 60) -> list[Candle]:
+        """Üst zaman dilimi (ör. 15dk) trend onayı için yalnızca kapanmış mumları döndürür."""
+        sym = symbol.strip().upper()
+        raw_klines, _ = self._get_json(
+            "/api/v3/klines", params={"symbol": sym, "interval": interval, "limit": limit}
+        )
+        return extract_closed_candles(raw_klines, server_time_ms=int(time.time() * 1000))
+
+    def fetch_usdt_opportunities(
+        self,
+        limit: int = 30,
+        *,
+        min_quote_volume: float = 25_000_000.0,
+    ) -> list[dict[str, Any]]:
+        """24 saatlik ticker ile likit, hareketli ve dar spreadli Spot USDT fırsat evrenini puanlar."""
+        from .expert import score_universe
+
+        usdt_map = self.discover_spot_pairs(quote_asset="USDT", allow_stablecoin_conversion=False)
+        tickers, _ = self._get_json("/api/v3/ticker/24hr")
+        return score_universe(
+            tickers,
+            tradable_usdt=usdt_map,
+            min_quote_volume=min_quote_volume,
+            limit=limit,
+        )
+
     def fetch_order_book(self, symbol: str, depth_limit: int = 20) -> OrderBookSnapshot:
         """Gerçekçi likidite ve kayma hesabı için emir defteri kademelerini çeker."""
         sym = symbol.strip().upper()

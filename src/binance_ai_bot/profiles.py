@@ -39,6 +39,8 @@ class TradingProfile:
     max_open_positions: int = 1
     min_net_profit_exit_pct: Decimal = Decimal("0")
     max_entry_spread_pct: Decimal = Decimal("0")
+    expert_mode: bool = False
+    risk_per_trade_pct: Decimal = Decimal("0")
     trailing_by_leverage: tuple[tuple[int, Decimal], ...] = ()
 
     def trailing_stop_for(self, leverage: int) -> Decimal:
@@ -101,6 +103,8 @@ class TradingProfile:
             min_net_profit_exit_pct=adj_min_exit,
             trailing_stop_pct=self.trailing_stop_for(eff_lev),
             max_entry_spread_pct=self.max_entry_spread_pct,
+            expert_mode=self.expert_mode,
+            risk_per_trade_pct=self.risk_per_trade_pct,
         )
 
 
@@ -137,6 +141,8 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         max_open_positions=5,
         min_net_profit_exit_pct=Decimal("0.0080"),
         max_entry_spread_pct=Decimal("0.0012"),
+        expert_mode=True,
+        risk_per_trade_pct=Decimal("0.02"),
         trailing_by_leverage=(
             (1, Decimal("0.0040")),
             (2, Decimal("0.0030")),

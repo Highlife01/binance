@@ -183,6 +183,7 @@
         <div id="perfSummary" style="font-size:0.95rem;line-height:1.7;">—</div>
         <div id="perfReasons" style="font-size:0.85rem;opacity:0.85;margin-top:6px;"></div>
         <div id="perfFooter" style="font-size:0.8rem;opacity:0.7;margin-top:6px;"></div>
+        <div id="perfUniverse" style="font-size:0.8rem;opacity:0.8;margin-top:6px;"></div>
       </div>
 
       <!-- Hizli Eylem ve Ayarlar -->
@@ -476,6 +477,10 @@
           `Ort. kazanç: ${p.avg_win} • Ort. kayıp: ${p.avg_loss} • Komisyon: ${p.fees}`;
         $("perfReasons").textContent = (p.by_reason || [])
           .map((r) => `${r.reason}: ${r.count} işlem (${r.pnl})`).join("  |  ");
+      }
+      if (d.universe && d.universe.length) {
+        $("perfUniverse").textContent = "🔎 Fırsat evreni (puan | 24s aralık %): " +
+          d.universe.map((u) => `${u.symbol.replace("USDT", "")} ${Number(u.score).toFixed(2)}|${u.range_pct_24h}%`).join("  ");
       }
       if (d.risk_settings) {
         const cpu = d.cpu_usage || {};

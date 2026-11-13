@@ -43,6 +43,7 @@ import requests
 from binance_ai_bot.config import AppConfig
 from binance_ai_bot.domain import RiskSettings, is_substep_dust_position
 from binance_ai_bot.engine import StepCycleSummary, TradingSystemEngine
+from binance_ai_bot.expert import pick_scan_symbols
 from binance_ai_bot.live_executor import LiveExecutionError
 from binance_ai_bot.market_data import MarketDataError
 from binance_ai_bot.notifier import TelegramNotifier
@@ -508,6 +509,53 @@ class CloudBotApplication:
                 pass
         return bids
 
+    def _dynamic_scan_symbols(self, eng: TradingSystemEngine, core: list[str]) -> list[str]:
+        """
+        Sabit 10 coin yerine likit + hareketli + dar spreadli geniş fırsat evrenini (30 parite) 30 dakikada bir
+        puanlar; tick başına tarama bütçesini (CPU/maliyet) sabit tutarak döngüsel (round-robin) tarar.
+        Veri alınamazsa çekirdek listeye geri döner (fail-safe).
+        """
+        st = eng.storage
+        if st.get_state("cloud_dynamic_scan", "1") != "1":
+            return core
+        fetch = getattr(eng.market_client, "fetch_usdt_opportunities", None)
+        if fetch is None:
+            return core
+        raw = st.get_state("cloud_universe_json", "")
+        try:
+            last_ts = float(st.get_state("cloud_universe_ts", "0") or "0")
+        except ValueError:
+            last_ts = 0.0
+        if not raw or (time.time() - last_ts) > 1800:
+            try:
+                ranked_new = fetch(limit=30)
+                if ranked_new:
+                    raw = json.dumps(ranked_new, ensure_ascii=False)
+                    st.set_state("cloud_universe_json", raw)
+                    st.set_state("cloud_universe_ts", str(time.time()))
+            except Exception as exc:
+                logging.warning("Fırsat evreni güncellenemedi: %s", _safe_text(exc, 120))
+        try:
+            ranked = json.loads(raw) if raw else []
+        except ValueError:
+            ranked = []
+        universe = [
+            str(r.get("symbol", "")).upper()
+            for r in ranked
+            if _SYMBOL_RE.fullmatch(str(r.get("symbol", "")).upper())
+            and str(r.get("symbol", "")).upper().endswith("USDT")
+        ]
+        if not universe:
+            return core
+        try:
+            budget = max(6, min(20, int(st.get_state("cloud_scan_budget", "14") or "14")))
+            cursor = int(st.get_state("cloud_scan_cursor", "0") or "0")
+        except ValueError:
+            budget, cursor = 14, 0
+        picked, next_cursor = pick_scan_symbols(core=core, universe=universe, budget=budget, cursor=cursor)
+        st.set_state("cloud_scan_cursor", str(next_cursor))
+        return picked
+
     def _run_scan_cycle(self, eng: TradingSystemEngine, *, source: str) -> dict[str, Any]:
         t_cycle_start = time.monotonic()
         params = self._active_cloud_params(eng)
@@ -516,7 +564,7 @@ class CloudBotApplication:
         track: str = params["track"]
         profile: TradingProfile = params["profile"]
         settings: RiskSettings = params["settings"]
-        scan_symbols: list[str] = params["symbols"]
+        scan_symbols: list[str] = self._dynamic_scan_symbols(eng, params["symbols"])
         ai_enabled: bool = params["ai_enabled"]
         ai_force: bool = params["ai_force"]
         use_ai_now = ai_force if profile.direct_rule_execution else ai_enabled
@@ -880,6 +928,11 @@ class CloudBotApplication:
         }
         month_key = f"cloud_cpu_sec:{now_dt.isoformat()[:7]}"
         try:
+            universe_rows = json.loads(st.get_state("cloud_universe_json", "") or "[]")[:15]
+        except ValueError:
+            universe_rows = []
+        universe_ts = st.get_state("cloud_universe_ts", "") or None
+        try:
             cpu_used = float(st.get_state(month_key, "0") or "0")
         except ValueError:
             cpu_used = 0.0
@@ -917,6 +970,8 @@ class CloudBotApplication:
             "performance": perf_payload,
             "cpu_usage": cpu_payload,
             "telegram_enabled": self.notifier.enabled,
+            "universe": universe_rows,
+            "universe_updated_ts": universe_ts,
             "ai_force": params["ai_force"],
             "ai_mode": params["ai_mode"],
             "has_gemini_key": eng.config.has_gemini_key,

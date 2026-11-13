@@ -219,6 +219,8 @@ class RiskSettings:
     min_net_profit_exit_pct: Decimal = Decimal("0")  # >0 ise teknik SAT sinyalinde zararına çıkmaz, bu kâr eşiğini bekler
     trailing_stop_pct: Decimal = Decimal("0")  # >0 ise Kâr-Al hedefinde satmak yerine hareket eden (trailing) stop devreye girer
     max_entry_spread_pct: Decimal = Decimal("0")  # >0 ise alış-satış farkı bu orandan genişse yeni alım yapılmaz
+    expert_mode: bool = False  # True: çoklu zaman dilimi/BTC rejimi filtresi, ATR dinamik stop/hedef, zarar serisi bekletmesi
+    risk_per_trade_pct: Decimal = Decimal("0")  # >0 ise işlem başına kayıp bütçesi = özsermaye x bu oran (pozisyon büyüklüğü tavanı)
 
 
 @dataclass(frozen=True)
