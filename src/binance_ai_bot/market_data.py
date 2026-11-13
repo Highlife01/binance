@@ -217,6 +217,7 @@ class BinancePublicDataClient:
     ) -> None:
         self.config = config
         self._external_client = http_client
+        self._shared_client: httpx.Client | None = None
         self._base_urls = self._build_base_url_list()
         self._exchange_info_cache: dict[str, SymbolFilters] = {}
         self._exchange_info_fetched_at: float = 0.0
@@ -270,8 +271,7 @@ class BinancePublicDataClient:
             )
 
         last_error_msg = "Bilinmeyen veri hatası."
-        client_to_use = self._external_client or httpx.Client(timeout=8.0)
-        close_after = self._external_client is None
+        client_to_use = self._get_client()
 
         try:
             for base_url in self._base_urls:
@@ -281,8 +281,17 @@ class BinancePublicDataClient:
                 try:
                     resp = client_to_use.get(full_url, params=params)
                 except Exception as exc:
-                    last_error_msg = _friendly_network_error(exc, full_url)
-                    continue
+                    if self._external_client is not None:
+                        last_error_msg = _friendly_network_error(exc, full_url)
+                        continue
+                    # Bayat keep-alive bağlantısı olabilir: istemciyi yenileyip bir kez daha dene
+                    self._reset_client()
+                    client_to_use = self._get_client()
+                    try:
+                        resp = client_to_use.get(full_url, params=params)
+                    except Exception as exc2:
+                        last_error_msg = _friendly_network_error(exc2, full_url)
+                        continue
 
                 weight_hdr = resp.headers.get("X-MBX-USED-WEIGHT-1M")
                 if weight_hdr and weight_hdr.isdigit():
@@ -318,8 +327,30 @@ class BinancePublicDataClient:
             self._cooldown_until_monotonic = time.monotonic() + backoff_sec
             raise MarketDataError(last_error_msg)
         finally:
-            if close_after:
-                client_to_use.close()
+            pass
+
+    def _get_client(self) -> httpx.Client:
+        """
+        Kalıcı (keep-alive) HTTP istemcisi: her istekte yeni TCP bağlantısı açmak Cloud NAT port
+        havuzunu tüketip "No route to host" hatalarına yol açıyordu; bağlantılar yeniden kullanılır.
+        """
+        if self._external_client is not None:
+            return self._external_client
+        if self._shared_client is None:
+            self._shared_client = httpx.Client(
+                timeout=8.0,
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=30.0),
+            )
+        return self._shared_client
+
+    def _reset_client(self) -> None:
+        client = self._shared_client
+        self._shared_client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def discover_spot_pairs(
         self,
