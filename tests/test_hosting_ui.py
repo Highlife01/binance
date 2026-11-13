@@ -44,6 +44,7 @@ def test_dashboard_dom_ids_and_required_controls() -> None:
         "authError",
         "appSection",
         "modeBanner",
+        "marginQuickBanner",
         "lastErrorAlert",
         "toastAlert",
         "mEquity",
@@ -99,6 +100,8 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "/api/margin-liquidate" in js
     assert "btn-margin-liq" in js
     assert "renderWalletData" in js
+    assert "handleMarginLiqClick" in js
+    assert "autoLoadWalletOnce" in js
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:

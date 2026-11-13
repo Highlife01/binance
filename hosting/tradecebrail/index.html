@@ -893,6 +893,7 @@
     <!-- Ana Kontrol Paneli -->
     <main id="appSection" class="hidden">
       <div id="modeBanner" class="banner">Yükleniyor...</div>
+      <div id="marginQuickBanner" class="banner banner-margin hidden"></div>
       <div id="lastErrorAlert" class="alert hidden">
         <span id="lastErrorText"></span>
         <button id="dismissLastErrBtn" class="alert-close" type="button" title="Gizle">×</button>
@@ -1044,6 +1045,17 @@
         <div class="heartbeat-strip" id="heartbeatInfo">Son tarama bilgisi yükleniyor...</div>
       </section>
 
+      <!-- Gerçek Binance Cüzdan Özeti -->
+      <section class="section">
+        <div class="section-head">
+          <h3>💼 Gerçek Binance Cüzdanım (Spot + Çapraz Marjin + Simple Earn)</h3>
+          <button id="checkWalletBtn" type="button">🔄 Cüzdanı Yenile</button>
+        </div>
+        <div id="walletContent" class="muted">
+          Gerçek Binance cüzdanınız yükleniyor...
+        </div>
+      </section>
+
       <!-- Açık Pozisyonlar -->
       <section class="section">
         <div class="section-head">
@@ -1069,17 +1081,6 @@
               <tr><td colspan="9" class="muted">Açık pozisyon bulunmuyor.</td></tr>
             </tbody>
           </table>
-        </div>
-      </section>
-
-      <!-- Gerçek Binance Cüzdan Özeti -->
-      <section class="section">
-        <div class="section-head">
-          <h3>💼 Gerçek Binance Cüzdanım (Spot + Simple Earn)</h3>
-          <button id="checkWalletBtn" type="button">🔍 Gerçek Binance Cüzdanımı Sorgula</button>
-        </div>
-        <div id="walletContent" class="muted">
-          Gerçek Binance hesabınızdaki Spot ve Simple Earn (Kazan) varlıklarını görmek için sağdaki düğmeye tıklayın.
         </div>
       </section>
 
@@ -1207,6 +1208,7 @@
     let decSearchText = "";
     let renderSigs = {};
     let chartState = null;
+    let walletAutoLoaded = false;
 
     $("pollIntervalSel").value = String(pollIntervalMs);
 
@@ -2125,9 +2127,36 @@
 
     function renderWalletData(w) {
       const box = $("walletContent");
+      const qBanner = $("marginQuickBanner");
       if (!w || !w.ok) {
+        if (qBanner) {
+          qBanner.classList.add("hidden");
+          qBanner.innerHTML = "";
+        }
         box.innerHTML = `<div class="alert" style="margin:0;"><span>${esc((w && w.error) || "Cüzdan sorgulanamadı.")}</span></div>`;
         return;
+      }
+      const liqRows = (w.rows || []).filter((r) => r.can_margin_liquidate && r.raw_asset);
+      if (qBanner) {
+        if (liqRows.length > 0) {
+          const debtTxt = Number(w.margin_borrowed_usdt || 0) > 0
+            ? ` · Marjin Borcu: <b>~${esc(w.margin_borrowed_usdt)} USDT</b>`
+            : "";
+          const itemsTxt = liqRows
+            .map((r) => `<b>${esc(r.raw_asset)}</b> (${esc(r.free_quantity || r.quantity)} · ~${esc(r.value_usdt)} USDT)`)
+            .join(", ");
+          const btnsHtml = liqRows
+            .map(
+              (r) =>
+                `<button type="button" class="btn-amber btn-margin-liq" data-asset="${esc(r.raw_asset)}" data-qty="${esc(r.free_quantity || r.quantity)}" data-usd="${esc(r.value_usdt)}" style="font-weight:700;padding:8px 14px;font-size:0.86rem;">⚡ ${esc(r.raw_asset)} Sat + Borcu Kapat</button>`
+            )
+            .join(" ");
+          qBanner.innerHTML = `<div style="line-height:1.45;">⚡ <b>Çapraz Marjin Cüzdanında Satılabilir Bakiye:</b> ${itemsTxt}${debtTxt}</div><div style="display:flex;flex-wrap:wrap;gap:8px;">${btnsHtml}</div>`;
+          qBanner.classList.remove("hidden");
+        } else {
+          qBanner.classList.add("hidden");
+          qBanner.innerHTML = "";
+        }
       }
       const hasMarginInfo = Math.abs(Number(w.margin_usdt || 0)) >= 0.01 || Number(w.margin_borrowed_usdt || 0) > 0;
       let html = `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;">
@@ -2147,7 +2176,7 @@
         </div>`;
       }
       if (w.rows && w.rows.length) {
-        html += `<div class="table-scroll"><table><thead><tr><th>Cüzdan Yeri</th><th>Varlık</th><th class="tr">Miktar</th><th class="tr">Fiyat (USDT)</th><th class="tr">Değer (USDT)</th><th>İşlem</th></tr></thead><tbody>` +
+        html += `<div class="table-scroll"><table><thead><tr><th>Cüzdan Yeri</th><th>Varlık</th><th>İşlem</th><th class="tr">Miktar</th><th class="tr">Fiyat (USDT)</th><th class="tr">Değer (USDT)</th></tr></thead><tbody>` +
           w.rows.map((r) => {
             const actBtn = r.can_margin_liquidate && r.raw_asset
               ? `<button type="button" class="btn-amber btn-margin-liq" data-asset="${esc(r.raw_asset)}" data-qty="${esc(r.free_quantity || r.quantity)}" data-usd="${esc(r.value_usdt)}" style="padding:4px 9px;font-size:0.74rem;">⚡ Sat + Borç Kapat</button>`
@@ -2155,17 +2184,17 @@
             return `<tr>
               <td class="muted">${esc(r.location)}</td>
               <td><b>${esc(r.asset)}</b></td>
+              <td>${actBtn}</td>
               <td class="tr mono">${esc(r.quantity)}</td>
               <td class="tr mono">${esc(r.price_usdt || "—")}</td>
               <td class="tr num"><b>~${esc(r.value_usdt)} USDT</b></td>
-              <td>${actBtn}</td>
             </tr>`;
           }).join("") + `</tbody></table></div>`;
       }
       box.innerHTML = html;
     }
 
-    $("walletContent").addEventListener("click", async (e) => {
+    async function handleMarginLiqClick(e) {
       const btn = e.target.closest(".btn-margin-liq");
       if (!btn) return;
       const asset = btn.getAttribute("data-asset");
@@ -2186,7 +2215,25 @@
       } finally {
         setBtnBusy(btn, false);
       }
-    });
+    }
+
+    $("walletContent").addEventListener("click", handleMarginLiqClick);
+    $("marginQuickBanner").addEventListener("click", handleMarginLiqClick);
+
+    async function autoLoadWalletOnce() {
+      if (walletAutoLoaded || !currentUser) return;
+      if (latestDash && !latestDash.has_binance_live_keys) {
+        $("walletContent").textContent = "Binance API anahtarı tanımlı değil.";
+        return;
+      }
+      walletAutoLoaded = true;
+      try {
+        const w = await apiCall("/api/wallet", "GET", null, 25000);
+        renderWalletData(w);
+      } catch (err) {
+        $("walletContent").innerHTML = `<div class="alert" style="margin:0;"><span>${esc(err.message)}</span></div>`;
+      }
+    }
 
     $("checkWalletBtn").addEventListener("click", async () => {
       const btn = $("checkWalletBtn");
@@ -2218,6 +2265,9 @@
       if (!user) {
         latestDash = null;
         lastFetchOkAt = 0;
+        walletAutoLoaded = false;
+        $("marginQuickBanner").classList.add("hidden");
+        $("marginQuickBanner").innerHTML = "";
         $("authSection").classList.remove("hidden");
         $("appSection").classList.add("hidden");
         $("logoutBtn").classList.add("hidden");
@@ -2233,6 +2283,7 @@
       $("authSection").classList.add("hidden");
       $("appSection").classList.remove("hidden");
       await refreshDashboard({ force: true });
+      autoLoadWalletOnce();
       schedulePoll();
       ageTimer = setInterval(() => {
         if (document.visibilityState === "visible") updateSyncAge();
