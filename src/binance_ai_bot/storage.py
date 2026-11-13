@@ -713,6 +713,54 @@ class SQLiteStorage:
 
             return realized_today, open_entry_fees_today
 
+    def get_performance_stats(self, track: str, istanbul_date: str) -> dict[str, Any]:
+        """Kapanmış pozisyonlardan net (komisyon dahil) performans özeti ve kapanış nedeni dağılımı."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT realized_pnl_usdc, close_reason, closed_istanbul_date, entry_fee_usdc, exit_fee_usdc
+                FROM positions
+                WHERE portfolio_track = ? AND status = 'CLOSED'
+                """,
+                (track,),
+            ).fetchall()
+        total = Decimal("0")
+        today = Decimal("0")
+        wins = losses = today_count = 0
+        gross_win = gross_loss = fees = Decimal("0")
+        reasons: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            pnl = Decimal(str(r["realized_pnl_usdc"] or "0"))
+            total += pnl
+            fees += Decimal(str(r["entry_fee_usdc"] or "0")) + Decimal(str(r["exit_fee_usdc"] or "0"))
+            if pnl > 0:
+                wins += 1
+                gross_win += pnl
+            elif pnl < 0:
+                losses += 1
+                gross_loss += pnl
+            if r["closed_istanbul_date"] == istanbul_date:
+                today += pnl
+                today_count += 1
+            reason = str(r["close_reason"] or "BILINMIYOR")
+            bucket = reasons.setdefault(reason, {"count": 0, "pnl": Decimal("0")})
+            bucket["count"] += 1
+            bucket["pnl"] += pnl
+        closed = len(rows)
+        return {
+            "closed_count": closed,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": (Decimal(wins) / Decimal(closed) * Decimal("100")) if closed else Decimal("0"),
+            "net_pnl": total,
+            "today_net_pnl": today,
+            "today_closed": today_count,
+            "avg_win": (gross_win / Decimal(wins)) if wins else Decimal("0"),
+            "avg_loss": (gross_loss / Decimal(losses)) if losses else Decimal("0"),
+            "fees": fees,
+            "by_reason": reasons,
+        }
+
     def get_total_realized_pnl_and_fees(self, track: str = "MAIN") -> tuple[Decimal, Decimal]:
         with self._connect() as conn:
             pos_rows = conn.execute(

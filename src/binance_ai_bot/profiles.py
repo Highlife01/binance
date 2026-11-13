@@ -38,6 +38,13 @@ class TradingProfile:
     direct_rule_execution: bool = False
     max_open_positions: int = 1
     min_net_profit_exit_pct: Decimal = Decimal("0")
+    max_entry_spread_pct: Decimal = Decimal("0")
+    trailing_by_leverage: tuple[tuple[int, Decimal], ...] = ()
+
+    def trailing_stop_for(self, leverage: int) -> Decimal:
+        """Kaldıraca göre hareket eden stop mesafesi (fiyat yüzdesi); tanımsızsa 0 (kapalı)."""
+        eff_lev = max(1, min(5, int(leverage)))
+        return dict(self.trailing_by_leverage).get(eff_lev, Decimal("0"))
 
     def leverage_adjusted_targets(
         self, leverage: int
@@ -92,6 +99,8 @@ class TradingProfile:
                 base, "hourly_margin_interest_rate", Decimal("0.000005")
             ),
             min_net_profit_exit_pct=adj_min_exit,
+            trailing_stop_pct=self.trailing_stop_for(eff_lev),
+            max_entry_spread_pct=self.max_entry_spread_pct,
         )
 
 
@@ -127,6 +136,14 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
         direct_rule_execution=True,
         max_open_positions=5,
         min_net_profit_exit_pct=Decimal("0.0080"),
+        max_entry_spread_pct=Decimal("0.0012"),
+        trailing_by_leverage=(
+            (1, Decimal("0.0040")),
+            (2, Decimal("0.0030")),
+            (3, Decimal("0.0025")),
+            (4, Decimal("0.0022")),
+            (5, Decimal("0.0020")),
+        ),
     ),
     "HIZLI_30SN": TradingProfile(
         key="HIZLI_30SN",

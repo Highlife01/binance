@@ -45,6 +45,7 @@ from binance_ai_bot.domain import RiskSettings, is_substep_dust_position
 from binance_ai_bot.engine import StepCycleSummary, TradingSystemEngine
 from binance_ai_bot.live_executor import LiveExecutionError
 from binance_ai_bot.market_data import MarketDataError
+from binance_ai_bot.notifier import TelegramNotifier
 from binance_ai_bot.profiles import TRADING_PROFILES, TradingProfile, get_profile
 from binance_ai_bot.risk import compute_open_position_unrealized_net_pnl
 from binance_ai_bot.runner import DEFAULT_SCAN_SYMBOLS
@@ -307,6 +308,7 @@ class CloudBotApplication:
         self._engine: TradingSystemEngine | None = engine
         self._initialized = engine is not None
         self._bid_cache: dict[str, tuple[float, Decimal]] = {}
+        self.notifier = TelegramNotifier()
 
         if self._engine is not None:
             self._engine.lock_benchmark_symbol = True
@@ -434,6 +436,24 @@ class CloudBotApplication:
             lev = 1
         elif mode == "LIVE_MARGIN":
             lev = max(2, min(5, lev))
+        lev_selected = lev
+        derate_reason = ""
+        if mode == "LIVE_MARGIN" and lev > 2:
+            # Dinamik kaldıraç: kullanıcının seçtiği değer TAVANDIR, asla aşılmaz; risk artınca 2x'e düşer.
+            try:
+                m_level = Decimal(st.get_state("live_margin_level", "999") or "999")
+            except InvalidOperation:
+                m_level = Decimal("999")
+            realized_today, _ = st.get_daily_realized_pnl_and_entry_fees(
+                st.istanbul_date_str(self.now().astimezone(timezone.utc)), "LIVE_MARGIN"
+            )
+            loss_limit = eng.default_risk_settings().daily_loss_limit_usdc
+            if Decimal("0") < m_level < Decimal("1.35"):
+                lev = 2
+                derate_reason = f"Marjin seviyesi düşük ({m_level:.2f}); yeni alımlar 2x'e indirildi."
+            elif realized_today <= -(loss_limit * Decimal("0.5")):
+                lev = 2
+                derate_reason = "Günlük zarar eşiğinin yarısı aşıldı; yeni alımlar 2x'e indirildi."
 
         saved_risk = eng.default_risk_settings()
         eff_settings = profile.apply_to_risk_settings(saved_risk, leverage=lev)
@@ -459,6 +479,8 @@ class CloudBotApplication:
             "track": track,
             "profile": profile,
             "leverage": lev,
+            "leverage_selected": lev_selected,
+            "derate_reason": derate_reason,
             "settings": eff_settings,
             "symbols": symbols,
             "ai_enabled": ai_enabled,
@@ -487,6 +509,7 @@ class CloudBotApplication:
         return bids
 
     def _run_scan_cycle(self, eng: TradingSystemEngine, *, source: str) -> dict[str, Any]:
+        t_cycle_start = time.monotonic()
         params = self._active_cloud_params(eng)
         st = eng.storage
         mode: str = params["mode"]
@@ -552,6 +575,9 @@ class CloudBotApplication:
                 self._bid_cache[sym] = (time.monotonic(), eng._latest_bid_map[sym])
             if res.executed_order is not None and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED"):
                 orders_executed += 1
+                if mode != "PAPER":
+                    mode_tag = "MARJİN" if is_live_margin else "SPOT"
+                    self.notifier.send(f"[{mode_tag}] {res.executed_order.side} {sym}: {res.block_or_info_message}")
             if res.error_message and not last_error:
                 last_error = self._friendly_live_error(res.error_message)
             scanned.append(
@@ -584,7 +610,27 @@ class CloudBotApplication:
         }
         st.set_state("cloud_last_tick_iso", now_iso)
         st.set_state("cloud_last_tick_summary_json", json.dumps(summary_obj, ensure_ascii=False))
+        cpu_key = f"cloud_cpu_sec:{now_iso[:7]}"
+        try:
+            cpu_total = float(st.get_state(cpu_key, "0") or "0")
+        except ValueError:
+            cpu_total = 0.0
+        st.set_state(cpu_key, f"{cpu_total + (time.monotonic() - t_cycle_start):.2f}")
+        prev_error = st.get_state("cloud_last_error", "")
         st.set_state("cloud_last_error", last_error)
+        if self.notifier.enabled:
+            now_ts = time.time()
+            if last_error and last_error != prev_error:
+                self.notifier.send(f"⚠️ Bot uyarısı: {last_error}")
+            if is_live_margin:
+                try:
+                    m_lvl = Decimal(st.get_state("live_margin_level", "999") or "999")
+                except InvalidOperation:
+                    m_lvl = Decimal("999")
+                last_warn = float(st.get_state("cloud_margin_warn_ts", "0") or "0")
+                if Decimal("0") < m_lvl < Decimal("1.30") and (now_ts - last_warn) > 1800:
+                    self.notifier.send(f"🚨 Marjin seviyesi düşük: {m_lvl:.2f} (likidasyon ~1.10). Pozisyonları kontrol edin.")
+                    st.set_state("cloud_margin_warn_ts", str(now_ts))
         self.state_sync.persist(self.config.db_path)
         return summary_obj
 
@@ -815,6 +861,34 @@ class CloudBotApplication:
         )
 
         quote_ccy = summary.get("quote_asset") or "USDT"
+        perf = st.get_performance_stats(track, ist_today)
+        perf_payload = {
+            "closed_count": perf["closed_count"],
+            "wins": perf["wins"],
+            "losses": perf["losses"],
+            "win_rate_pct": _dec_str(perf["win_rate_pct"], "0.1"),
+            "net_pnl": _dec_str(perf["net_pnl"], "0.0001"),
+            "today_net_pnl": _dec_str(perf["today_net_pnl"], "0.0001"),
+            "today_closed": perf["today_closed"],
+            "avg_win": _dec_str(perf["avg_win"], "0.0001"),
+            "avg_loss": _dec_str(perf["avg_loss"], "0.0001"),
+            "fees": _dec_str(perf["fees"], "0.0001"),
+            "by_reason": [
+                {"reason": _safe_text(k, 40), "count": v["count"], "pnl": _dec_str(v["pnl"], "0.0001")}
+                for k, v in sorted(perf["by_reason"].items(), key=lambda kv: -kv[1]["count"])
+            ],
+        }
+        month_key = f"cloud_cpu_sec:{now_dt.isoformat()[:7]}"
+        try:
+            cpu_used = float(st.get_state(month_key, "0") or "0")
+        except ValueError:
+            cpu_used = 0.0
+        cpu_payload = {
+            "month_sec": round(cpu_used, 1),
+            "free_tier_sec": 180000,
+            "percent_of_free_tier": round(cpu_used / 180000 * 100, 2),
+            "note": "Yalnızca tarama süresi (alt sınır); gerçek faturalama için Google Cloud Billing'e bakın.",
+        }
         return {
             "schema_version": 2,
             "environment": "cloud",
@@ -838,6 +912,11 @@ class CloudBotApplication:
             "interval": profile.interval,
             "leverage": settings.leverage,
             "ai_enabled": params["ai_enabled"],
+            "leverage_selected": params["leverage_selected"],
+            "derate_reason": params["derate_reason"],
+            "performance": perf_payload,
+            "cpu_usage": cpu_payload,
+            "telegram_enabled": self.notifier.enabled,
             "ai_force": params["ai_force"],
             "ai_mode": params["ai_mode"],
             "has_gemini_key": eng.config.has_gemini_key,
@@ -867,6 +946,8 @@ class CloudBotApplication:
                 "stop_loss_pct": _dec_str(settings.stop_loss_pct * Decimal("100"), "0.01"),
                 "take_profit_pct": _dec_str(settings.take_profit_pct * Decimal("100"), "0.01"),
                 "min_net_profit_exit_pct": _dec_str(settings.min_net_profit_exit_pct * Decimal("100"), "0.02"),
+                "trailing_stop_pct": _dec_str(settings.trailing_stop_pct * Decimal("100"), "0.01"),
+                "max_entry_spread_pct": _dec_str(settings.max_entry_spread_pct * Decimal("100"), "0.01"),
             },
             "ai_usage": {
                 "today_network_calls": ai_summary["today_network_calls"],
@@ -1072,13 +1153,16 @@ class CloudBotApplication:
             for pos in st.get_open_positions(track=active_p["track"]):
                 if is_substep_dust_position(pos):
                     continue
+                if pos.stop_loss_price is not None and pos.stop_loss_price > pos.entry_price:
+                    continue  # trailing stop ile kâra kilitlenmiş pozisyonun hedeflerini geriye alma
+                pos_sl, pos_tp, _ = active_p["profile"].leverage_adjusted_targets(max(1, int(pos.leverage)))
                 st.update_position_remaining(
                     pos.position_id,
                     quantity=pos.quantity,
                     cost_basis_usdc=pos.cost_basis_usdc,
                     entry_fee_usdc=pos.entry_fee_usdc,
-                    stop_loss_price=pos.entry_price * (Decimal("1") - eff_s.stop_loss_pct),
-                    take_profit_price=pos.entry_price * (Decimal("1") + eff_s.take_profit_pct),
+                    stop_loss_price=pos.entry_price * (Decimal("1") - pos_sl),
+                    take_profit_price=pos.entry_price * (Decimal("1") + pos_tp),
                     update_exit_targets=True,
                 )
 

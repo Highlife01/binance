@@ -521,15 +521,52 @@ class TradingSystemEngine:
                 )
 
         # Açık pozisyonun Likidasyon, Zarar-Kes (Stop-Loss) veya Kâr-Al (Take-Profit) kontrolü
+        trailing_note = ""
         if symbol_open_pos is not None:
             pos = symbol_open_pos
             liq_hit = pos.liquidation_price is not None and best_bid <= pos.liquidation_price
             stop_hit = pos.stop_loss_price is not None and best_bid <= pos.stop_loss_price
             tp_hit = pos.take_profit_price is not None and best_bid >= pos.take_profit_price
+
+            # Hareket eden (trailing) stop: Kâr-Al hedefine ulaşınca hemen satmak yerine stop'u kârın
+            # üzerine çekip hedefi yukarı taşır; güçlü yükselişin devamını yakalar, düşüşte kâr kilitli kalır.
+            trail_pct = getattr(settings, "trailing_stop_pct", Decimal("0"))
+            if tp_hit and not liq_hit and not stop_hit and trail_pct > Decimal("0"):
+                lock_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
+                if getattr(pos, "borrowed_usdc", Decimal("0")) > Decimal("0") and pos.cost_basis_usdc > Decimal("0"):
+                    lock_pct += compute_accrued_margin_interest(
+                        pos, now_utc, getattr(settings, "hourly_margin_interest_rate", Decimal("0.000005"))
+                    ) / pos.cost_basis_usdc
+                floor_px = pos.entry_price * (Decimal("1") + lock_pct)
+                new_stop = max(best_bid * (Decimal("1") - trail_pct), floor_px, pos.stop_loss_price or Decimal("0"))
+                if new_stop < best_bid:
+                    self.storage.update_position_remaining(
+                        pos.position_id,
+                        quantity=pos.quantity,
+                        cost_basis_usdc=pos.cost_basis_usdc,
+                        entry_fee_usdc=pos.entry_fee_usdc,
+                        stop_loss_price=new_stop,
+                        take_profit_price=best_bid * (Decimal("1") + trail_pct),
+                        update_exit_targets=True,
+                    )
+                    tp_hit = False
+                    trailing_note = (
+                        f"{market.symbol} trailing stop yükseltildi: {new_stop:.6g} (anlık {best_bid:.6g})."
+                    )
             if liq_hit or stop_hit or tp_hit:
                 if stop_requested and stop_requested():
                     return blocked("Durdurma isteği alındı; emir gönderilmedi.")
-                exit_tag = "LIKIDASYON" if liq_hit else ("ZARAR_KES" if stop_hit else "KAR_AL")
+                locked_trailing = (
+                    stop_hit
+                    and not liq_hit
+                    and pos.stop_loss_price is not None
+                    and pos.stop_loss_price > pos.entry_price
+                )
+                exit_tag = (
+                    "LIKIDASYON"
+                    if liq_hit
+                    else ("TRAILING_KAR" if locked_trailing else ("ZARAR_KES" if stop_hit else "KAR_AL"))
+                )
                 exit_sig = f"{exit_tag}:{pos.position_id}:{tech_signal.candle_open_time_ms}"
                 if is_live_spot:
                     closed_ord = self.live_executor.execute_live_market_sell(
@@ -602,6 +639,8 @@ class TradingSystemEngine:
         info_msg = ai_decision.reason
         block_reason: str | None = None
         min_profit_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
+        if trailing_note:
+            info_msg = trailing_note
 
         # "Al & Kârı Görünce Sat" koruması:
         # 1) Fiyat net kâr eşiğinin (+min_net_profit_exit_pct + varsa birikmiş marjin faizi) üzerine çıktıysa ve teknik ivme SAT diyorsa anında kârı kilitle.
@@ -648,6 +687,17 @@ class TradingSystemEngine:
                     info_msg = block_reason
                 elif not 0 <= (datetime.now(timezone.utc) - market.order_book.fetched_at_utc).total_seconds() <= self.config.max_data_age_seconds:
                     block_reason = "Karar beklenirken piyasa fiyatı eskidi; yeni alım için güncel veri bekleniyor."
+                    info_msg = block_reason
+                elif (
+                    getattr(settings, "max_entry_spread_pct", Decimal("0")) > Decimal("0")
+                    and mid_price > Decimal("0")
+                    and (best_ask - best_bid) / mid_price > settings.max_entry_spread_pct
+                ):
+                    spread_now = (best_ask - best_bid) / mid_price
+                    block_reason = (
+                        f"{market.symbol} alış-satış farkı geniş (%{spread_now * Decimal('100'):.3f} > "
+                        f"%{settings.max_entry_spread_pct * Decimal('100'):.3f}); maliyet kârı yiyeceği için alım atlandı."
+                    )
                     info_msg = block_reason
                 else:
                     risk_chk = self.risk_manager.check_buy_entry(

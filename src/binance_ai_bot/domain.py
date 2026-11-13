@@ -217,6 +217,8 @@ class RiskSettings:
     leverage: int = 1  # 1 = Kaldıraçsız Spot, 2..5 = Çapraz Marjin / Sanal Kaldıraç çarpanı
     hourly_margin_interest_rate: Decimal = Decimal("0.000005")  # ~%0.0005/saat (~%0.012/gün)
     min_net_profit_exit_pct: Decimal = Decimal("0")  # >0 ise teknik SAT sinyalinde zararına çıkmaz, bu kâr eşiğini bekler
+    trailing_stop_pct: Decimal = Decimal("0")  # >0 ise Kâr-Al hedefinde satmak yerine hareket eden (trailing) stop devreye girer
+    max_entry_spread_pct: Decimal = Decimal("0")  # >0 ise alış-satış farkı bu orandan genişse yeni alım yapılmaz
 
 
 @dataclass(frozen=True)

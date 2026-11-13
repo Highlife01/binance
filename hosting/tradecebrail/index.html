@@ -177,6 +177,14 @@
         </div>
       </div>
 
+      <!-- Performans Ozeti -->
+      <div class="controls-panel" id="perfPanel">
+        <div class="section-head"><h3>📈 Performans (Komisyon + Faiz Dahil Net)</h3></div>
+        <div id="perfSummary" style="font-size:0.95rem;line-height:1.7;">—</div>
+        <div id="perfReasons" style="font-size:0.85rem;opacity:0.85;margin-top:6px;"></div>
+        <div id="perfFooter" style="font-size:0.8rem;opacity:0.7;margin-top:6px;"></div>
+      </div>
+
       <!-- Hizli Eylem ve Ayarlar -->
       <div class="controls-panel">
         <div class="section-head">
@@ -456,6 +464,25 @@
       $("mRealized").innerHTML = pnlHtml(d.realized_pnl, ` ${ccy}`);
       $("mDaily").innerHTML = pnlHtml(d.daily_pnl, ` ${ccy}`);
       $("mLevInfo").textContent = `${d.leverage}x | Borç: ${d.borrowed || "0"} | Kom: ${Number(d.total_fees || 0).toFixed(3)}`;
+      if (d.leverage_selected && Number(d.leverage_selected) !== Number(d.leverage)) {
+        $("mLevInfo").textContent += ` | Seçilen ${d.leverage_selected}x → ${d.derate_reason || "risk nedeniyle düşürüldü"}`;
+      }
+      if (d.performance) {
+        const p = d.performance;
+        $("perfSummary").innerHTML =
+          `Kapanan işlem: <b>${p.closed_count}</b> • Kazanan: <b>${p.wins}</b> • Kaybeden: <b>${p.losses}</b> • ` +
+          `Kazanma oranı: <b>%${p.win_rate_pct}</b><br>Toplam net: ${pnlHtml(p.net_pnl, " " + ccy)} • ` +
+          `Bugün (${p.today_closed} işlem): ${pnlHtml(p.today_net_pnl, " " + ccy)} • ` +
+          `Ort. kazanç: ${p.avg_win} • Ort. kayıp: ${p.avg_loss} • Komisyon: ${p.fees}`;
+        $("perfReasons").textContent = (p.by_reason || [])
+          .map((r) => `${r.reason}: ${r.count} işlem (${r.pnl})`).join("  |  ");
+      }
+      if (d.risk_settings) {
+        const cpu = d.cpu_usage || {};
+        $("perfFooter").textContent =
+          `Trailing stop: %${d.risk_settings.trailing_stop_pct || "0"} • Maks. alış-satış farkı: %${d.risk_settings.max_entry_spread_pct || "0"} • ` +
+          `Telegram: ${d.telegram_enabled ? "açık" : "kapalı"} • Bulut CPU (ay): ${cpu.month_sec || 0} sn (%${cpu.percent_of_free_tier || 0} ücretsiz kota)`;
+      }
 
       // Kontrolleri senkronla (kullanici duzenlemiyorsa)
       if (document.activeElement.tagName !== "SELECT" && document.activeElement.tagName !== "INPUT") {
