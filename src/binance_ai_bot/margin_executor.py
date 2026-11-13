@@ -407,40 +407,18 @@ class BinanceLiveMarginExecutor:
         self.storage.record_order(res, ist_date, track="LIVE_MARGIN")
         return res
 
-    def execute_live_margin_sell(
+    def _submit_margin_sell_and_parse(
         self,
         *,
-        position: Position,
         filters: SymbolFilters,
-        signal_key: str,
-        strategy_source: str,
-        close_reason: str,
+        sell_qty: Decimal,
         ui_live_confirmed: bool,
         ui_margin_confirmed: bool,
-    ) -> SimulatedOrderResult:
-        """
-        Açık Çapraz Marjin pozisyonunu `sideEffectType=AUTO_REPAY` ile satarak kapatır;
-        elde edilen USDT ile birikmiş faiz ve anapara borcunu otomatik öder (asla short borcu açmaz).
-        """
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()
-        ist_date = self.storage.istanbul_date_str(now_utc)
+        id_prefix: str = "MSELL",
+    ) -> dict[str, Any]:
+        """Ortak Çapraz Marjin AUTO_REPAY piyasa satış emri gönderir ve komisyon/fiyatı ayrıştırır."""
         q_ccy = filters.quote_asset
-
-        status_info = self.fetch_live_margin_balances(
-            ui_live_confirmed=ui_live_confirmed,
-            ui_margin_confirmed=ui_margin_confirmed,
-            quote_asset=q_ccy,
-        )
-        free_base = status_info["free_by_asset"].get(filters.base_asset, Decimal("0"))
-        sell_qty = quantize_down(min(position.quantity, free_base), filters.market_step_size)
-        if sell_qty < max(filters.min_qty, filters.market_min_qty) or sell_qty <= Decimal("0"):
-            raise LiveExecutionError(
-                f"Marjin cüzdanında satılabilir yeterli {filters.base_asset} miktarı bulunamadı "
-                f"(serbest: {free_base}, gereken min: {filters.min_qty})."
-            )
-
-        client_oid = f"MSELL{uuid.uuid4().hex[:18].upper()}"
+        client_oid = f"{id_prefix}{uuid.uuid4().hex[:18].upper()}"
         order_params = {
             "symbol": filters.symbol,
             "isIsolated": "FALSE",
@@ -477,9 +455,65 @@ class BinanceLiveMarginExecutor:
                 fill_quote = fill_qty * fill_px if (fill_qty > 0 and fill_px > 0) else cumm_quote
                 exit_fee_usdc += fill_quote * Decimal("0.00075")
 
-        net_proceeds = cumm_quote - exit_fee_usdc
-        realized_pnl = net_proceeds - position.cost_basis_usdc - position.entry_fee_usdc
         order_id = f"MARG-{resp.get('orderId', client_oid)}"
+        return {
+            "order_id": order_id,
+            "status": str(resp.get("status", "FILLED")).upper(),
+            "executed_qty": executed_qty,
+            "cumm_quote": cumm_quote,
+            "avg_price": avg_price,
+            "exit_fee_usdc": exit_fee_usdc,
+            "net_proceeds": cumm_quote - exit_fee_usdc,
+        }
+
+    def execute_live_margin_sell(
+        self,
+        *,
+        position: Position,
+        filters: SymbolFilters,
+        signal_key: str,
+        strategy_source: str,
+        close_reason: str,
+        ui_live_confirmed: bool,
+        ui_margin_confirmed: bool,
+    ) -> SimulatedOrderResult:
+        """
+        Açık Çapraz Marjin pozisyonunu `sideEffectType=AUTO_REPAY` ile satarak kapatır;
+        elde edilen USDT ile birikmiş faiz ve anapara borcunu otomatik öder (asla short borcu açmaz).
+        """
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        ist_date = self.storage.istanbul_date_str(now_utc)
+        q_ccy = filters.quote_asset
+
+        status_info = self.fetch_live_margin_balances(
+            ui_live_confirmed=ui_live_confirmed,
+            ui_margin_confirmed=ui_margin_confirmed,
+            quote_asset=q_ccy,
+        )
+        free_base = status_info["free_by_asset"].get(filters.base_asset, Decimal("0"))
+        sell_qty = quantize_down(min(position.quantity, free_base), filters.market_step_size)
+        if sell_qty < max(filters.min_qty, filters.market_min_qty) or sell_qty <= Decimal("0"):
+            raise LiveExecutionError(
+                f"Marjin cüzdanında satılabilir yeterli {filters.base_asset} miktarı bulunamadı "
+                f"(serbest: {free_base}, gereken min: {filters.min_qty})."
+            )
+
+        parsed = self._submit_margin_sell_and_parse(
+            filters=filters,
+            sell_qty=sell_qty,
+            ui_live_confirmed=ui_live_confirmed,
+            ui_margin_confirmed=ui_margin_confirmed,
+            id_prefix="MSELL",
+        )
+        executed_qty = parsed["executed_qty"]
+        cumm_quote = parsed["cumm_quote"]
+        avg_price = parsed["avg_price"]
+        exit_fee_usdc = parsed["exit_fee_usdc"]
+        net_proceeds = parsed["net_proceeds"]
+        order_id = parsed["order_id"]
+
+        realized_pnl = net_proceeds - position.cost_basis_usdc - position.entry_fee_usdc
 
         self.storage.update_position_closed(
             position.position_id,
@@ -521,3 +555,151 @@ class BinanceLiveMarginExecutor:
         )
         self.storage.record_order(res, ist_date, track="LIVE_MARGIN")
         return res
+
+    def liquidate_free_margin_asset(
+        self,
+        *,
+        filters: SymbolFilters,
+        ui_live_confirmed: bool,
+        ui_margin_confirmed: bool,
+        estimated_bid: Decimal | None = None,
+    ) -> dict[str, Any]:
+        """
+        Çapraz Marjin cüzdanındaki satılabilir serbest varlık bakiyesini tek seferde
+        `sideEffectType=AUTO_REPAY` ile satar, varsa borcu kapatır ve açık DB marjin
+        pozisyon kayıtlarını da senkronize eder.
+        """
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        ist_date = self.storage.istanbul_date_str(now_utc)
+        q_ccy = filters.quote_asset
+
+        status_info = self.fetch_live_margin_balances(
+            ui_live_confirmed=ui_live_confirmed,
+            ui_margin_confirmed=ui_margin_confirmed,
+            quote_asset=q_ccy,
+        )
+        free_base = status_info["free_by_asset"].get(filters.base_asset, Decimal("0"))
+        sell_qty = quantize_down(free_base, filters.market_step_size)
+        min_req_qty = max(filters.min_qty, filters.market_min_qty)
+        if sell_qty < min_req_qty or sell_qty <= Decimal("0"):
+            raise LiveExecutionError(
+                f"Çapraz Marjin cüzdanında satılabilir yeterli {filters.base_asset} bulunamadı "
+                f"(serbest: {free_base}, gereken min: {min_req_qty})."
+            )
+        if estimated_bid is not None and estimated_bid > Decimal("0"):
+            est_notional = sell_qty * estimated_bid
+            if est_notional < filters.min_notional:
+                raise LiveExecutionError(
+                    f"Satılabilir {sell_qty} {filters.base_asset} tutarı (~{est_notional:.2f} {q_ccy}) "
+                    f"borsa minimum emir alt sınırının ({filters.min_notional:.2f} {q_ccy}) altında."
+                )
+
+        parsed = self._submit_margin_sell_and_parse(
+            filters=filters,
+            sell_qty=sell_qty,
+            ui_live_confirmed=ui_live_confirmed,
+            ui_margin_confirmed=ui_margin_confirmed,
+            id_prefix="MLIQ",
+        )
+        executed_qty = parsed["executed_qty"]
+        cumm_quote = parsed["cumm_quote"]
+        avg_price = parsed["avg_price"]
+        exit_fee_usdc = parsed["exit_fee_usdc"]
+        net_proceeds = parsed["net_proceeds"]
+        order_id = parsed["order_id"]
+
+        open_positions = [
+            p for p in self.storage.get_open_positions(track="LIVE_MARGIN") if p.symbol == filters.symbol
+        ]
+        remaining_sold = executed_qty
+        closed_positions = 0
+        matched_pnl = Decimal("0")
+        for pos in open_positions:
+            if remaining_sold <= Decimal("0"):
+                break
+            if remaining_sold >= pos.quantity:
+                pos_gross = pos.quantity * avg_price
+                pos_fee = (
+                    exit_fee_usdc * (pos.quantity / executed_qty)
+                    if executed_qty > Decimal("0")
+                    else Decimal("0")
+                )
+                pos_pnl = (pos_gross - pos_fee) - pos.cost_basis_usdc - pos.entry_fee_usdc
+                self.storage.update_position_closed(
+                    pos.position_id,
+                    closed_at_iso=now_iso,
+                    closed_istanbul_date=ist_date,
+                    exit_price=avg_price,
+                    exit_fee_usdc=pos_fee,
+                    realized_pnl_usdc=pos_pnl,
+                    close_reason="MANUEL_MARJIN_TASFIYE",
+                )
+                remaining_sold -= pos.quantity
+                closed_positions += 1
+                matched_pnl += pos_pnl
+            else:
+                ratio = (pos.quantity - remaining_sold) / pos.quantity if pos.quantity > 0 else Decimal("0")
+                self.storage.update_position_remaining(
+                    pos.position_id,
+                    quantity=pos.quantity - remaining_sold,
+                    cost_basis_usdc=pos.cost_basis_usdc * ratio,
+                    entry_fee_usdc=pos.entry_fee_usdc * ratio,
+                    borrowed_usdc=pos.borrowed_usdc * ratio,
+                )
+                remaining_sold = Decimal("0")
+
+        sig_key = f"MARGIN_LIQ:{filters.symbol}:{int(now_utc.timestamp())}:{order_id}"
+        self.storage.mark_signal_processed(sig_key, order_id, now_iso, track="LIVE_MARGIN")
+
+        after = self.fetch_live_margin_balances(
+            ui_live_confirmed=ui_live_confirmed,
+            ui_margin_confirmed=ui_margin_confirmed,
+            quote_asset=q_ccy,
+        )
+        rem_debt = after["quote_borrowed"] + after["quote_interest"]
+        rem_free_q = after["quote_free"]
+        m_level = after["margin_level"]
+
+        pos_note = f" • {closed_positions} açık marjin pozisyon kaydı kapatıldı." if closed_positions else ""
+        summary_msg = (
+            f"Çapraz Marjin'de {executed_qty} {filters.base_asset} @ {avg_price:.2f} {q_ccy} "
+            f"satıldı (Brüt: {cumm_quote:.2f} {q_ccy}). Otomatik borç ödeme sonrası kalan {q_ccy} borcu: "
+            f"{rem_debt:.2f}, serbest {q_ccy}: {rem_free_q:.2f}{pos_note}"
+        )
+
+        res = SimulatedOrderResult(
+            order_id=order_id,
+            symbol=filters.symbol,
+            side="SELL",
+            order_type="MARKET",
+            status="FILLED",
+            requested_qty=sell_qty,
+            filled_qty=executed_qty,
+            avg_fill_price=avg_price,
+            gross_quote_usdc=cumm_quote,
+            fee_usdc=exit_fee_usdc,
+            slippage_bps=Decimal("0"),
+            signal_key=sig_key,
+            strategy_source="KULLANICI_MARJIN_TASFIYE",
+            explanation=summary_msg,
+            created_at_iso=now_iso,
+            realized_pnl_usdc=matched_pnl,
+        )
+        self.storage.record_order(res, ist_date, track="LIVE_MARGIN")
+
+        return {
+            "order_id": order_id,
+            "symbol": filters.symbol,
+            "asset": filters.base_asset,
+            "executed_qty": _format_decimal_clean(executed_qty),
+            "avg_price": f"{avg_price:.4f}",
+            "gross_quote_usdc": f"{cumm_quote:.2f}",
+            "exit_fee_usdc": f"{exit_fee_usdc:.4f}",
+            "net_proceeds": f"{net_proceeds:.2f}",
+            "remaining_borrowed": f"{rem_debt:.2f}",
+            "remaining_free_quote": f"{rem_free_q:.2f}",
+            "margin_level": f"{m_level:.2f}",
+            "closed_positions": closed_positions,
+            "message": summary_msg,
+        }

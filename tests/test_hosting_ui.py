@@ -96,6 +96,9 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "visibilitychange" in js
     assert "inFlightDash" in js
     assert "SETTINGS_CONTROL_IDS" in js
+    assert "/api/margin-liquidate" in js
+    assert "btn-margin-liq" in js
+    assert "renderWalletData" in js
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:

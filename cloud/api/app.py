@@ -50,7 +50,7 @@ from binance_ai_bot.notifier import TelegramNotifier
 from binance_ai_bot.profiles import TRADING_PROFILES, TradingProfile, get_profile
 from binance_ai_bot.risk import compute_open_position_unrealized_net_pnl
 from binance_ai_bot.runner import DEFAULT_SCAN_SYMBOLS
-from binance_ai_bot.security import LiveOrderBlockedError, redact_secrets
+from binance_ai_bot.security import LiveOrderBlockedError, STABLECOIN_OR_FIAT_ASSETS, redact_secrets
 from binance_ai_bot.storage import SQLiteStorage
 
 
@@ -783,27 +783,48 @@ class CloudBotApplication:
                         }
                     )
             margin_usd = Decimal("0")
+            margin_borrowed_usdt = Decimal("0")
+            margin_level_str: str | None = None
             try:
                 m_raw = eng.live_margin_executor._request_signed(
                     "GET", "/sapi/v1/margin/account", ui_live_confirmed=True, ui_margin_confirmed=True
                 )
+                try:
+                    m_lvl_dec = Decimal(str(m_raw.get("marginLevel", "999")))
+                    margin_level_str = "Borçsuz (999)" if m_lvl_dec >= Decimal("900") else f"{m_lvl_dec:.2f}"
+                except Exception:
+                    margin_level_str = None
                 for mb in m_raw.get("userAssets", []):
                     net_amt = Decimal(str(mb.get("netAsset", "0")))
-                    free_amt = Decimal(str(mb.get("free", "0"))) + Decimal(str(mb.get("locked", "0")))
+                    free_only = Decimal(str(mb.get("free", "0")))
+                    free_amt = free_only + Decimal(str(mb.get("locked", "0")))
                     borrowed_amt = Decimal(str(mb.get("borrowed", "0"))) + Decimal(str(mb.get("interest", "0")))
                     if free_amt <= Decimal("0") and borrowed_amt <= Decimal("0"):
                         continue
                     m_asset = str(mb.get("asset", "")).upper()
                     unit_px = Decimal("1") if m_asset in {"USDT", "USDC", "FDUSD"} else px_map.get(f"{m_asset}USDT", Decimal("0"))
                     net_usd = net_amt * unit_px
+                    free_usd = free_only * unit_px
                     margin_usd += net_usd
+                    if m_asset in {"USDT", "USDC", "FDUSD"} and borrowed_amt > 0:
+                        margin_borrowed_usdt += borrowed_amt
+                    can_liq = bool(
+                        m_asset not in STABLECOIN_OR_FIAT_ASSETS
+                        and free_only > Decimal("0")
+                        and unit_px > Decimal("0")
+                        and free_usd >= Decimal("5.00")
+                    )
                     if abs(net_usd) >= Decimal("0.01") or free_amt >= Decimal("0.01"):
                         rows.append(
                             {
                                 "location": "Çapraz Marjin (Kaldıraç)",
                                 "is_earn": False,
                                 "asset": f"{m_asset} (Borç: {_dec_str(borrowed_amt, '0.01')})" if borrowed_amt > 0 else m_asset,
+                                "raw_asset": m_asset,
                                 "quantity": _dec_str(net_amt),
+                                "free_quantity": _dec_str(free_only),
+                                "borrowed": _dec_str(borrowed_amt, "0.01"),
+                                "can_margin_liquidate": can_liq,
                                 "price_usdt": _dec_str(unit_px, "0.0001") if unit_px > 0 else None,
                                 "value_usdt": _dec_str(net_usd, "0.01"),
                             }
@@ -815,6 +836,8 @@ class CloudBotApplication:
                 "ok": True,
                 "spot_usdt": _dec_str(spot_usd, "0.01"),
                 "margin_usdt": _dec_str(margin_usd, "0.01"),
+                "margin_borrowed_usdt": _dec_str(margin_borrowed_usdt, "0.01"),
+                "margin_level": margin_level_str,
                 "earn_usdt": _dec_str(earn_usd, "0.01"),
                 "total_usdt": _dec_str(spot_usd + margin_usd + earn_usd, "0.01"),
                 "rows": rows,
@@ -1267,6 +1290,54 @@ class CloudBotApplication:
         self.state_sync.persist(self.config.db_path)
         return " ".join(notes) if notes else "Ayarlar güncellendi."
 
+    def _handle_margin_liquidate(self, eng: TradingSystemEngine, payload: Mapping[str, Any]) -> dict[str, Any]:
+        confirm_val = payload.get("confirm")
+        confirmed = confirm_val is True or (
+            isinstance(confirm_val, str) and confirm_val.strip().upper() in {"EVET", "SAT", "TRUE"}
+        )
+        if not confirmed:
+            raise ValueError("Çapraz Marjin satışı için açık onay ('EVET') gereklidir.")
+        raw_asset = str(payload.get("asset", "")).strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,15}", raw_asset):
+            raise ValueError("Geçerli bir varlık kodu belirtin (ör. BTC).")
+        if raw_asset in STABLECOIN_OR_FIAT_ASSETS:
+            raise ValueError(f"{raw_asset} stabilcoin olduğu için USDT'ye satılamaz.")
+        if not eng.config.enable_live_trading or not eng.config.has_binance_live_keys:
+            raise ValueError(
+                "Canlı Çapraz Marjin satışı kilitli: Sunucuda ENABLE_LIVE_TRADING=true ve Binance API anahtarları tanımlı olmalıdır."
+            )
+
+        symbol = f"{raw_asset}USDT"
+        spot_map = eng.market_client.discover_spot_pairs(quote_asset="USDT")
+        filters = spot_map.get(symbol)
+        if filters is None:
+            raise ValueError(f"{symbol} için Binance emir filtreleri bulunamadı.")
+
+        est_bid: Decimal | None = None
+        try:
+            book = eng.market_client.fetch_order_book(symbol, depth_limit=5)
+            if book.bids:
+                est_bid = book.bids[0].price
+        except Exception:
+            est_bid = None
+
+        summary = eng.live_margin_executor.liquidate_free_margin_asset(
+            filters=filters,
+            ui_live_confirmed=True,
+            ui_margin_confirmed=True,
+            estimated_bid=est_bid,
+        )
+        self.state_sync.persist(self.config.db_path)
+        if self.notifier.enabled:
+            self.notifier.send(f"[MARJİN TASFİYE] {summary['message']}")
+        return {
+            "ok": True,
+            "message": _safe_text(summary["message"], 340),
+            "summary": summary,
+            "wallet": self._fetch_real_wallet_summary(eng),
+            "dashboard": self._build_dashboard(eng),
+        }
+
     def _reset_paper_portfolio(self, eng: TradingSystemEngine, initial_balance: Decimal) -> str:
         st = eng.storage
         paper_tracks = ("MAIN", "RULE_SHADOW", "RULE_SHADOW_USDT", "RULE_SHADOW_USDC")
@@ -1413,6 +1484,7 @@ class CloudBotApplication:
             "/api/tick",
             "/api/settings",
             "/api/close-positions",
+            "/api/margin-liquidate",
             "/api/reset-paper",
         }
         if route not in known_owner_routes:
@@ -1491,6 +1563,8 @@ class CloudBotApplication:
                             "dashboard": self._build_dashboard(eng),
                         },
                     )
+                if route == "/api/margin-liquidate":
+                    return respond(200, self._handle_margin_liquidate(eng, payload))
                 if route == "/api/reset-paper":
                     if str(payload.get("confirm", "")).strip().upper() != "SIFIRLA":
                         return respond(400, {"error": "Sıfırlama onayı için 'SIFIRLA' gönderilmelidir."})

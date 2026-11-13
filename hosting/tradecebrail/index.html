@@ -2123,6 +2123,71 @@
       }
     });
 
+    function renderWalletData(w) {
+      const box = $("walletContent");
+      if (!w || !w.ok) {
+        box.innerHTML = `<div class="alert" style="margin:0;"><span>${esc((w && w.error) || "Cüzdan sorgulanamadı.")}</span></div>`;
+        return;
+      }
+      const hasMarginInfo = Math.abs(Number(w.margin_usdt || 0)) >= 0.01 || Number(w.margin_borrowed_usdt || 0) > 0;
+      let html = `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;">
+        <span class="badge badge-teal num" style="font-size:0.84rem;padding:6px 12px;">Toplam: ~${esc(w.total_usdt)} USDT</span>
+        <span class="chip num">Spot: <b>${esc(w.spot_usdt)} USDT</b></span>
+        ${hasMarginInfo ? `<span class="chip num">Marjin Net: <b>${esc(w.margin_usdt || "0.00")} USDT</b>${w.margin_level ? ` · Sv: <b>${esc(w.margin_level)}</b>` : ""}</span>` : ""}
+        <span class="chip num">Simple Earn / Kazan: <b>${esc(w.earn_usdt)} USDT</b></span>
+      </div>`;
+      if (Number(w.margin_borrowed_usdt || 0) > 0) {
+        html += `<div class="alert">
+          <span>⚠️ <b>Çapraz Marjin Borcu (~${esc(w.margin_borrowed_usdt)} USDT):</b> Tablodaki satılabilir Marjin varlığının yanındaki <b>⚡ Sat + Borç Kapat</b> düğmesi ile tek seferde satış yapıp borcunuzu otomatik (AUTO_REPAY) kapatabilirsiniz.</span>
+        </div>`;
+      }
+      if (Number(w.earn_usdt) > 1 && Number(w.spot_usdt) < 5) {
+        html += `<div class="alert">
+          <span>💡 <b>Bilgi:</b> Varlıklarınızın büyük kısmı (<b>~${esc(w.earn_usdt)} USDT</b>) Binance <b>Simple Earn (Otomatik Katılım / Kazan)</b> hesabında duruyor. Spot'ta işlem açmak isterseniz Binance uygulamasından <b>Kazan (Earn) → Geri Al (Redeem)</b> yapıp Otomatik Katılımı kapatabilirsiniz.</span>
+        </div>`;
+      }
+      if (w.rows && w.rows.length) {
+        html += `<div class="table-scroll"><table><thead><tr><th>Cüzdan Yeri</th><th>Varlık</th><th class="tr">Miktar</th><th class="tr">Fiyat (USDT)</th><th class="tr">Değer (USDT)</th><th>İşlem</th></tr></thead><tbody>` +
+          w.rows.map((r) => {
+            const actBtn = r.can_margin_liquidate && r.raw_asset
+              ? `<button type="button" class="btn-amber btn-margin-liq" data-asset="${esc(r.raw_asset)}" data-qty="${esc(r.free_quantity || r.quantity)}" data-usd="${esc(r.value_usdt)}" style="padding:4px 9px;font-size:0.74rem;">⚡ Sat + Borç Kapat</button>`
+              : `<span class="muted">—</span>`;
+            return `<tr>
+              <td class="muted">${esc(r.location)}</td>
+              <td><b>${esc(r.asset)}</b></td>
+              <td class="tr mono">${esc(r.quantity)}</td>
+              <td class="tr mono">${esc(r.price_usdt || "—")}</td>
+              <td class="tr num"><b>~${esc(r.value_usdt)} USDT</b></td>
+              <td>${actBtn}</td>
+            </tr>`;
+          }).join("") + `</tbody></table></div>`;
+      }
+      box.innerHTML = html;
+    }
+
+    $("walletContent").addEventListener("click", async (e) => {
+      const btn = e.target.closest(".btn-margin-liq");
+      if (!btn) return;
+      const asset = btn.getAttribute("data-asset");
+      const qty = btn.getAttribute("data-qty") || "";
+      const usd = btn.getAttribute("data-usd") || "";
+      if (!asset) return;
+      if (!confirm(`Çapraz Marjin hesabınızdaki ${qty} ${asset} (~${usd} USDT) piyasa fiyatından satılıp varsa Marjin USDT borcunuz otomatik (AUTO_REPAY) kapatılacak. Onaylıyor musunuz?`)) {
+        return;
+      }
+      setBtnBusy(btn, true, "⏳ Satılıyor...");
+      try {
+        const res = await apiCall("/api/margin-liquidate", "POST", { asset, confirm: "EVET" }, 30000);
+        showToast(res.message || `${asset} satıldı.`);
+        if (res.wallet) renderWalletData(res.wallet);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        setBtnBusy(btn, false);
+      }
+    });
+
     $("checkWalletBtn").addEventListener("click", async () => {
       const btn = $("checkWalletBtn");
       const box = $("walletContent");
@@ -2130,31 +2195,7 @@
       box.textContent = "Gerçek Binance cüzdanınız sorgulanıyor...";
       try {
         const w = await apiCall("/api/wallet", "GET", null, 25000);
-        if (!w.ok) {
-          box.innerHTML = `<div class="alert" style="margin:0;"><span>${esc(w.error)}</span></div>`;
-          return;
-        }
-        let html = `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;">
-          <span class="badge badge-teal num" style="font-size:0.84rem;padding:6px 12px;">Toplam: ~${esc(w.total_usdt)} USDT</span>
-          <span class="chip num">Spot: <b>${esc(w.spot_usdt)} USDT</b></span>
-          <span class="chip num">Simple Earn / Kazan: <b>${esc(w.earn_usdt)} USDT</b></span>
-        </div>`;
-        if (Number(w.earn_usdt) > 1 && Number(w.spot_usdt) < 5) {
-          html += `<div class="alert">
-            <span>💡 <b>Bilgi:</b> Varlıklarınızın büyük kısmı (<b>~${esc(w.earn_usdt)} USDT</b>) Binance <b>Simple Earn (Otomatik Katılım / Kazan)</b> hesabında duruyor. Spot'ta işlem açmak isterseniz Binance uygulamasından <b>Kazan (Earn) → Geri Al (Redeem)</b> yapıp Otomatik Katılımı kapatabilirsiniz.</span>
-          </div>`;
-        }
-        if (w.rows && w.rows.length) {
-          html += `<div class="table-scroll"><table><thead><tr><th>Cüzdan Yeri</th><th>Varlık</th><th class="tr">Miktar</th><th class="tr">Fiyat (USDT)</th><th class="tr">Değer (USDT)</th></tr></thead><tbody>` +
-            w.rows.map((r) => `<tr>
-              <td class="muted">${esc(r.location)}</td>
-              <td><b>${esc(r.asset)}</b></td>
-              <td class="tr mono">${esc(r.quantity)}</td>
-              <td class="tr mono">${esc(r.price_usdt || "—")}</td>
-              <td class="tr num"><b>~${esc(r.value_usdt)} USDT</b></td>
-            </tr>`).join("") + `</tbody></table></div>`;
-        }
-        box.innerHTML = html;
+        renderWalletData(w);
       } catch (err) {
         box.innerHTML = `<div class="alert" style="margin:0;"><span>${esc(err.message)}</span></div>`;
       } finally {
