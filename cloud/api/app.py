@@ -91,6 +91,20 @@ def _safe_text(value: Any, length: int = 420) -> str:
     return cleaned[:length]
 
 
+def _normalize_symbol_input(raw: Any) -> str:
+    if raw is None:
+        return ""
+    token = re.sub(r"[^A-Z0-9]", "", str(raw).strip().upper())
+    if not token:
+        return ""
+    if token.endswith("USDT"):
+        return token if _SYMBOL_RE.fullmatch(token) else ""
+    if len(token) <= 6:
+        candidate = f"{token}USDT"
+        return candidate if _SYMBOL_RE.fullmatch(candidate) else ""
+    return token if _SYMBOL_RE.fullmatch(token) else ""
+
+
 def _dec_str(value: Any, places: str | None = None) -> str:
     try:
         d = value if isinstance(value, Decimal) else Decimal(str(value))

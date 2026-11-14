@@ -127,6 +127,12 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "/api/research" in js
     assert "renderQuantDesk" in js
     assert "renderResearchResult" in js
+    assert 'preserveAspectRatio="none"' not in text
+    assert "workspaceNav" in text
+    assert "applyWorkspaceTab" in js
+    assert "coinBadgeHtml" in js
+    assert "fmtSmartNum" in js
+    assert "resp-table" in text
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:
