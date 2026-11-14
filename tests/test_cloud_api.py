@@ -301,6 +301,32 @@ def test_settings_manual_close_reset_and_secret_redaction(tmp_path: Path):
     assert r_reset.body["dashboard"]["recent_orders"] == []
 
 
+def test_research_and_settings_ignore_invalid_payloads(tmp_path: Path):
+    app, _, _ = _make_app(tmp_path)
+    headers = {"Authorization": "Bearer owner-token", "Origin": "https://tradecebrail.web.app"}
+
+    r_research = app.handle(
+        "POST",
+        "/api/research",
+        headers,
+        json.dumps({"symbol": "bad@@@", "interval": "godzilla", "lookback": "-999", "question": "  "}).encode("utf-8"),
+    )
+    assert r_research.status == 200
+    assert r_research.body["ok"] is True
+    assert r_research.body["symbol"].endswith("USDT")
+    assert r_research.body["interval"] == "5m"
+
+    r_settings = app.handle(
+        "POST",
+        "/api/settings",
+        headers,
+        json.dumps({"leverage": "abc", "max_position_size_usdc": "99999", "daily_loss_limit_usdc": "-1"}).encode("utf-8"),
+    )
+    assert r_settings.status == 200
+    assert r_settings.body["dashboard"]["leverage"] == 2
+    assert r_settings.body["dashboard"]["risk_settings"]["max_position_size_usdc"] == "15.00"
+
+
 def test_al_yukselince_sat_holds_pullback_locks_net_profit_and_rebuys_continuously(tmp_path: Path):
     """Verify continuous Buy -> Hold slight dip -> Sell in net profit -> Buy again cycle."""
     from binance_ai_bot.config import AppConfig

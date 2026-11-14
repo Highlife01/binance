@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 import gzip
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import inspect
 import json
 import logging
 import os
@@ -103,6 +104,32 @@ def _normalize_symbol_input(raw: Any) -> str:
         candidate = f"{token}USDT"
         return candidate if _SYMBOL_RE.fullmatch(candidate) else ""
     return token if _SYMBOL_RE.fullmatch(token) else ""
+
+
+def _coerce_research_interval(raw: Any, default: str) -> str:
+    candidate = str(raw).strip().lower() if raw is not None else default
+    return candidate if candidate in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"} else default
+
+
+def _coerce_lookback(raw: Any, default: int = 360) -> int:
+    try:
+        candidate = int(raw)
+    except (TypeError, ValueError):
+        candidate = int(default)
+    if candidate <= 0:
+        return max(140, min(1000, int(default)))
+    return max(140, min(1000, candidate))
+
+
+def _fetch_market_bundle_with_optional_limit(market_client: Any, *, symbol: str, interval: str, candle_limit: int) -> Any:
+    method = getattr(market_client, "fetch_verified_market_bundle")
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return method(symbol=symbol, interval=interval)
+    if "candle_limit" in params:
+        return method(symbol=symbol, interval=interval, candle_limit=candle_limit)
+    return method(symbol=symbol, interval=interval)
 
 
 def _dec_str(value: Any, places: str | None = None) -> str:
@@ -1317,34 +1344,35 @@ class CloudBotApplication:
 
     def _handle_research(self, eng: TradingSystemEngine, payload: dict[str, Any]) -> dict[str, Any]:
         """QuantDinger tarzı doğal dil strateji araştırması ve nedensel backtest yürütür."""
-        question = _safe_text(payload.get("question", ""), 300) or "SOLUSDT 5m 360 mum RSI dip stratejisi test et"
-        raw_sym = str(payload.get("symbol", "") or "").strip().upper()
-        raw_tf = str(payload.get("interval", "") or "").strip().lower()
-        if _SYMBOL_RE.fullmatch(raw_sym) and raw_sym not in question.upper():
-            question = f"{raw_sym} {question}"
-        if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"} and raw_tf not in question.lower():
-            question = f"{question} {raw_tf}"
         params_active = self._active_cloud_params(eng)
-        default_sym = raw_sym if _SYMBOL_RE.fullmatch(raw_sym) else (params_active["symbols"][0] if params_active["symbols"] else "SOLUSDT")
-        default_tf = raw_tf if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"} else params_active["profile"].interval
+        default_sym = _normalize_symbol_input(payload.get("symbol")) or (
+            params_active["symbols"][0] if params_active["symbols"] else "SOLUSDT"
+        )
+        default_tf = _coerce_research_interval(payload.get("interval"), params_active["profile"].interval)
+
+        question = _safe_text(payload.get("question", ""), 300) or "SOLUSDT 5m 360 mum RSI dip stratejisi test et"
+        if default_sym and default_sym not in question.upper():
+            question = f"{default_sym} {question}"
+        if default_tf and default_tf not in question.lower():
+            question = f"{question} {default_tf}"
 
         plan = build_research_plan(question, default_symbol=default_sym, default_interval=default_tf)
-        if _SYMBOL_RE.fullmatch(raw_sym) and raw_sym not in plan["symbols"]:
-            plan["symbols"] = [raw_sym] + plan["symbols"][:2]
-        if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"}:
-            plan["interval"] = raw_tf
+        if default_sym and default_sym not in plan["symbols"]:
+            plan["symbols"] = [default_sym] + plan["symbols"][:2]
+        plan["interval"] = default_tf
 
         spot_filters = eng.market_client.discover_spot_pairs(quote_asset="USDT")
         candles_by_sym: dict[str, list[Any]] = {}
         books_by_sym: dict[str, Any] = {}
         filters_by_sym: dict[str, Any] = {}
 
-        lookback = max(140, min(1000, int(payload.get("lookback") or plan["lookback"])))
+        lookback = _coerce_lookback(payload.get("lookback"), int(plan["lookback"]))
         for sym in plan["symbols"][:2]:
             if sym in spot_filters:
                 filters_by_sym[sym] = spot_filters[sym]
             try:
-                bundle = eng.market_client.fetch_verified_market_bundle(
+                bundle = _fetch_market_bundle_with_optional_limit(
+                    eng.market_client,
                     symbol=sym,
                     interval=plan["interval"],
                     candle_limit=lookback,
