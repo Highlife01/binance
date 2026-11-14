@@ -13,6 +13,7 @@ from binance_ai_bot.expert import (
     dynamic_exits,
     loss_streak_cooldown,
     pick_scan_symbols,
+    post_exit_reentry_block,
     rank_top_gainers,
     regime_block,
     risk_capped_notional,
@@ -281,3 +282,96 @@ def test_score_universe_catches_midcap_momentum_and_rank_top_gainers_works():
     assert [g["symbol"] for g in gainers] == ["PUMPUSDT", "SHELLUSDT"]
     assert gainers[0]["tag"] == "ASIRI_PUMP"
     assert gainers[1]["tag"] == "GUCLU_TREND"
+
+
+def test_post_exit_reentry_block_prevents_dodo_and_inj_profit_rebuy_loops():
+    now = datetime(2026, 11, 14, 19, 0, 0, tzinfo=timezone.utc)
+
+    def _closed(sym: str, exit_px: str, pnl: str, mins_ago: int, reason: str = "KAR_AL") -> Position:
+        closed_dt = now - timedelta(minutes=mins_ago)
+        return Position(
+            position_id=f"POS-{sym}-{mins_ago}",
+            symbol=sym,
+            quantity=Decimal("100"),
+            entry_price=Decimal(exit_px) * Decimal("0.985"),
+            cost_basis_usdc=Decimal("15"),
+            entry_fee_usdc=Decimal("0.015"),
+            opened_at_iso=(closed_dt - timedelta(minutes=20)).isoformat(),
+            signal_key="sig-1",
+            strategy_source="AL_YUKSELINCE_SAT",
+            stop_loss_price=Decimal("0"),
+            take_profit_price=Decimal("0"),
+            status="CLOSED",
+            closed_at_iso=closed_dt.isoformat(),
+            exit_price=Decimal(exit_px),
+            exit_fee_usdc=Decimal("0.015"),
+            realized_pnl_usdc=Decimal(pnl),
+            close_reason=reason,
+        )
+
+    # Exact DODOUSDT scenario: took +0.165 profit @ 0.03270, bot tried rebuy 2m later @ 0.03286 -> BLOCKED
+    dodo_2m = _closed("DODOUSDT", "0.03270", "0.165", mins_ago=2, reason="TRAILING_KAR")
+    why_2m = post_exit_reentry_block(dodo_2m, current_price=Decimal("0.03286"), now_utc=now)
+    assert why_2m is not None and "bekletme" in why_2m
+
+    # Even 18m later (INJUSDT scenario: sold @ 7.293, tried rebuy @ 7.321) -> BLOCKED by cooldown
+    inj_18m = _closed("INJUSDT", "7.293", "0.079", mins_ago=18, reason="KAR_AL")
+    why_18m = post_exit_reentry_block(inj_18m, current_price=Decimal("7.321"), now_utc=now)
+    assert why_18m is not None and "bekletme" in why_18m
+
+    # After 45m cooldown (say 60m), rebuying AT or ABOVE profitable exit price is STILL blocked (top chase guard)
+    dodo_60m = _closed("DODOUSDT", "0.03270", "0.165", mins_ago=60, reason="KAR_AL")
+    assert post_exit_reentry_block(dodo_60m, current_price=Decimal("0.03286"), now_utc=now) is not None
+    assert post_exit_reentry_block(dodo_60m, current_price=Decimal("0.03265"), now_utc=now) is not None
+
+    # After 45m cooldown AND genuine >= 0.8% dip below exit price (0.03270 * 0.992 = 0.0324384) -> ALLOWED
+    assert post_exit_reentry_block(dodo_60m, current_price=Decimal("0.03240"), now_utc=now) is None
+
+    # After 4h pullback window elapses -> ALLOWED even above prior exit price
+    dodo_5h = _closed("DODOUSDT", "0.03270", "0.165", mins_ago=250, reason="KAR_AL")
+    assert post_exit_reentry_block(dodo_5h, current_price=Decimal("0.03400"), now_utc=now) is None
+
+    # Single ZARAR_KES whipsaw guard (DODOUSDT 4m after -0.492 loss): blocked for 15m, allowed after 16m
+    dodo_loss_4m = _closed("DODOUSDT", "0.03210", "-0.492", mins_ago=4, reason="ZARAR_KES")
+    why_loss = post_exit_reentry_block(dodo_loss_4m, current_price=Decimal("0.03100"), now_utc=now)
+    assert why_loss is not None and "zarar sonrası" in why_loss
+    dodo_loss_16m = _closed("DODOUSDT", "0.03210", "-0.492", mins_ago=16, reason="ZARAR_KES")
+    assert post_exit_reentry_block(dodo_loss_16m, current_price=Decimal("0.03100"), now_utc=now) is None
+
+
+def test_engine_blocks_rebuy_after_profit_even_without_expert_mode(tmp_path: Path):
+    app, _, _ = _make_app(tmp_path)
+    eng = app._get_engine()
+    # Explicitly test with expert_mode=False (e.g. AL_YUKSELINCE_SAT style non-expert mode)
+    now = datetime.now(timezone.utc)
+    recent = now - timedelta(minutes=3)
+    pos = Position(
+        position_id="WIN-BTC-1",
+        symbol="BTCUSDT",
+        quantity=Decimal("0.001"),
+        entry_price=Decimal("99.0"),
+        cost_basis_usdc=Decimal("10"),
+        entry_fee_usdc=Decimal("0.01"),
+        opened_at_iso=(recent - timedelta(minutes=10)).isoformat(),
+        signal_key="win-1",
+        strategy_source="AL_YUKSELINCE_SAT",
+        stop_loss_price=Decimal("95"),
+        take_profit_price=Decimal("101"),
+        status="OPEN",
+    )
+    eng.storage.insert_position(pos, track="MAIN")
+    eng.storage.update_position_closed(
+        pos.position_id,
+        closed_at_iso=recent.isoformat(),
+        closed_istanbul_date=eng.storage.istanbul_date_str(recent),
+        exit_price=Decimal("100.5"),
+        exit_fee_usdc=Decimal("0.01"),
+        realized_pnl_usdc=Decimal("0.20"),
+        close_reason="KAR_AL",
+    )
+    settings = eng.default_risk_settings()
+    settings = dataclasses.replace(settings, expert_mode=False)
+    step = eng.run_analysis_step(symbol="BTCUSDT", interval="1m", settings=settings, ai_enabled_by_user=False)
+    assert step.executed_order is None
+    assert "karlı satış sonrası bekletme" in step.block_or_info_message
+    assert all(p.symbol != "BTCUSDT" for p in eng.storage.get_open_positions(track="MAIN"))

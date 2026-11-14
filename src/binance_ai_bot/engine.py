@@ -39,6 +39,7 @@ from .expert import (
     coin_knife_block,
     dynamic_exits,
     loss_streak_cooldown,
+    post_exit_reentry_block,
     regime_block,
     risk_capped_notional,
     trend_info,
@@ -794,6 +795,13 @@ class TradingSystemEngine:
                     and quant_assessment.block_reason
                 ):
                     block_reason = quant_assessment.block_reason
+                    info_msg = block_reason
+                elif reentry_why := post_exit_reentry_block(
+                    self.storage.get_last_closed_position(active_track, market.symbol),
+                    current_price=best_ask or mid_price,
+                    now_utc=now_utc,
+                ):
+                    block_reason = f"{market.symbol} {reentry_why}; alım atlandı."
                     info_msg = block_reason
                 else:
                     risk_chk = self.risk_manager.check_buy_entry(

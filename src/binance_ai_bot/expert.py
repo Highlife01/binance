@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
-from .domain import Candle
+from .domain import Candle, Position
 
 _LEVERAGED_SUFFIXES = ("DOWN", "BULL", "BEAR")
 
@@ -159,6 +159,78 @@ def loss_streak_cooldown(
     if now_utc < until:
         mins = int((until - now_utc).total_seconds() // 60) + 1
         return f"üst üste {streak} zarar sonrası bekletme ({mins} dk kaldı)"
+    return None
+
+
+_PROFIT_EXIT_REASONS = frozenset(
+    {"KAR_AL", "TRAILING_KAR", "KARDA_STRATEJI_SAT", "TAKE_PROFIT", "KURAL_SAT"}
+)
+
+
+def post_exit_reentry_block(
+    last_closed: Position | None,
+    *,
+    current_price: Decimal | None,
+    now_utc: datetime,
+    profit_cooldown_minutes: int = 45,
+    price_pullback_window_minutes: int = 240,
+    min_pullback_pct: Decimal = Decimal("0.008"),
+    single_loss_cooldown_minutes: int = 15,
+) -> str | None:
+    """
+    Aynı paritede karlı veya zararlı kapanıştan hemen sonra tepeden/whipsaw geri alışını engeller:
+    - Kârlı / başa-baş kapanışta: `profit_cooldown_minutes` (45 dk) boyunca koşulsuz bekletir;
+      ardından `price_pullback_window_minutes` (4 saat) içinde fiyat son satış fiyatının en az
+      `min_pullback_pct` (%0.80) altına geri çekilmediyse tepe geri alışını durdurur.
+    - Tek zararlı kapanışta: hemen tepki alışını önlemek için `single_loss_cooldown_minutes` (15 dk) bekletir.
+    """
+    if last_closed is None or not last_closed.closed_at_iso:
+        return None
+    try:
+        closed_at = datetime.fromisoformat(last_closed.closed_at_iso)
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    pnl = last_closed.realized_pnl_usdc
+    reason = (last_closed.close_reason or "").upper()
+    is_profit_exit = pnl >= Decimal("0") or (reason in _PROFIT_EXIT_REASONS and pnl >= Decimal("0"))
+
+    if is_profit_exit:
+        cooldown_until = closed_at + timedelta(minutes=profit_cooldown_minutes)
+        if now_utc < cooldown_until:
+            mins = max(1, int((cooldown_until - now_utc).total_seconds() // 60) + 1)
+            exit_str = f"{last_closed.exit_price:.6f}".rstrip("0").rstrip(".") if last_closed.exit_price else "-"
+            return (
+                f"karlı satış sonrası bekletme aktif "
+                f"(son satış: +{pnl:.4f} USDC @ {exit_str}, {mins} dk kaldı)"
+            )
+        pullback_until = closed_at + timedelta(minutes=price_pullback_window_minutes)
+        exit_px = last_closed.exit_price
+        if (
+            now_utc < pullback_until
+            and exit_px is not None
+            and exit_px > Decimal("0")
+            and current_price is not None
+            and current_price > Decimal("0")
+        ):
+            max_reentry_px = exit_px * (Decimal("1") - min_pullback_pct)
+            if current_price > max_reentry_px:
+                return (
+                    f"karlı satış sonrası tepe geri alış koruması "
+                    f"(güncel {current_price:.6f} > eşik {max_reentry_px:.6f}; "
+                    f"son satış {exit_px:.6f} fiyatından en az %{min_pullback_pct * Decimal('100'):.2f} geri çekilme bekleniyor)"
+                )
+        return None
+
+    loss_until = closed_at + timedelta(minutes=single_loss_cooldown_minutes)
+    if now_utc < loss_until:
+        mins = max(1, int((loss_until - now_utc).total_seconds() // 60) + 1)
+        return f"zarar sonrası hızlı geri alış bekletmesi ({mins} dk kaldı)"
     return None
 
 

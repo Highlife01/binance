@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -449,9 +449,32 @@ def test_al_yukselince_sat_holds_pullback_locks_net_profit_and_rebuys_continuous
     assert len(eng.storage.get_open_positions()) == 0
     assert eng.storage.get_cash_balance() > Decimal("86.00")
 
-    # Step D: Next dip rebound immediately buys again continuously!
+    # Step D: Immediate rebuy right after profitable exit is blocked by profit cooldown;
+    # after 50m cooldown, buying back ABOVE exit price is still blocked (top guard),
+    # and once price genuinely dips >= 0.8% (100.00 <= 101.30 * 0.992), it re-buys cleanly!
     sm.candle_shift = 3
     sm.mode = "REBUY"
+    sm.price_by_symbol["SOLUSDT"] = Decimal("100.00")
+    s_cool = eng.run_analysis_step(
+        symbol="SOLUSDT", interval="1m", settings=settings, ai_enabled_by_user=False, strategy_params=prof.strategy
+    )
+    assert s_cool.executed_order is None
+    assert "karlı satış sonrası bekletme" in s_cool.block_or_info_message
+
+    # Advance closed_at_iso 50 minutes into the past (cooldown elapsed, still within 4h top-guard window)
+    older_iso = (datetime.now(timezone.utc) - timedelta(minutes=50)).isoformat()
+    with eng.storage._connect() as conn:
+        conn.execute("UPDATE positions SET closed_at_iso = ? WHERE symbol = 'SOLUSDT' AND status = 'CLOSED'", (older_iso,))
+
+    sm.candle_shift = 4
+    sm.price_by_symbol["SOLUSDT"] = (s3.executed_order.avg_fill_price * Decimal("1.002")).quantize(Decimal("0.01"))
+    s_top = eng.run_analysis_step(
+        symbol="SOLUSDT", interval="1m", settings=settings, ai_enabled_by_user=False, strategy_params=prof.strategy
+    )
+    assert s_top.executed_order is None
+    assert "tepe geri alış koruması" in s_top.block_or_info_message
+
+    sm.candle_shift = 5
     sm.price_by_symbol["SOLUSDT"] = Decimal("100.00")
     s4 = eng.run_analysis_step(
         symbol="SOLUSDT", interval="1m", settings=settings, ai_enabled_by_user=False, strategy_params=prof.strategy

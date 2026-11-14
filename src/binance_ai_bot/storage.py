@@ -728,6 +728,19 @@ class SQLiteStorage:
             ).fetchall()
         return [(str(r["closed_at_iso"]), Decimal(str(r["realized_pnl_usdc"] or "0"))) for r in rows]
 
+    def get_last_closed_position(self, track: str, symbol: str) -> Position | None:
+        """Bir paritenin en son kapanmış pozisyonunu (kâr/zarar ve çıkış fiyatı dahil) döner."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM positions
+                WHERE portfolio_track = ? AND symbol = ? AND status = 'CLOSED' AND closed_at_iso IS NOT NULL
+                ORDER BY closed_at_iso DESC, rowid DESC LIMIT 1
+                """,
+                (track, symbol),
+            ).fetchone()
+        return self._row_to_position(row) if row is not None else None
+
     def get_performance_stats(self, track: str, istanbul_date: str) -> dict[str, Any]:
         """Kapanmış pozisyonlardan net (komisyon dahil) performans özeti ve kapanış nedeni dağılımı."""
         with self._connect() as conn:
