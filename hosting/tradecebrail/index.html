@@ -1157,8 +1157,8 @@
             <input type="number" id="inpPosSize" min="5" max="250" step="1" value="15" />
           </div>
           <div class="field">
-            <label for="inpMaxOpen">Maks. Eşzamanlı Coin</label>
-            <input type="number" id="inpMaxOpen" min="1" max="10" step="1" value="5" />
+            <label for="inpMaxOpen">Maks. Eşzamanlı Coin <span class="muted">(999 = Sınırsız)</span></label>
+            <input type="number" id="inpMaxOpen" min="1" max="999" step="1" value="999" />
           </div>
           <div class="field">
             <label for="inpDailyLoss">Günlük Zarar Sigortası (USDT)</label>
@@ -1992,8 +1992,11 @@
       $("mEquity").textContent = d.equity != null ? `${d.equity} ${ccy}` : "—";
       $("mEquitySub").textContent = `Açık pozisyon: ${d.open_market_value || "0.00"} ${ccy}`;
       $("mCash").textContent = `${d.cash || "0.00"} ${ccy}`;
-      const maxDailyNew = d.risk_settings ? d.risk_settings.max_daily_new_positions : "—";
-      $("mCashSub").textContent = `Günlük yeni giriş: ${d.daily_new_positions ?? 0} / ${maxDailyNew}`;
+      const maxDailyNew = d.risk_settings ? Number(d.risk_settings.max_daily_new_positions || 0) : 0;
+      const maxOpenCfg = d.risk_settings ? Number(d.risk_settings.max_open_positions || 999) : 999;
+      const maxDailyLbl = maxDailyNew >= 500 ? "Sınırsız" : (maxDailyNew || "—");
+      const maxOpenLbl = maxOpenCfg >= 999 ? "Sınırsız" : maxOpenCfg;
+      $("mCashSub").textContent = `Günlük: ${d.daily_new_positions ?? 0}/${maxDailyLbl} • Eşzamanlı: ${maxOpenLbl}`;
       $("mUnreal").innerHTML = pnlHtml(d.unrealized_pnl, ` ${ccy}`);
       $("mRealized").innerHTML = pnlHtml(d.realized_pnl, ` ${ccy}`);
       $("mDaily").innerHTML = pnlHtml(d.daily_pnl, ` ${ccy}`);
@@ -2013,8 +2016,8 @@
         $("selLeverage").disabled = d.mode === "LIVE_SPOT";
         applyModeLeverageRules();
         if (d.risk_settings) {
-          $("inpPosSize").value = Number(d.risk_settings.max_position_size_usdc || 10);
-          $("inpMaxOpen").value = Number(d.risk_settings.max_open_positions || 5);
+          $("inpPosSize").value = Number(d.risk_settings.max_position_size_usdc || 15);
+          $("inpMaxOpen").value = Number(d.risk_settings.max_open_positions || 999);
           $("inpDailyLoss").value = Number(d.risk_settings.daily_loss_limit_usdc || 2);
         }
         $("selAi").value = d.ai_mode != null ? String(d.ai_mode) : (d.ai_enabled ? "1" : "0");

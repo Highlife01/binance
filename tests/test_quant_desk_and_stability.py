@@ -690,3 +690,139 @@ def test_cloud_api_research_and_telegram_webhook_endpoints(tmp_path: Path, monke
     )
     assert start_ok.status == 200
     assert eng.storage.is_new_entries_paused(track="MAIN")[0] is False
+
+
+def test_al_yukselince_sat_allows_unlimited_positions_while_preserving_other_profiles() -> None:
+    from binance_ai_bot.profiles import get_profile
+
+    base = RiskSettings(max_open_positions=1, max_position_size_usdc=Decimal("15.00"))
+    main_prof = get_profile("AL_YUKSELINCE_SAT").apply_to_risk_settings(base, leverage=2)
+    assert main_prof.max_open_positions == 999
+    assert main_prof.max_daily_new_positions == 999
+
+    assert get_profile("AKTIF").apply_to_risk_settings(base).max_open_positions == 3
+    assert get_profile("HIZLI_30SN").apply_to_risk_settings(base).max_open_positions == 5
+
+
+def test_cloud_migrates_5_limit_and_buys_more_than_5_positions_until_cash_runs_out(tmp_path: Path) -> None:
+    symbols = [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+        "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "SUIUSDT",
+        "DOTUSDT", "ATOMUSDT", "NEARUSDT", "OPUSDT", "FILUSDT",
+    ]
+    now_dt = datetime.now(timezone.utc)
+    now_ms = int(now_dt.timestamp() * 1000)
+    step_ms = 60_000
+    first_open = (now_ms - 5_000 - step_ms + 1) - 59 * step_ms
+    dip_candles: list[Candle] = []
+    px = Decimal("100.00")
+    for idx in range(60):
+        delta = (Decimal("-0.15") if idx % 3 != 0 else Decimal("0.07")) if idx < 59 else Decimal("0.25")
+        op = px
+        cl = px + delta
+        om = first_open + idx * step_ms
+        dip_candles.append(
+            Candle(
+                open_time_ms=om,
+                open=op,
+                high=max(op, cl) + Decimal("0.10"),
+                low=min(op, cl) - Decimal("0.10"),
+                close=cl,
+                volume=Decimal("25.0"),
+                close_time_ms=om + step_ms - 1,
+                quote_volume=Decimal("25.0") * cl,
+                trade_count=120,
+                is_closed=True,
+            )
+        )
+        px = cl
+
+    class _EightCoinMarket:
+        def discover_spot_pairs(self, quote_asset: str = "USDT", allow_stablecoin_conversion: bool = False):
+            return {s: _make_filters(s) for s in symbols}
+
+        def fetch_order_book(self, symbol: str, depth_limit: int = 20) -> OrderBookSnapshot:
+            return _make_book(symbol, dip_candles[-1].close)
+
+        def fetch_verified_market_bundle(self, symbol: str, interval: str, **kwargs: Any) -> MarketBundle:
+            return MarketBundle(
+                symbol=symbol,
+                interval=interval,
+                filters=_make_filters(symbol),
+                closed_candles=dip_candles,
+                order_book=_make_book(symbol, dip_candles[-1].close),
+                server_time_ms=now_ms,
+                fetched_at_utc=now_dt,
+                source_label="MockMulti",
+                wake_gap_detected=False,
+            )
+
+    class _SyncStub:
+        def restore(self, db_path: Path) -> bool:
+            return False
+
+        def persist(self, db_path: Path) -> bool:
+            return True
+
+    cfg = CloudConfig(
+        project_id="adanahizlitaksi",
+        owner_email="cebrailkara@gmail.com",
+        state_bucket="bucket",
+        cron_secret="c" * 32,
+        db_path=tmp_path / "unlimited_positions.db",
+        initial_balance_usdc=Decimal("120.00"),
+    )
+    eng = TradingSystemEngine(cfg.to_app_config(), market_client=_EightCoinMarket())
+    # Simulate legacy persisted DB stuck at 5-trade limit before unlimited_open_positions_v1 migration
+    eng.storage.save_risk_settings(
+        RiskSettings(
+            max_open_positions=5,
+            max_position_size_usdc=Decimal("15.00"),
+            daily_loss_limit_usdc=Decimal("10.00"),
+            max_daily_new_positions=60,
+        )
+    )
+    eng.storage.set_state("cloud_leverage", "1")
+    eng.storage.set_state("cloud_ai_enabled", "0")
+    eng.storage.set_state("cloud_scan_symbols", ",".join(symbols))
+    eng.storage.set_state("cloud_dynamic_scan", "0")
+    eng.storage.set_cash_balance(Decimal("120.00"), track="MAIN")
+
+    def verifier(token: str, audience: str) -> dict[str, Any]:
+        return {
+            "aud": audience,
+            "iss": f"https://securetoken.google.com/{audience}",
+            "sub": "uid-owner-123",
+            "email": "cebrailkara@gmail.com",
+            "email_verified": True,
+        }
+
+    app = CloudBotApplication(cfg, engine=eng, state_sync=_SyncStub(), verifier=verifier)  # type: ignore[arg-type]
+
+    # Migration automatically upgraded saved max_open_positions from 5 -> 999
+    assert eng.default_risk_settings().max_open_positions == 999
+
+    tick = app.handle("POST", "/api/cron/tick", {"X-Cron-Secret": cfg.cron_secret}, b"")
+    assert tick.status == 200
+    opened = eng.storage.get_open_positions(track="MAIN")
+    assert len(opened) > 5, f"Expected > 5 positions to be bought with 120 USDT, got {len(opened)}"
+    assert eng.storage.get_cash_balance(track="MAIN") < Decimal("15.00")
+
+    # /api/settings should allow explicit >10 limits and 0 -> 999 unlimited shortcut
+    r_25 = app.handle(
+        "POST",
+        "/api/settings",
+        {"Authorization": "Bearer ok", "Content-Type": "application/json"},
+        b'{"max_open_positions": 25}',
+    )
+    assert r_25.status == 200
+    assert r_25.body["dashboard"]["risk_settings"]["max_open_positions"] == 25
+
+    r_unlim = app.handle(
+        "POST",
+        "/api/settings",
+        {"Authorization": "Bearer ok", "Content-Type": "application/json"},
+        b'{"max_open_positions": 0}',
+    )
+    assert r_unlim.status == 200
+    assert r_unlim.body["dashboard"]["risk_settings"]["max_open_positions"] == 999

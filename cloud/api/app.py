@@ -162,10 +162,10 @@ class CloudConfig:
     def to_app_config(self) -> AppConfig:
         return AppConfig(
             initial_balance_usdc=self.initial_balance_usdc,
-            max_open_positions=5,
+            max_open_positions=999,
             max_position_size_usdc=Decimal("15.00"),
             daily_loss_limit_usdc=Decimal("2.00"),
-            max_daily_new_positions=60,
+            max_daily_new_positions=999,
             daily_limit_exit_policy="HOLD_EXISTING",
             binance_public_base_url=self.binance_public_base_url,
             binance_fallback_base_url=self.binance_fallback_base_url,
@@ -415,7 +415,7 @@ class CloudBotApplication:
         if storage.get_state("risk_settings_json", "") == "":
             prof = get_profile("AL_YUKSELINCE_SAT")
             base = RiskSettings(
-                max_open_positions=5,
+                max_open_positions=999,
                 max_position_size_usdc=Decimal("15.00"),
                 daily_loss_limit_usdc=Decimal("2.00"),
                 max_daily_new_positions=prof.max_daily_new_positions,
@@ -429,11 +429,11 @@ class CloudBotApplication:
         if storage.get_state("profit_target_v2_15usdt", "") != "1":
             prof = get_profile(storage.get_state("cloud_profile", "AL_YUKSELINCE_SAT") or "AL_YUKSELINCE_SAT")
             cur = storage.load_risk_settings(
-                RiskSettings(max_open_positions=5, max_position_size_usdc=Decimal("15.00"), daily_loss_limit_usdc=Decimal("2.00"))
+                RiskSettings(max_open_positions=999, max_position_size_usdc=Decimal("15.00"), daily_loss_limit_usdc=Decimal("2.00"))
             )
             new_pos_size = Decimal("15.00") if cur.max_position_size_usdc == Decimal("10.00") else cur.max_position_size_usdc
             upgraded = RiskSettings(
-                max_open_positions=max(1, min(10, int(cur.max_open_positions))),
+                max_open_positions=max(1, min(999, int(cur.max_open_positions))),
                 max_position_size_usdc=new_pos_size,
                 daily_loss_limit_usdc=cur.daily_loss_limit_usdc,
                 max_daily_new_positions=prof.max_daily_new_positions,
@@ -493,6 +493,26 @@ class CloudBotApplication:
                         )
             storage.set_state("margin_cost_fix_v1", "1")
             changed = True
+        if storage.get_state("unlimited_open_positions_v1", "") != "1":
+            # Kullanıcı talebi: 5 işlem üst sınırı kaldırılarak bakiye elverdiğince pozisyon açılabilsin.
+            prof_u = get_profile(storage.get_state("cloud_profile", "AL_YUKSELINCE_SAT") or "AL_YUKSELINCE_SAT")
+            cur_u = storage.load_risk_settings(
+                RiskSettings(
+                    max_open_positions=999,
+                    max_position_size_usdc=Decimal("15.00"),
+                    daily_loss_limit_usdc=Decimal("2.00"),
+                    max_daily_new_positions=prof_u.max_daily_new_positions,
+                )
+            )
+            if int(cur_u.max_open_positions) <= 10 or int(cur_u.max_daily_new_positions) < int(prof_u.max_daily_new_positions):
+                upgraded_u = dataclasses.replace(
+                    cur_u,
+                    max_open_positions=999 if int(cur_u.max_open_positions) <= 10 else int(cur_u.max_open_positions),
+                    max_daily_new_positions=max(int(cur_u.max_daily_new_positions), int(prof_u.max_daily_new_positions)),
+                )
+                storage.save_risk_settings(upgraded_u)
+            storage.set_state("unlimited_open_positions_v1", "1")
+            changed = True
         return changed
 
     @staticmethod
@@ -550,10 +570,10 @@ class CloudBotApplication:
 
         saved_risk = eng.default_risk_settings()
         eff_settings = profile.apply_to_risk_settings(saved_risk, leverage=lev)
-        # Kullanicinin kaydettigi acik pozisyon ust sinirini (1..10) koru, kaldiraca gore ayarlanan SL/TP/Kar Kilidi hedeflerini muhafaza et
+        # Kullanıcının kaydettiği açık pozisyon üst sınırını (1..999; 999 = bakiye yettiğince sınırsız) koru
         eff_settings = dataclasses.replace(
             eff_settings,
-            max_open_positions=max(1, min(10, int(saved_risk.max_open_positions))),
+            max_open_positions=max(1, min(999, int(saved_risk.max_open_positions))),
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
         symbols = self._parse_scan_symbols(raw_syms)
@@ -699,10 +719,10 @@ class CloudBotApplication:
         if not universe:
             return core
         try:
-            budget = max(6, min(20, int(st.get_state("cloud_scan_budget", "14") or "14")))
+            budget = max(6, min(30, int(st.get_state("cloud_scan_budget", "18") or "18")))
             cursor = int(st.get_state("cloud_scan_cursor", "0") or "0")
         except ValueError:
-            budget, cursor = 14, 0
+            budget, cursor = 18, 0
         picked, next_cursor = pick_scan_symbols(core=core, universe=universe, budget=budget, cursor=cursor)
         st.set_state("cloud_scan_cursor", str(next_cursor))
         return picked
@@ -782,7 +802,7 @@ class CloudBotApplication:
                     quote_asset="USDT",
                     allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
                 )
-                with ThreadPoolExecutor(max_workers=4) as pool:
+                with ThreadPoolExecutor(max_workers=8) as pool:
                     futures = {
                         pool.submit(
                             eng.market_client.fetch_verified_market_bundle,
@@ -792,12 +812,15 @@ class CloudBotApplication:
                         ): s
                         for s in cycle_symbols
                     }
-                    for fut in as_completed(futures, timeout=18.0):
-                        s = futures[fut]
-                        try:
-                            prefetched_bundles[s] = fut.result()
-                        except Exception:
-                            pass
+                    try:
+                        for fut in as_completed(futures, timeout=25.0):
+                            s = futures[fut]
+                            try:
+                                prefetched_bundles[s] = fut.result()
+                            except Exception:
+                                pass
+                    except TimeoutError:
+                        pass
             except Exception:
                 pass
 
@@ -805,13 +828,13 @@ class CloudBotApplication:
         scanned: list[dict[str, Any]] = []
         orders_executed = 0
         for idx, sym in enumerate(cycle_symbols):
-            if (time.monotonic() - t_cycle_start) > 25.0 and idx > 0:
+            if (time.monotonic() - t_cycle_start) > 45.0 and idx > 0:
                 break
             cur_open = [p for p in st.get_open_positions(track=track) if _is_non_dust(p)]
             cur_open_syms = {p.symbol for p in cur_open}
             if sym not in cur_open_syms and (len(cur_open) >= settings.max_open_positions or paused):
                 break
-            is_last = idx == len(cycle_symbols) - 1 or (time.monotonic() - t_cycle_start) > 22.0
+            is_last = idx == len(cycle_symbols) - 1 or (time.monotonic() - t_cycle_start) > 40.0
             res: StepCycleSummary = eng.run_analysis_step(
                 symbol=sym,
                 interval=profile.interval,
@@ -864,7 +887,7 @@ class CloudBotApplication:
             "leverage": settings.leverage,
             "scanned_count": len(scanned),
             "orders_executed": orders_executed,
-            "items": scanned[:12],
+            "items": scanned[:30],
         }
         st.set_state("cloud_last_tick_iso", now_iso)
         st.set_state("cloud_last_tick_summary_json", json.dumps(summary_obj, ensure_ascii=False))
@@ -1380,11 +1403,19 @@ class CloudBotApplication:
         risk_changed = False
 
         if "max_open_positions" in payload:
-            try:
-                max_open = max(1, min(10, int(payload["max_open_positions"])))
-                risk_changed = True
-            except (TypeError, ValueError):
-                pass
+            raw_val = payload["max_open_positions"]
+            if not isinstance(raw_val, bool):
+                raw_mo = "" if raw_val is None else str(raw_val).strip().lower()
+                if raw_mo in {"0", "unlimited", "sınırsız", "sinirsiz"}:
+                    max_open = 999
+                    risk_changed = True
+                else:
+                    try:
+                        parsed_mo = int(raw_val)
+                        max_open = 999 if parsed_mo <= 0 else max(1, min(999, parsed_mo))
+                        risk_changed = True
+                    except (TypeError, ValueError):
+                        pass
 
         if "max_position_size_usdc" in payload:
             try:
