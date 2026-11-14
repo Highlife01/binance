@@ -29,9 +29,11 @@ from .domain import (
     RiskSettings,
     SimulatedOrderResult,
     TechnicalSignal,
+    is_effective_dust_position,
     is_substep_dust_position,
     quantize_down,
 )
+from .quant_desk import QuantBundleAssessment, SelfRetrainingSignalModel, evaluate_quant_bundle
 from .expert import (
     atr_pct_of_price,
     coin_knife_block,
@@ -115,11 +117,23 @@ class TradingSystemEngine:
         self.allow_live_margin = False
         self._candle_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._latest_bid_map: dict[str, Decimal] = {}
+        self.freqai_model = SelfRetrainingSignalModel()
+        self.latest_quant_summaries: dict[str, dict[str, Any]] = {}
+        self._symbol_returns_cache: dict[str, list[float]] = {}
 
     def _collect_position_bids(self, positions, initial=None):
-        """Fetch every held asset; missing marks block entries, never invent prices."""
+        """Fetch every held asset; batch bookTicker first, then order_book fallback; missing marks block entries."""
         bids = dict(initial or {})
-        missing = []
+        missing: list[str] = []
+        needed = {p.symbol for p in positions} - bids.keys()
+        if needed and callable(getattr(self.market_client, "fetch_book_tickers", None)):
+            try:
+                batch = self.market_client.fetch_book_tickers(needed)
+                for sym, bid_px in (batch or {}).items():
+                    if bid_px is not None and bid_px > 0:
+                        bids[sym] = bid_px
+            except Exception:
+                pass
         for symbol in {p.symbol for p in positions} - bids.keys():
             try:
                 book = self.market_client.fetch_order_book(symbol, depth_limit=5)
@@ -310,6 +324,9 @@ class TradingSystemEngine:
         strategy_params: StrategyParams | None = None,
         ai_only_on_rule_signal: bool = False,
         skip_balance_prefetch: bool = False,
+        prefetched_market: MarketBundle | None = None,
+        record_equity_snapshot: bool = True,
+        live_free_balances: dict[str, Decimal] | None = None,
         stop_requested: Callable[[], bool] | None = None,
     ) -> StepCycleSummary:
         """
@@ -396,9 +413,9 @@ class TradingSystemEngine:
                     error_message=str(exc),
                 )
 
-        # 1. Doğrulanmış piyasa verisini çek (hata/eski veri varsa işlem ÜRETME!)
+        # 1. Doğrulanmış piyasa verisini çek (veya ön-yüklenmiş bundle kullan; hata varsa işlem ÜRETME!)
         try:
-            market = self.market_client.fetch_verified_market_bundle(
+            market = prefetched_market or self.market_client.fetch_verified_market_bundle(
                 symbol=symbol,
                 interval=interval,
                 allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
@@ -458,11 +475,93 @@ class TradingSystemEngine:
         )
 
         open_positions = self.storage.get_open_positions(track=active_track)
+        free_base_qty = (
+            (live_free_balances or {}).get(market.filters.base_asset)
+            if is_live_spot and live_free_balances is not None
+            else None
+        )
         symbol_open_pos = next(
-            (p for p in open_positions if p.symbol == market.symbol and not is_substep_dust_position(p, market.filters)),
+            (
+                p
+                for p in open_positions
+                if p.symbol == market.symbol
+                and not is_effective_dust_position(
+                    p,
+                    market.filters,
+                    mark_price=best_bid,
+                    free_base_qty=free_base_qty,
+                )
+            ),
             None,
         )
         has_open_pos = symbol_open_pos is not None
+
+        # 3b. 6-Repo Kantitatif Masa Değerlendirmesi (Kronos + skfolio + Hummingbot + FreqAI; LLM emir dışı)
+        quant_assessment: QuantBundleAssessment | None = None
+        try:
+            closes_hist = [float(c.close) for c in market.closed_candles[-65:]]
+            if len(closes_hist) > 2:
+                self._symbol_returns_cache[market.symbol] = [
+                    (closes_hist[i] / closes_hist[i - 1]) - 1.0
+                    for i in range(1, len(closes_hist))
+                    if closes_hist[i - 1] > 0
+                ]
+            inv_ratio = 1.0 if has_open_pos else 0.0
+            quant_assessment = evaluate_quant_bundle(
+                closed_candles=market.closed_candles,
+                order_book=market.order_book,
+                symbol=market.symbol,
+                interval=market.interval,
+                strategy_params=strategy_params,
+                freqai_model=self.freqai_model,
+                returns_by_symbol=self._symbol_returns_cache,
+                open_symbols=[p.symbol for p in open_positions if not is_substep_dust_position(p)],
+                inventory_ratio=inv_ratio,
+                strict_quant_gate=False,
+            )
+            self.latest_quant_summaries[market.symbol] = quant_assessment.to_summary_dict()
+        except Exception:
+            quant_assessment = None
+
+        def _run_protective_sell(pos_obj, exit_sig: str, close_reason: str) -> tuple[SimulatedOrderResult | None, str | None]:
+            try:
+                if is_live_spot:
+                    ord_out = self.live_executor.execute_live_market_sell(
+                        position=pos_obj,
+                        filters=market.filters,
+                        signal_key=exit_sig,
+                        strategy_source="RISK_KORUMA",
+                        close_reason=close_reason,
+                        ui_live_confirmed=ui_live_confirmed,
+                        stop_requested=stop_requested,
+                    )
+                    self._resolve_live_unvalued_commissions(quote_ccy, settings)
+                    return ord_out, None
+                if is_live_margin:
+                    ord_out = self.live_margin_executor.execute_live_margin_sell(
+                        position=pos_obj,
+                        filters=market.filters,
+                        signal_key=exit_sig,
+                        strategy_source="RISK_KORUMA",
+                        close_reason=close_reason,
+                        ui_live_confirmed=ui_live_confirmed,
+                        ui_margin_confirmed=ui_margin_confirmed,
+                    )
+                    return ord_out, None
+                ord_out = self.simulator.execute_sell_position(
+                    position=pos_obj,
+                    filters=market.filters,
+                    order_book=market.order_book,
+                    signal_key=exit_sig,
+                    strategy_source="RISK_KORUMA",
+                    close_reason=close_reason,
+                    settings=settings,
+                    now_utc=now_utc,
+                    track="MAIN",
+                )
+                return ord_out, None
+            except (LiveOrderBlockedError, LiveExecutionError) as exc:
+                return None, str(exc)
 
         # 4. Günlük zarar limiti ve açık pozisyon koruyucu çıkış denetimi
         bid_map, missing_marks = self._collect_position_bids(open_positions, {market.symbol: best_bid})
@@ -484,40 +583,24 @@ class TradingSystemEngine:
                 if stop_requested and stop_requested():
                     return blocked("Durdurma isteği alındı; emir gönderilmedi.")
                 exit_sig = f"DAILY_LOSS_AUTO_EXIT:{ist_date}:{symbol_open_pos.position_id}"
-                if is_live_spot:
-                    closed_ord = self.live_executor.execute_live_market_sell(
-                        position=symbol_open_pos,
-                        filters=market.filters,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason="GUNLUK_ZARAR_OTOMATIK_CIKIS",
-                        ui_live_confirmed=ui_live_confirmed,
-                        stop_requested=stop_requested,
+                closed_ord, exit_err = _run_protective_sell(symbol_open_pos, exit_sig, "GUNLUK_ZARAR_OTOMATIK_CIKIS")
+                if exit_err is not None:
+                    return StepCycleSummary(
+                        ok=False,
+                        timestamp_iso=now_iso,
+                        symbol=market.symbol,
+                        interval=market.interval,
+                        data_source=market.source_label,
+                        wake_gap_detected=False,
+                        tech_signal=tech_signal,
+                        ai_decision=None,
+                        final_action="BEKLE",
+                        executed_order=None,
+                        block_or_info_message=f"Koruyucu satış tamamlanamadı: {exit_err}",
+                        error_message=exit_err,
                     )
-                    self._resolve_live_unvalued_commissions(quote_ccy, settings)
-                elif is_live_margin:
-                    closed_ord = self.live_margin_executor.execute_live_margin_sell(
-                        position=symbol_open_pos,
-                        filters=market.filters,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason="GUNLUK_ZARAR_OTOMATIK_CIKIS",
-                        ui_live_confirmed=ui_live_confirmed,
-                        ui_margin_confirmed=ui_margin_confirmed,
-                    )
-                else:
-                    closed_ord = self.simulator.execute_sell_position(
-                        position=symbol_open_pos,
-                        filters=market.filters,
-                        order_book=market.order_book,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason="GUNLUK_ZARAR_OTOMATIK_CIKIS",
-                        settings=settings,
-                        now_utc=now_utc,
-                        track="MAIN",
-                    )
-                self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
+                if record_equity_snapshot:
+                    self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
                 return StepCycleSummary(
                     ok=True,
                     timestamp_iso=now_iso,
@@ -580,40 +663,24 @@ class TradingSystemEngine:
                     else ("TRAILING_KAR" if locked_trailing else ("ZARAR_KES" if stop_hit else "KAR_AL"))
                 )
                 exit_sig = f"{exit_tag}:{pos.position_id}:{tech_signal.candle_open_time_ms}"
-                if is_live_spot:
-                    closed_ord = self.live_executor.execute_live_market_sell(
-                        position=pos,
-                        filters=market.filters,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason=exit_tag,
-                        ui_live_confirmed=ui_live_confirmed,
-                        stop_requested=stop_requested,
+                closed_ord, exit_err = _run_protective_sell(pos, exit_sig, exit_tag)
+                if exit_err is not None:
+                    return StepCycleSummary(
+                        ok=False,
+                        timestamp_iso=now_iso,
+                        symbol=market.symbol,
+                        interval=market.interval,
+                        data_source=market.source_label,
+                        wake_gap_detected=False,
+                        tech_signal=tech_signal,
+                        ai_decision=None,
+                        final_action="BEKLE",
+                        executed_order=None,
+                        block_or_info_message=f"Koruyucu {exit_tag} çıkışı tamamlanamadı: {exit_err}",
+                        error_message=exit_err,
                     )
-                    self._resolve_live_unvalued_commissions(quote_ccy, settings)
-                elif is_live_margin:
-                    closed_ord = self.live_margin_executor.execute_live_margin_sell(
-                        position=pos,
-                        filters=market.filters,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason=exit_tag,
-                        ui_live_confirmed=ui_live_confirmed,
-                        ui_margin_confirmed=ui_margin_confirmed,
-                    )
-                else:
-                    closed_ord = self.simulator.execute_sell_position(
-                        position=pos,
-                        filters=market.filters,
-                        order_book=market.order_book,
-                        signal_key=exit_sig,
-                        strategy_source="RISK_KORUMA",
-                        close_reason=exit_tag,
-                        settings=settings,
-                        now_utc=now_utc,
-                        track="MAIN",
-                    )
-                self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
+                if record_equity_snapshot:
+                    self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
                 return StepCycleSummary(
                     ok=True,
                     timestamp_iso=now_iso,
@@ -720,6 +787,14 @@ class TradingSystemEngine:
                 ):
                     block_reason = f"Uzman filtre: {expert_why}; alım atlandı."
                     info_msg = block_reason
+                elif (
+                    getattr(settings, "expert_mode", False)
+                    and quant_assessment is not None
+                    and not quant_assessment.entry_allowed
+                    and quant_assessment.block_reason
+                ):
+                    block_reason = quant_assessment.block_reason
+                    info_msg = block_reason
                 else:
                     risk_chk = self.risk_manager.check_buy_entry(
                         filters=market.filters,
@@ -740,6 +815,26 @@ class TradingSystemEngine:
                             buy_settings, buy_qty, buy_notional = self._expert_adjust_buy(
                                 settings, market, tech_signal, risk_chk, bid_map, active_track
                             )
+                            if (
+                                quant_assessment is not None
+                                and Decimal("0") < Decimal(str(quant_assessment.sizing_multiplier)) < Decimal("1")
+                                and best_ask > Decimal("0")
+                            ):
+                                mult = Decimal(str(quant_assessment.sizing_multiplier))
+                                scaled_notional = max(
+                                    buy_notional * mult,
+                                    market.filters.min_notional * Decimal("1.05"),
+                                )
+                                if scaled_notional < buy_notional:
+                                    scaled_qty = quantize_down(scaled_notional / best_ask, market.filters.market_step_size)
+                                    eff_min_q = max(market.filters.min_qty, market.filters.market_min_qty)
+                                    if (
+                                        scaled_qty >= eff_min_q
+                                        and scaled_qty * best_ask >= market.filters.min_notional
+                                        and scaled_qty < buy_qty
+                                    ):
+                                        buy_qty = scaled_qty
+                                        buy_notional = scaled_qty * best_ask
                         sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
                         if is_live_spot:
                             try:
@@ -889,7 +984,8 @@ class TradingSystemEngine:
             quote_asset=quote_ccy,
         )
 
-        self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
+        if record_equity_snapshot:
+            self._record_snapshot(market.symbol, mid_price, best_bid, settings, now_iso, ist_date, track=active_track)
 
         return StepCycleSummary(
             ok=True,

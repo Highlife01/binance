@@ -87,6 +87,15 @@ def test_dashboard_dom_ids_and_required_controls() -> None:
         "ordersBody",
         "aiUsageText",
         "decisionsBody",
+        "loginRedirectBtn",
+        "quantDeskSection",
+        "quantDeskBody",
+        "quantMeta",
+        "quantResearchSection",
+        "researchPromptInp",
+        "researchTfSel",
+        "runResearchBtn",
+        "researchOutput",
     }
     assert required_static <= ids_static
 
@@ -113,6 +122,11 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "updateWatchSymbol" in js
     assert "add_scan_symbol" in js
     assert "remove_scan_symbol" in js
+    assert "signInWithRedirect" in js
+    assert "getRedirectResult" in js
+    assert "/api/research" in js
+    assert "renderQuantDesk" in js
+    assert "renderResearchResult" in js
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:

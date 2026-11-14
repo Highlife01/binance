@@ -11,10 +11,12 @@ TradeCebrail 7/24 Bulut Alım-Satım Motoru ve Sahip Doğrulamalı Kontrol API's
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import gzip
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -41,13 +43,14 @@ from google.oauth2 import id_token
 import requests
 
 from binance_ai_bot.config import AppConfig
-from binance_ai_bot.domain import RiskSettings, is_substep_dust_position
+from binance_ai_bot.domain import RiskSettings, is_effective_dust_position, is_substep_dust_position
 from binance_ai_bot.engine import StepCycleSummary, TradingSystemEngine
 from binance_ai_bot.expert import pick_scan_symbols
 from binance_ai_bot.live_executor import LiveExecutionError
-from binance_ai_bot.market_data import MarketDataError
+from binance_ai_bot.market_data import BinancePublicDataClient, MarketDataError
 from binance_ai_bot.notifier import TelegramNotifier
 from binance_ai_bot.profiles import TRADING_PROFILES, TradingProfile, get_profile
+from binance_ai_bot.quant_desk import build_research_plan, process_telegram_command, run_quant_research
 from binance_ai_bot.risk import compute_open_position_unrealized_net_pnl
 from binance_ai_bot.runner import DEFAULT_SCAN_SYMBOLS
 from binance_ai_bot.security import LiveOrderBlockedError, STABLECOIN_OR_FIAT_ASSETS, redact_secrets
@@ -229,35 +232,58 @@ class GcsSqliteSync:
     def __init__(self, bucket: str, object_name: str = "sanal_sistem.db") -> None:
         self.bucket = bucket.strip()
         self.object_name = object_name.strip() or "sanal_sistem.db"
+        self._session_lock = threading.Lock()
+        self._session: AuthorizedSession | None = None
+
+    def _get_session(self) -> AuthorizedSession:
+        with self._session_lock:
+            if self._session is None:
+                credentials, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
+                )
+                self._session = AuthorizedSession(credentials)
+            return self._session
+
+    def _reset_session(self) -> None:
+        with self._session_lock:
+            sess = self._session
+            self._session = None
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
     def restore(self, db_path: Path) -> bool:
         if not self.bucket:
             return False
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
-        )
         url = (
             f"https://storage.googleapis.com/storage/v1/b/{quote(self.bucket, safe='')}"
             f"/o/{quote(self.object_name, safe='')}?alt=media"
         )
         tmp_path = db_path.with_suffix(".restore.tmp")
-        with AuthorizedSession(credentials) as session:
-            with session.get(
-                url, timeout=(4.0, 20.0), stream=True, headers={"Cache-Control": "no-cache"}
-            ) as resp:
-                if resp.status_code == 404:
-                    return False
-                if resp.status_code != 200:
-                    raise RuntimeError(f"GCS durum okuma hatası: HTTP {resp.status_code}")
-                buf = bytearray()
-                for chunk in resp.iter_content(chunk_size=65_536):
-                    buf.extend(chunk)
-                    if len(buf) > MAX_DB_BYTES:
-                        raise RuntimeError("GCS durum nesnesi izin verilen boyutu aştı.")
-        if len(buf) < 100 or bytes(buf[:16]) != SQLITE_MAGIC:
+        session = self._get_session()
+        with session.get(
+            url, timeout=(6.0, 30.0), stream=True, headers={"Cache-Control": "no-cache"}
+        ) as resp:
+            if resp.status_code == 404:
+                return False
+            if resp.status_code != 200:
+                raise RuntimeError(f"GCS durum okuma hatası: HTTP {resp.status_code}")
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=65_536):
+                buf.extend(chunk)
+                if len(buf) > MAX_DB_BYTES:
+                    raise RuntimeError("GCS durum nesnesi izin verilen boyutu aştı.")
+        raw_bytes = bytes(buf)
+        if raw_bytes.startswith(b"\x1f\x8b"):
+            raw_bytes = gzip.decompress(raw_bytes)
+            if len(raw_bytes) > MAX_DB_BYTES:
+                raise RuntimeError("GCS açılmış durum nesnesi izin verilen boyutu aştı.")
+        if len(raw_bytes) < 100 or raw_bytes[:16] != SQLITE_MAGIC:
             raise RuntimeError("GCS üzerindeki durum nesnesi geçerli bir SQLite veritabanı değil.")
-        tmp_path.write_bytes(buf)
+        tmp_path.write_bytes(raw_bytes)
         for suffix in ("-wal", "-shm"):
             sidecar = Path(f"{db_path}{suffix}")
             if sidecar.exists():
@@ -269,22 +295,37 @@ class GcsSqliteSync:
         if not self.bucket or not db_path.exists():
             return False
         payload = snapshot_sqlite_bytes(db_path)
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
-        )
+        if len(payload) >= 8192:
+            upload_bytes = gzip.compress(payload, compresslevel=6)
+            content_type = "application/octet-stream"
+        else:
+            upload_bytes = payload
+            content_type = "application/x-sqlite3"
         url = (
             f"https://storage.googleapis.com/upload/storage/v1/b/{quote(self.bucket, safe='')}"
             f"/o?uploadType=media&name={quote(self.object_name, safe='')}"
         )
-        with AuthorizedSession(credentials) as session:
+        session = self._get_session()
+        try:
             resp = session.post(
                 url,
-                data=payload,
-                headers={"Content-Type": "application/x-sqlite3"},
-                timeout=(4.0, 25.0),
+                data=upload_bytes,
+                headers={"Content-Type": content_type},
+                timeout=(6.0, 40.0),
             )
-            if resp.status_code not in (200, 201):
-                raise RuntimeError(f"GCS durum yazma hatası: HTTP {resp.status_code}")
+        except Exception:
+            self._reset_session()
+            session = self._get_session()
+            resp = session.post(
+                url,
+                data=upload_bytes,
+                headers={"Content-Type": content_type},
+                timeout=(6.0, 40.0),
+            )
+        if resp.status_code not in (200, 201):
+            if resp.status_code in (401, 403):
+                self._reset_session()
+            raise RuntimeError(f"GCS durum yazma hatası: HTTP {resp.status_code}")
         return True
 
 
@@ -309,6 +350,7 @@ class CloudBotApplication:
         self._engine: TradingSystemEngine | None = engine
         self._initialized = engine is not None
         self._bid_cache: dict[str, tuple[float, Decimal]] = {}
+        self._scan_count: int = 0
         self.notifier = TelegramNotifier()
 
         if self._engine is not None:
@@ -334,7 +376,14 @@ class CloudBotApplication:
             eng.lock_benchmark_symbol = True
             eng.allow_live_margin = True
             created_defaults = self._ensure_cloud_defaults(eng.storage)
-            if created_defaults:
+            compacted = False
+            if self.config.db_path.exists() and self.config.db_path.stat().st_size > 1_200_000:
+                try:
+                    eng.storage.prune_history()
+                    compacted = True
+                except Exception as exc:
+                    logging.warning("Baslangic DB budama uyarisi: %s", _safe_text(exc))
+            if created_defaults or compacted:
                 try:
                     self.state_sync.persist(self.config.db_path)
                 except Exception as exc:
@@ -532,16 +581,29 @@ class CloudBotApplication:
     def _get_live_bids_for_positions(self, eng: TradingSystemEngine, positions: list[Any]) -> dict[str, Decimal]:
         bids: dict[str, Decimal] = {}
         now_mono = time.monotonic()
+        uncached: set[str] = set()
         for pos in positions:
             cached = self._bid_cache.get(pos.symbol)
-            if cached and (now_mono - cached[0]) <= 6.0:
+            if cached and (now_mono - cached[0]) <= 8.0:
                 bids[pos.symbol] = cached[1]
-                continue
+            else:
+                uncached.add(pos.symbol)
+        if uncached and callable(getattr(eng.market_client, "fetch_book_tickers", None)):
             try:
-                ob = eng.market_client.fetch_order_book(pos.symbol, depth_limit=5)
+                batch = eng.market_client.fetch_book_tickers(uncached)
+                for sym, bid_px in (batch or {}).items():
+                    if bid_px is not None and bid_px > 0:
+                        bids[sym] = bid_px
+                        self._bid_cache[sym] = (now_mono, bid_px)
+                        uncached.discard(sym)
+            except Exception:
+                pass
+        for sym in uncached:
+            try:
+                ob = eng.market_client.fetch_order_book(sym, depth_limit=5)
                 if ob.best_bid is not None and ob.best_bid > 0:
-                    bids[pos.symbol] = ob.best_bid
-                    self._bid_cache[pos.symbol] = (now_mono, ob.best_bid)
+                    bids[sym] = ob.best_bid
+                    self._bid_cache[sym] = (now_mono, ob.best_bid)
             except Exception:
                 pass
         return bids
@@ -661,10 +723,13 @@ class CloudBotApplication:
         is_live_margin = mode == "LIVE_MARGIN"
 
         prefetched_live = False
+        live_free_balances: dict[str, Decimal] | None = None
         last_error = ""
         if is_live_spot:
             try:
-                eng.live_executor.fetch_live_spot_balances(ui_live_confirmed=True, quote_asset="USDT")
+                live_free_balances = eng.live_executor.fetch_live_spot_balances(
+                    ui_live_confirmed=True, quote_asset="USDT"
+                )
                 prefetched_live = True
             except Exception as exc:
                 last_error = self._friendly_live_error(str(exc))
@@ -679,7 +744,24 @@ class CloudBotApplication:
                 last_error = self._friendly_live_error(str(exc))
                 st.set_state("cloud_last_error", last_error)
 
-        open_now = [p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]
+        ex_cache = getattr(eng.market_client, "_exchange_info_cache", {}) or {}
+
+        def _is_non_dust(pos_obj: Any) -> bool:
+            flt = ex_cache.get(pos_obj.symbol)
+            free_b = (
+                live_free_balances.get(flt.base_asset)
+                if (is_live_spot and flt is not None and live_free_balances is not None)
+                else None
+            )
+            bid_c = self._bid_cache.get(pos_obj.symbol)
+            return not is_effective_dust_position(
+                pos_obj,
+                flt,
+                mark_price=bid_c[1] if bid_c else pos_obj.entry_price,
+                free_base_qty=free_b,
+            )
+
+        open_now = [p for p in st.get_open_positions(track=track) if _is_non_dust(p)]
         open_syms = list(dict.fromkeys(p.symbol for p in open_now))
         paused, _ = st.is_new_entries_paused(track=track)
         if len(open_now) < settings.max_open_positions and not paused:
@@ -687,13 +769,49 @@ class CloudBotApplication:
         else:
             cycle_symbols = open_syms if open_syms else scan_symbols[:3]
 
+        # Canlı ağ istemcisinde piyasa demetlerini paralel ön-yükle (14 ardışık isteği ~2-3 saniyeye indirir)
+        prefetched_bundles: dict[str, Any] = {}
+        if (
+            isinstance(eng.market_client, BinancePublicDataClient)
+            and getattr(eng.market_client, "_external_client", None) is None
+            and len(cycle_symbols) > 1
+        ):
+            try:
+                eng.market_client.fetch_server_time_ms()
+                eng.market_client.discover_spot_pairs(
+                    quote_asset="USDT",
+                    allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
+                )
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = {
+                        pool.submit(
+                            eng.market_client.fetch_verified_market_bundle,
+                            symbol=s,
+                            interval=profile.interval,
+                            allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
+                        ): s
+                        for s in cycle_symbols
+                    }
+                    for fut in as_completed(futures, timeout=18.0):
+                        s = futures[fut]
+                        try:
+                            prefetched_bundles[s] = fut.result()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        eng.lock_benchmark_symbol = True
         scanned: list[dict[str, Any]] = []
         orders_executed = 0
-        for sym in cycle_symbols:
-            cur_open = [p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]
+        for idx, sym in enumerate(cycle_symbols):
+            if (time.monotonic() - t_cycle_start) > 25.0 and idx > 0:
+                break
+            cur_open = [p for p in st.get_open_positions(track=track) if _is_non_dust(p)]
             cur_open_syms = {p.symbol for p in cur_open}
             if sym not in cur_open_syms and (len(cur_open) >= settings.max_open_positions or paused):
                 break
+            is_last = idx == len(cycle_symbols) - 1 or (time.monotonic() - t_cycle_start) > 22.0
             res: StepCycleSummary = eng.run_analysis_step(
                 symbol=sym,
                 interval=profile.interval,
@@ -707,6 +825,9 @@ class CloudBotApplication:
                 strategy_params=profile.strategy,
                 ai_only_on_rule_signal=(len(scan_symbols) > 1),
                 skip_balance_prefetch=prefetched_live,
+                prefetched_market=prefetched_bundles.get(sym),
+                record_equity_snapshot=is_last,
+                live_free_balances=live_free_balances,
             )
             if res.symbol and sym in eng._latest_bid_map:
                 self._bid_cache[sym] = (time.monotonic(), eng._latest_bid_map[sym])
@@ -730,7 +851,7 @@ class CloudBotApplication:
                 res.executed_order is not None
                 and res.executed_order.side == "BUY"
                 and res.executed_order.status in ("FILLED", "PARTIALLY_FILLED")
-                and len([p for p in st.get_open_positions(track=track) if not is_substep_dust_position(p)]) >= settings.max_open_positions
+                and len([p for p in st.get_open_positions(track=track) if _is_non_dust(p)]) >= settings.max_open_positions
             ):
                 break
 
@@ -768,6 +889,13 @@ class CloudBotApplication:
                 if Decimal("0") < m_lvl < Decimal("1.30") and (now_ts - last_warn) > 1800:
                     self.notifier.send(f"🚨 Marjin seviyesi düşük: {m_lvl:.2f} (likidasyon ~1.10). Pozisyonları kontrol edin.")
                     st.set_state("cloud_margin_warn_ts", str(now_ts))
+        self._scan_count += 1
+        db_too_big = self.config.db_path.exists() and self.config.db_path.stat().st_size > 1_200_000
+        if self._scan_count % 10 == 0 or db_too_big:
+            try:
+                st.prune_history()
+            except Exception as exc:
+                logging.warning("DB budama uyarisi: %s", _safe_text(exc))
         self.state_sync.persist(self.config.db_path)
         return summary_obj
 
@@ -1131,6 +1259,14 @@ class CloudBotApplication:
             "recent_orders": order_rows,
             "recent_decisions": decision_rows,
             "equity_history": eq_rows,
+            "quant_desk": {
+                "items": sorted(
+                    list(getattr(eng, "latest_quant_summaries", {}).values()),
+                    key=lambda x: float(x.get("quant_score", 0) or 0),
+                    reverse=True,
+                )[:12],
+                "model": "Kronos+skfolio+Hummingbot+FreqAI+Nautilus",
+            },
             "profiles_catalog": [
                 {
                     "key": p.key,
@@ -1141,6 +1277,60 @@ class CloudBotApplication:
                 for p in TRADING_PROFILES.values()
             ],
         }
+
+    def _handle_research(self, eng: TradingSystemEngine, payload: dict[str, Any]) -> dict[str, Any]:
+        """QuantDinger tarzı doğal dil strateji araştırması ve nedensel backtest yürütür."""
+        question = _safe_text(payload.get("question", ""), 300) or "SOLUSDT 5m 360 mum RSI dip stratejisi test et"
+        raw_sym = str(payload.get("symbol", "") or "").strip().upper()
+        raw_tf = str(payload.get("interval", "") or "").strip().lower()
+        if _SYMBOL_RE.fullmatch(raw_sym) and raw_sym not in question.upper():
+            question = f"{raw_sym} {question}"
+        if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"} and raw_tf not in question.lower():
+            question = f"{question} {raw_tf}"
+        params_active = self._active_cloud_params(eng)
+        default_sym = raw_sym if _SYMBOL_RE.fullmatch(raw_sym) else (params_active["symbols"][0] if params_active["symbols"] else "SOLUSDT")
+        default_tf = raw_tf if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"} else params_active["profile"].interval
+
+        plan = build_research_plan(question, default_symbol=default_sym, default_interval=default_tf)
+        if _SYMBOL_RE.fullmatch(raw_sym) and raw_sym not in plan["symbols"]:
+            plan["symbols"] = [raw_sym] + plan["symbols"][:2]
+        if raw_tf in {"1m", "3m", "5m", "15m", "30m", "1h", "4h"}:
+            plan["interval"] = raw_tf
+
+        spot_filters = eng.market_client.discover_spot_pairs(quote_asset="USDT")
+        candles_by_sym: dict[str, list[Any]] = {}
+        books_by_sym: dict[str, Any] = {}
+        filters_by_sym: dict[str, Any] = {}
+
+        lookback = max(140, min(1000, int(payload.get("lookback") or plan["lookback"])))
+        for sym in plan["symbols"][:2]:
+            if sym in spot_filters:
+                filters_by_sym[sym] = spot_filters[sym]
+            try:
+                bundle = eng.market_client.fetch_verified_market_bundle(
+                    symbol=sym,
+                    interval=plan["interval"],
+                    candle_limit=lookback,
+                )
+                candles_by_sym[sym] = bundle.closed_candles
+                books_by_sym[sym] = bundle.order_book
+                filters_by_sym[sym] = bundle.filters
+            except Exception as exc:
+                if not candles_by_sym and hasattr(eng.market_client, "fetch_closed_candles"):
+                    c_list = eng.market_client.fetch_closed_candles(sym, plan["interval"], limit=lookback)
+                    candles_by_sym[sym] = c_list
+                if not candles_by_sym:
+                    raise MarketDataError(str(exc))
+
+        report = run_quant_research(
+            question=question,
+            closed_candles_by_symbol=candles_by_sym,
+            order_books_by_symbol=books_by_sym,
+            filters_by_symbol=filters_by_sym,
+            settings=params_active["settings"],
+            initial_balance=self.config.initial_balance_usdc,
+        )
+        return report
 
     def _apply_settings_update(self, eng: TradingSystemEngine, payload: dict[str, Any]) -> str:
         st = eng.storage
@@ -1574,6 +1764,44 @@ class CloudBotApplication:
                         self._op_lock.release()
             return respond(200, {"ok": True, "skipped": False, "summary": tick_summary})
 
+        if route == "/api/telegram/webhook":
+            if method != "POST":
+                return respond(405, {"error": "Yalnızca POST desteklenir."})
+            wh_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+            if wh_secret:
+                got_sec = normalized.get("x-telegram-bot-api-secret-token", "")
+                if not got_sec or not hmac.compare_digest(got_sec.encode("utf-8"), wh_secret.encode("utf-8")):
+                    return respond(401, {"error": "Yetkisiz Telegram webhook çağrısı."})
+            if len(body_bytes) > MAX_BODY_BYTES:
+                return respond(413, {"error": "İstek gövdesi çok büyük."})
+            try:
+                upd = json.loads(body_bytes.decode("utf-8") or "{}")
+            except Exception:
+                upd = {}
+            msg_obj = upd.get("message") if isinstance(upd, dict) else None
+            if isinstance(msg_obj, dict) and self.notifier.enabled:
+                chat_id = (msg_obj.get("chat") or {}).get("id", "")
+                text = str(msg_obj.get("text") or "")
+                if text:
+                    with self._op_lock:
+                        eng_tg = self._get_engine()
+                        track_tg = self._active_cloud_params(eng_tg)["track"]
+
+                        def _set_pause_tg(paused_flag: bool, reason_txt: str) -> None:
+                            eng_tg.storage.set_new_entries_paused(paused_flag, reason_txt, track=track_tg)
+                            self.state_sync.persist(self.config.db_path)
+
+                        reply = process_telegram_command(
+                            chat_id=chat_id,
+                            expected_chat_id=self.notifier.chat_id,
+                            text=text,
+                            dashboard_provider=lambda: self._build_dashboard(eng_tg),
+                            pause_setter=_set_pause_tg,
+                        )
+                        if reply:
+                            self.notifier.send(reply)
+            return respond(200, {"ok": True})
+
         known_owner_routes = {
             "/status",
             "/api/status",
@@ -1585,6 +1813,7 @@ class CloudBotApplication:
             "/api/close-positions",
             "/api/margin-liquidate",
             "/api/reset-paper",
+            "/api/research",
         }
         if route not in known_owner_routes:
             return respond(404, {"error": "Adres bulunamadı."})
@@ -1675,6 +1904,8 @@ class CloudBotApplication:
                     )
                 if route == "/api/margin-liquidate":
                     return respond(200, self._handle_margin_liquidate(eng, payload))
+                if route == "/api/research":
+                    return respond(200, self._handle_research(eng, payload))
                 if route == "/api/reset-paper":
                     if str(payload.get("confirm", "")).strip().upper() != "SIFIRLA":
                         return respond(400, {"error": "Sıfırlama onayı için 'SIFIRLA' gönderilmelidir."})

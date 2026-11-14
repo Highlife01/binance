@@ -929,6 +929,9 @@
       <button id="loginBtn" class="btn-blue" type="button" style="width:100%;padding:12px;font-size:0.95rem;">
         Google ile Güvenli Giriş Yap
       </button>
+      <button id="loginRedirectBtn" type="button" style="width:100%;padding:10px;font-size:0.86rem;margin-top:10px;">
+        Yönlendirme ile Giriş Yap (Popup / Ağ Hatasında)
+      </button>
       <div id="authError" class="alert hidden" style="margin-top:16px;text-align:left;"></div>
     </div>
 
@@ -1038,6 +1041,74 @@
         <div style="font-size:0.84rem;font-weight:700;color:#e2e8f0;margin-bottom:8px;">⚡ Dengeli Momentum &amp; Skorlu Fırsat Evreni (5M+ USDT · Otomatik Tarama)</div>
         <div id="perfUniverse" class="universe-grid">
           <div class="muted">Henüz fırsat evreni verisi yok — tarama tamamlandığında burada skorlu coin kartları görünür.</div>
+        </div>
+      </section>
+
+      <!-- 6-Repo Kantitatif Hedge-Fon Motoru -->
+      <section class="section" id="quantDeskSection">
+        <div class="section-head">
+          <div>
+            <h3>📊 Kantitatif Hedge-Fon Motoru <span class="badge badge-teal">Kronos · skfolio · Hummingbot · FreqAI</span></h3>
+            <div class="muted" style="font-size:0.76rem;margin-top:3px;">AI tahmin/boyutlandırma üretir; hızlı emir yolu her zaman deterministik kurallar + risk korumasıyla yürütülür.</div>
+          </div>
+          <span class="muted num" id="quantMeta">İlk tarama bekleniyor...</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Coin</th>
+                <th class="tr">Skor</th>
+                <th class="tr">Kronos +5m (p10..p90)</th>
+                <th class="tr">FreqAI &amp; DI Kapısı</th>
+                <th class="tr">Hummingbot L2 / NATR</th>
+                <th class="tr">skfolio VaR/CVaR · Çarpan</th>
+                <th>Durum</th>
+              </tr>
+            </thead>
+            <tbody id="quantDeskBody">
+              <tr><td colspan="7" class="muted">Henüz kantitatif tarama telemetrisi yok — "▶️ Şimdi Piyasayı Tara" veya cron sonrası dolar.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Doğal Dil AI Kantitatif Araştırma & Backtest Laboratuvarı -->
+      <section class="section" id="quantResearchSection">
+        <div class="section-head">
+          <div>
+            <h3>🔬 Kantitatif Araştırma &amp; Geriye Dönük Test (Lookahead-Free)</h3>
+            <div class="muted" style="font-size:0.76rem;margin-top:3px;">Sorunuzu Türkçe/İngilizce yazın; kapalı Binance mumlarında nedensel backtest + Sharpe/Sortino + Kronos olasılık dağılımı anında hesaplansın.</div>
+          </div>
+          <span class="badge badge-blue">QuantDinger · Nautilus Eşliği</span>
+        </div>
+        <div class="controls-row" style="margin-bottom:10px;">
+          <div class="field" style="flex:3;min-width:240px;">
+            <label for="researchPromptInp">Araştırma / Strateji Sorgusu</label>
+            <input type="text" id="researchPromptInp" maxlength="280" placeholder="Ör. SOLUSDT için 5m 400 mumda RSI dip dönüşü test et" value="SOLUSDT için 5m 360 mumda RSI dip dönüşü test et" />
+          </div>
+          <div class="field" style="min-width:110px;">
+            <label for="researchTfSel">Zaman Dilimi</label>
+            <select id="researchTfSel">
+              <option value="1m">1m</option>
+              <option value="5m" selected>5m</option>
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+            </select>
+          </div>
+          <div class="field" style="justify-content:flex-end;">
+            <button id="runResearchBtn" class="btn-primary" type="button" style="height:38px;">🧪 Backtest Çalıştır</button>
+          </div>
+        </div>
+        <div class="chips-wrap" id="researchPresets" style="margin-bottom:12px;">
+          <button type="button" class="toggle-chip research-preset" data-q="SOLUSDT için 5m 400 mumda RSI dip dönüşü test et" data-tf="5m">SOL Dip Dönüşü</button>
+          <button type="button" class="toggle-chip research-preset" data-q="BTCUSDT için 15m 500 mumda momentum kırılımı test et" data-tf="15m">BTC 15m Momentum</button>
+          <button type="button" class="toggle-chip research-preset" data-q="ETHUSDT için 5m 450 mumda güvenli düşük drawdown testi" data-tf="5m">ETH Güvenli Koruma</button>
+          <button type="button" class="toggle-chip research-preset" data-q="INJUSDT için 5m 360 mumda dengeli strateji testi" data-tf="5m">INJ Dengeli Test</button>
+        </div>
+        <div id="researchOutput" class="muted">
+          Strateji sorgusunu çalıştırdığınızda burada Sharpe, Sortino, MaxDD, Kronos tahmini ve portföy getiri eğrisi görünür.
         </div>
       </section>
 
@@ -1227,6 +1298,8 @@
       getAuth,
       GoogleAuthProvider,
       signInWithPopup,
+      signInWithRedirect,
+      getRedirectResult,
       signOut,
       onAuthStateChanged
     } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
@@ -1244,6 +1317,14 @@
     const auth = getAuth(app);
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
+
+    getRedirectResult(auth).catch((err) => {
+      const box = document.getElementById("authError");
+      if (box && err && err.message) {
+        box.textContent = `Giriş hatası: ${err.message}`;
+        box.classList.remove("hidden");
+      }
+    });
 
     const $ = (id) => document.getElementById(id);
     const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -1964,9 +2045,114 @@
       renderEquityChart(d);
       renderPerformance(d);
       renderUniverse(d);
+      renderQuantDesk(d);
       renderPositions(d);
       renderOrders(d);
       renderDecisions(d);
+    }
+
+    function renderQuantDesk(d) {
+      const qd = d && d.quant_desk ? d.quant_desk : {};
+      const items = Array.isArray(qd.items) ? qd.items : [];
+      const body = $("quantDeskBody");
+      const meta = $("quantMeta");
+      if (!body || !meta) return;
+      const sig = JSON.stringify(items);
+      if (renderSigs.quantDesk === sig) return;
+      renderSigs.quantDesk = sig;
+
+      if (!items.length) {
+        meta.textContent = "Tarama sonrası güncellenir";
+        body.innerHTML = `<tr><td colspan="7" class="muted">Henüz kantitatif tarama telemetrisi yok — bir sonraki tarama döngüsünde dolar.</td></tr>`;
+        return;
+      }
+
+      meta.textContent = `${items.length} parite • ${qd.model || "6-Repo Quant"}`;
+      body.innerHTML = items.map((it) => {
+        const sc = Number(it.quant_score || 0);
+        const scCls = sc >= 62 ? "badge-green" : (sc >= 45 ? "badge-amber" : "badge-slate");
+        const kp50 = Number(it.kronos_p50_pct || 0);
+        const kp10 = Number(it.kronos_p10_pct || 0);
+        const kp90 = Number(it.kronos_p90_pct || 0);
+        const kup = Math.round(Number(it.kronos_up_prob || 0) * 100);
+        const fProb = Math.round(Number(it.freqai_prob_up || 0) * 100);
+        const fDi = Number(it.freqai_di || 0);
+        const diBadge = it.freqai_do_predict
+          ? `<span class="badge badge-teal num">DI ${fDi.toFixed(2)} OK</span>`
+          : `<span class="badge badge-red num">DI ${fDi.toFixed(2)} ENGEL</span>`;
+        const spr = Number(it.l2_spread_bps || 0);
+        const imb = Number(it.l2_imbalance || 0);
+        const natr = Number(it.natr_pct || 0);
+        const mult = Number(it.sizing_multiplier || 1);
+        const var95 = Number(it.portfolio_var_95 || 0);
+        const cvar95 = Number(it.portfolio_cvar_95 || 0);
+        const statusCell = it.entry_allowed
+          ? `<span class="badge badge-green">ONAY</span>`
+          : `<span class="badge badge-red" title="${esc(it.block_reason || "")}">FİLTRE</span>`;
+        return `<tr>
+          <td><b>${esc(String(it.symbol || "").replace("USDT", ""))}</b> <span class="muted" style="font-size:0.72rem;">${esc(it.interval || "")}</span></td>
+          <td class="tr"><span class="badge ${scCls} num">${sc.toFixed(1)}</span></td>
+          <td class="tr num">
+            <b class="${kp50 >= 0 ? "pos" : "neg"}">${kp50 >= 0 ? "+" : ""}${kp50.toFixed(2)}%</b>
+            <span class="muted" style="font-size:0.72rem;">(%${kup}↑ · ${kp10.toFixed(1)}..${kp90.toFixed(1)})</span>
+          </td>
+          <td class="tr num">%${fProb}↑ · ${diBadge}</td>
+          <td class="tr num">${spr.toFixed(1)}bps · ${imb >= 0 ? "+" : ""}${imb.toFixed(2)} · NATR %${natr.toFixed(2)}</td>
+          <td class="tr num">VaR %${var95.toFixed(2)} / CVaR %${cvar95.toFixed(2)} · <b>${mult.toFixed(2)}x</b></td>
+          <td>${statusCell}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderResearchResult(res) {
+      const box = $("researchOutput");
+      if (!box) return;
+      if (!res || !res.ok) {
+        box.innerHTML = `<div class="alert">${esc((res && res.error) || "Araştırma çalıştırılamadı.")}</div>`;
+        return;
+      }
+      const m = res.metrics || {};
+      const q = res.quant || {};
+      const curve = Array.isArray(res.equity_curve) ? res.equity_curve : [];
+
+      let chartHtml = `<div class="muted">Eğri için yeterli nokta üretilmedi.</div>`;
+      if (curve.length >= 2) {
+        const w = 680, h = 150, pad = 16;
+        const allVals = curve.flatMap((p) => [Number(p.strategy || 0), Number(p.benchmark || 0)]);
+        const minV = Math.min(...allVals);
+        const maxV = Math.max(...allVals);
+        const span = Math.max(maxV - minV, 0.01);
+        const toX = (i) => pad + (i / Math.max(curve.length - 1, 1)) * (w - pad * 2);
+        const toY = (v) => (h - pad) - ((v - minV) / span) * (h - pad * 2);
+        const sPts = curve.map((p, i) => `${toX(i).toFixed(1)},${toY(Number(p.strategy)).toFixed(1)}`).join(" ");
+        const bPts = curve.map((p, i) => `${toX(i).toFixed(1)},${toY(Number(p.benchmark)).toFixed(1)}`).join(" ");
+        chartHtml = `
+          <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:150px;display:block;background:rgba(15,23,42,0.45);border-radius:8px;border:1px solid var(--border);" role="img" aria-label="Backtest Getiri Eğrisi">
+            <polyline fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" points="${bPts}" />
+            <polyline fill="none" stroke="#2dd4bf" stroke-width="2.2" points="${sPts}" />
+          </svg>
+          <div class="muted" style="font-size:0.72rem;margin-top:4px;display:flex;gap:14px;">
+            <span><b style="color:#2dd4bf;">—</b> Strateji (${esc(res.strategy_mode)})</span>
+            <span><b style="color:#64748b;">- -</b> Al-ve-Tut Referans</span>
+          </div>`;
+      }
+
+      const netR = Number(m.net_return_pct || 0);
+      const benR = Number(m.benchmark_return_pct || 0);
+      box.innerHTML = `
+        <div class="chips-wrap" style="margin-bottom:10px;">
+          <span class="chip num">Parite: <b>${esc(res.symbol)} (${esc(res.interval)})</b></span>
+          <span class="chip num">Strateji Getirisi: <b class="${netR >= 0 ? "pos" : "neg"}">${netR >= 0 ? "+" : ""}${netR.toFixed(2)}%</b></span>
+          <span class="chip num">Al-Tut Referans: <b>${benR >= 0 ? "+" : ""}${benR.toFixed(2)}%</b></span>
+          <span class="chip num">Sharpe / Sortino: <b>${esc(m.sharpe)} / ${esc(m.sortino)}</b></span>
+          <span class="chip num">Profit Factor: <b>${esc(m.profit_factor)}</b></span>
+          <span class="chip num">MaxDD: <b class="neg">-%${esc(m.max_drawdown_pct)}</b></span>
+          <span class="chip num">İşlem / Başarı: <b>${esc(m.trade_count)} (%${esc(m.win_rate_pct)})</b></span>
+          <span class="chip num">Kronos +5m p50: <b>${Number(q.kronos_p50_pct || 0) >= 0 ? "+" : ""}${Number(q.kronos_p50_pct || 0).toFixed(2)}%</b> (%${Math.round(Number(q.kronos_up_prob || 0) * 100)}↑)</span>
+        </div>
+        <div style="font-size:0.84rem;color:#e2e8f0;margin-bottom:10px;line-height:1.5;">${esc(res.narrative_tr || "")}</div>
+        ${chartHtml}
+      `;
     }
 
     async function refreshDashboard(opts = {}) {
@@ -2121,9 +2307,31 @@
       try {
         await signInWithPopup(auth, provider);
       } catch (err) {
-        $("authError").textContent = `Giriş hatası: ${err.message}`;
+        const code = err && err.code ? String(err.code) : "";
+        if (code === "auth/network-request-failed") {
+          $("authError").textContent =
+            "Ağ hatası (auth/network-request-failed): Tarayıcı eklentisi (reklam/izleyici engelleyici), VPN veya ağ bağlantısı Google girişini engelliyor olabilir. Alttaki 'Yönlendirme ile Giriş Yap' düğmesini deneyin veya eklentiyi kapatıp yenileyin.";
+        } else if (code === "auth/popup-blocked") {
+          $("authError").textContent =
+            "Açılır pencere tarayıcı tarafından engellendi. Alttaki 'Yönlendirme ile Giriş Yap' düğmesini kullanabilirsiniz.";
+        } else {
+          $("authError").textContent = `Giriş hatası: ${err.message}`;
+        }
         $("authError").classList.remove("hidden");
       } finally {
+        setBtnBusy(btn, false);
+      }
+    });
+
+    $("loginRedirectBtn").addEventListener("click", async () => {
+      const btn = $("loginRedirectBtn");
+      $("authError").classList.add("hidden");
+      setBtnBusy(btn, true, "Google'a yönlendiriliyor...");
+      try {
+        await signInWithRedirect(auth, provider);
+      } catch (err) {
+        $("authError").textContent = `Yönlendirme hatası: ${err.message}`;
+        $("authError").classList.remove("hidden");
         setBtnBusy(btn, false);
       }
     });
@@ -2399,6 +2607,41 @@
 
     $("walletContent").addEventListener("click", handleMarginLiqClick);
     $("marginQuickBanner").addEventListener("click", handleMarginLiqClick);
+
+    async function executeResearchQuery() {
+      const btn = $("runResearchBtn");
+      const inp = $("researchPromptInp");
+      const tfSel = $("researchTfSel");
+      const box = $("researchOutput");
+      if (!btn || !inp || !box) return;
+      const question = String(inp.value || "").trim() || "SOLUSDT için 5m 360 mumda RSI dip dönüşü test et";
+      const interval = tfSel ? tfSel.value : "5m";
+      setBtnBusy(btn, true, "⏳ Test Ediliyor...");
+      box.textContent = "Binance kapalı mumları ve kantitatif backtest hesaplanıyor...";
+      try {
+        const res = await apiCall("/api/research", "POST", { question, interval }, 35000);
+        renderResearchResult(res);
+      } catch (err) {
+        box.innerHTML = `<div class="alert">${esc(err.message || "Araştırma hatası")}</div>`;
+      } finally {
+        setBtnBusy(btn, false);
+      }
+    }
+
+    if ($("runResearchBtn")) {
+      $("runResearchBtn").addEventListener("click", executeResearchQuery);
+    }
+    if ($("researchPresets")) {
+      $("researchPresets").addEventListener("click", (e) => {
+        const chip = e.target.closest(".research-preset");
+        if (!chip) return;
+        const q = chip.getAttribute("data-q") || "";
+        const tf = chip.getAttribute("data-tf") || "5m";
+        if ($("researchPromptInp")) $("researchPromptInp").value = q;
+        if ($("researchTfSel")) $("researchTfSel").value = tf;
+        executeResearchQuery();
+      });
+    }
 
     async function autoLoadWalletOnce() {
       if (walletAutoLoaded || !currentUser) return;

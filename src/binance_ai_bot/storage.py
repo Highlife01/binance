@@ -1041,3 +1041,75 @@ class SQLiteStorage:
             buf.write("bilgi\nKayit bulunamadi\n")
 
         return buf.getvalue().encode("utf-8-sig")
+
+    def prune_history(
+        self,
+        *,
+        max_decisions: int = 800,
+        max_snapshots: int = 1200,
+        max_ai_usage: int = 400,
+        max_intents: int = 200,
+        compact_threshold_bytes: int = 1_500_000,
+    ) -> dict[str, int]:
+        """Veritabanının Cloud Run / GCS kotasını aşmaması için eski telemetri satırlarını budar."""
+        removed = {"decisions": 0, "equity_snapshots": 0, "ai_usage": 0, "live_order_intents": 0}
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM decisions
+                WHERE id NOT IN (SELECT id FROM decisions ORDER BY id DESC LIMIT ?)
+                """,
+                (max(10, int(max_decisions)),),
+            )
+            removed["decisions"] = int(cur.rowcount or 0)
+
+            cur = conn.execute(
+                """
+                DELETE FROM equity_snapshots
+                WHERE id NOT IN (SELECT id FROM equity_snapshots ORDER BY id DESC LIMIT ?)
+                """,
+                (max(10, int(max_snapshots)),),
+            )
+            removed["equity_snapshots"] = int(cur.rowcount or 0)
+
+            cur = conn.execute(
+                """
+                DELETE FROM ai_usage
+                WHERE id NOT IN (SELECT id FROM ai_usage ORDER BY id DESC LIMIT ?)
+                """,
+                (max(10, int(max_ai_usage)),),
+            )
+            removed["ai_usage"] = int(cur.rowcount or 0)
+
+            cur = conn.execute(
+                """
+                DELETE FROM live_order_intents
+                WHERE status IN ('APPLIED', 'REJECTED')
+                  AND signal_key NOT IN (
+                      SELECT signal_key FROM live_order_intents
+                      WHERE status IN ('APPLIED', 'REJECTED')
+                      ORDER BY updated_at_iso DESC LIMIT ?
+                  )
+                """,
+                (max(10, int(max_intents)),),
+            )
+            removed["live_order_intents"] = int(cur.rowcount or 0)
+
+        total_removed = sum(removed.values())
+        db_size = self.db_path.stat().st_size if self.db_path.exists() else 0
+        if total_removed > 0 or db_size >= compact_threshold_bytes:
+            self.compact_database()
+        return removed
+
+    def compact_database(self) -> int:
+        """WAL checkpoint + VACUUM ile SQLite dosya boyutunu fiziksel olarak küçültür."""
+        if getattr(self._transaction_state, "connection", None) is not None:
+            return int(self.db_path.stat().st_size) if self.db_path.exists() else 0
+        conn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.execute("VACUUM;")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        finally:
+            conn.close()
+        return int(self.db_path.stat().st_size) if self.db_path.exists() else 0

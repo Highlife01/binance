@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -218,9 +220,14 @@ class BinancePublicDataClient:
         self.config = config
         self._external_client = http_client
         self._shared_client: httpx.Client | None = None
+        self._lock = threading.RLock()
         self._base_urls = self._build_base_url_list()
         self._exchange_info_cache: dict[str, SymbolFilters] = {}
         self._exchange_info_fetched_at: float = 0.0
+        self._server_time_offset_ms: int | None = None
+        self._server_time_fetched_at: float = 0.0
+        self._book_tickers_cache: dict[str, Decimal] = {}
+        self._book_tickers_fetched_at: float = 0.0
         self._cooldown_until_monotonic: float = 0.0
         self._consecutive_failures: int = 0
         self._last_wall_clock_ts: float | None = None
@@ -258,7 +265,10 @@ class BinancePublicDataClient:
         threshold = max(expected_cycle_seconds * 3, 180)
         if elapsed > threshold:
             # Uyku modundan uyanıldı veya uzun süre ara verildi; önbelleği sıfırla
-            self._exchange_info_fetched_at = 0.0
+            with self._lock:
+                self._exchange_info_fetched_at = 0.0
+                self._server_time_fetched_at = 0.0
+                self._book_tickers_fetched_at = 0.0
             return True
         return False
 
@@ -336,21 +346,88 @@ class BinancePublicDataClient:
         """
         if self._external_client is not None:
             return self._external_client
-        if self._shared_client is None:
-            self._shared_client = httpx.Client(
-                timeout=8.0,
-                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=30.0),
-            )
-        return self._shared_client
+        with self._lock:
+            if self._shared_client is None:
+                self._shared_client = httpx.Client(
+                    timeout=8.0,
+                    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=30.0),
+                )
+            return self._shared_client
 
     def _reset_client(self) -> None:
-        client = self._shared_client
-        self._shared_client = None
+        with self._lock:
+            client = self._shared_client
+            self._shared_client = None
         if client is not None:
             try:
                 client.close()
             except Exception:
                 pass
+
+    def fetch_server_time_ms(self, *, force_refresh: bool = False, ttl_seconds: float = 120.0) -> int:
+        """Binance sunucu saatini ofset önbelleğiyle döndürür (her taramada 14+ gereksiz çağrıyı keser)."""
+        now_mono = time.monotonic()
+        with self._lock:
+            if (
+                self._external_client is None
+                and not force_refresh
+                and self._server_time_offset_ms is not None
+                and (now_mono - self._server_time_fetched_at) < ttl_seconds
+            ):
+                return int(time.time() * 1000) + self._server_time_offset_ms
+
+        time_payload, _ = self._get_json("/api/v3/time")
+        server_time_ms = int(time_payload["serverTime"])
+        local_now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._server_time_offset_ms = server_time_ms - local_now_ms
+            self._server_time_fetched_at = time.monotonic()
+        return server_time_ms
+
+    def fetch_book_tickers(
+        self,
+        symbols: Iterable[str] | None = None,
+        *,
+        ttl_seconds: float = 8.0,
+        force_refresh: bool = False,
+    ) -> dict[str, Decimal]:
+        """Tek /api/v3/ticker/bookTicker çağrısıyla tüm sembollerin güncel en iyi alış (bid) kotasyonlarını çeker."""
+        wanted = {str(s).strip().upper() for s in symbols if str(s).strip()} if symbols is not None else None
+        now_mono = time.monotonic()
+        with self._lock:
+            if (
+                self._external_client is None
+                and not force_refresh
+                and self._book_tickers_cache
+                and (now_mono - self._book_tickers_fetched_at) < ttl_seconds
+            ):
+                cached = self._book_tickers_cache
+                if wanted is None:
+                    return dict(cached)
+                return {sym: cached[sym] for sym in wanted if sym in cached}
+
+        raw_rows, _ = self._get_json("/api/v3/ticker/bookTicker")
+        parsed: dict[str, Decimal] = {}
+        rows_list = raw_rows if isinstance(raw_rows, list) else ([raw_rows] if isinstance(raw_rows, dict) else [])
+        for row in rows_list:
+            sym = str(row.get("symbol", "")).upper()
+            bid_str = row.get("bidPrice")
+            if not sym or bid_str is None:
+                continue
+            try:
+                bid = Decimal(str(bid_str))
+            except Exception:
+                continue
+            if bid > 0:
+                parsed[sym] = bid
+
+        with self._lock:
+            if parsed:
+                self._book_tickers_cache = parsed
+                self._book_tickers_fetched_at = time.monotonic()
+        if wanted is None:
+            return parsed
+        return {sym: parsed[sym] for sym in wanted if sym in parsed}
 
     def discover_spot_pairs(
         self,
@@ -365,17 +442,18 @@ class BinancePublicDataClient:
         """
         target_quotes = {quote_asset.strip().upper()} if quote_asset else {"USDC", "USDT"}
         now_mono = time.monotonic()
-        if (
-            not force_refresh
-            and self._exchange_info_cache
-            and (now_mono - self._exchange_info_fetched_at) < 900
-        ):
-            return {
-                sym: flt
-                for sym, flt in self._exchange_info_cache.items()
-                if flt.quote_asset in target_quotes
-                and (allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS)
-            }
+        with self._lock:
+            if (
+                not force_refresh
+                and self._exchange_info_cache
+                and (now_mono - self._exchange_info_fetched_at) < 900
+            ):
+                return {
+                    sym: flt
+                    for sym, flt in self._exchange_info_cache.items()
+                    if flt.quote_asset in target_quotes
+                    and (allow_stablecoin_conversion or flt.base_asset not in STABLECOIN_OR_FIAT_ASSETS)
+                }
 
         data, _ = self._get_json("/api/v3/exchangeInfo")
         symbols_raw = data.get("symbols", [])
@@ -391,8 +469,9 @@ class BinancePublicDataClient:
         if not discovered:
             raise MarketDataError("exchangeInfo içinde aktif Spot USDT/USDC işlem çifti bulunamadı.")
 
-        self._exchange_info_cache = discovered
-        self._exchange_info_fetched_at = now_mono
+        with self._lock:
+            self._exchange_info_cache = discovered
+            self._exchange_info_fetched_at = time.monotonic()
 
         return {
             sym: flt
@@ -534,8 +613,7 @@ class BinancePublicDataClient:
         inferred_quote = "USDT" if sym.endswith("USDT") else "USDC"
         wake_gap = self.detect_windows_wake_gap()
 
-        time_payload, src_url = self._get_json("/api/v3/time")
-        server_time_ms = int(time_payload["serverTime"])
+        server_time_ms = self.fetch_server_time_ms(force_refresh=wake_gap)
 
         spot_pairs = self.discover_spot_pairs(
             quote_asset=inferred_quote,

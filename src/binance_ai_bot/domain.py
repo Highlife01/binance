@@ -272,6 +272,39 @@ def is_substep_dust_position(pos: Position, filters: SymbolFilters | None = None
     )
 
 
+def is_effective_dust_position(
+    pos: Position,
+    filters: SymbolFilters | None = None,
+    *,
+    mark_price: Decimal | None = None,
+    free_base_qty: Decimal | None = None,
+) -> bool:
+    """
+    Hem adım/minimum miktarı hem de Spot minimum emir tutarı (`min_notional`, örn. < 5 USDT)
+    nedeniyle borsada tek başına satılamayacak küsurat artıklarını tespit eder.
+    """
+    if is_substep_dust_position(pos, filters):
+        return True
+    if getattr(pos, "borrowed_usdc", Decimal("0")) > Decimal("0") or int(getattr(pos, "leverage", 1)) > 1:
+        return False
+    if filters is not None and pos.symbol == filters.symbol:
+        eff_step = filters.market_step_size if filters.market_step_size > Decimal("0") else filters.step_size
+        eff_min = max(filters.min_qty, filters.market_min_qty)
+        q_pos = quantize_down(pos.quantity, eff_step)
+        if free_base_qty is not None and quantize_down(min(pos.quantity, free_base_qty), eff_step) < eff_min:
+            return True
+        if (
+            filters.apply_min_to_market
+            and filters.min_notional > Decimal("0")
+            and mark_price is not None
+            and mark_price > Decimal("0")
+            and (q_pos * mark_price) < filters.min_notional
+            and pos.cost_basis_usdc < filters.min_notional
+        ):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class SimulatedOrderResult:
     order_id: str
