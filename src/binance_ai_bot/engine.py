@@ -767,7 +767,9 @@ class TradingSystemEngine:
                 and symbol_open_pos.stop_loss_price is not None
                 and symbol_open_pos.stop_loss_price > symbol_open_pos.entry_price
             )
-            is_quick_1m_noise = str(tech_signal.reason or "").startswith("Hızlı ivme kaybı")
+            is_quick_1m_noise = str(tech_signal.reason or "").lstrip().startswith(
+                ("Hızlı çıkış", "Hızlı ivme kaybı")
+            )
             if trailing_armed:
                 if final_action == "SAT":
                     final_action = "BEKLE"
@@ -827,6 +829,13 @@ class TradingSystemEngine:
                         f"%{settings.max_entry_spread_pct * Decimal('100'):.3f}); maliyet kârı yiyeceği için alım atlandı."
                     )
                     info_msg = block_reason
+                elif reentry_why := post_exit_reentry_block(
+                    self.storage.get_last_closed_position(active_track, market.symbol),
+                    current_price=best_ask or mid_price,
+                    now_utc=now_utc,
+                ):
+                    block_reason = f"{market.symbol} {reentry_why}; alım atlandı."
+                    info_msg = block_reason
                 elif getattr(settings, "expert_mode", False) and (
                     expert_why := self._expert_entry_block(market.symbol, active_track, now_utc, market=market)
                 ):
@@ -839,13 +848,6 @@ class TradingSystemEngine:
                     and quant_assessment.block_reason
                 ):
                     block_reason = quant_assessment.block_reason
-                    info_msg = block_reason
-                elif reentry_why := post_exit_reentry_block(
-                    self.storage.get_last_closed_position(active_track, market.symbol),
-                    current_price=best_ask or mid_price,
-                    now_utc=now_utc,
-                ):
-                    block_reason = f"{market.symbol} {reentry_why}; alım atlandı."
                     info_msg = block_reason
                 else:
                     risk_chk = self.risk_manager.check_buy_entry(
@@ -899,7 +901,13 @@ class TradingSystemEngine:
                                         buy_notional = scaled_qty * best_ask
                         hard_min_buy = getattr(buy_settings, "min_buy_notional_usdc", Decimal("0"))
                         sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
-                        if hard_min_buy > Decimal("0") and buy_notional < hard_min_buy:
+                        if buy_qty <= Decimal("0") or buy_notional <= Decimal("0"):
+                            block_reason = (
+                                f"{market.symbol} işlem başına risk bütçesi ve miktar adımları içinde "
+                                "minimum alım tutarı karşılanamadı; risk sınırı büyütülmeden alım atlandı."
+                            )
+                            info_msg = block_reason
+                        elif hard_min_buy > Decimal("0") and buy_notional < hard_min_buy:
                             block_reason = (
                                 f"{market.symbol} hesaplanan alım tutarı ({buy_notional:.2f} {quote_ccy}), "
                                 f"minimum alım alt sınırının ({hard_min_buy:.2f} {quote_ccy}) altında kaldığı için alım yapılmadı."
@@ -1260,25 +1268,30 @@ class TradingSystemEngine:
                     approved_notional=notional,
                 )
             except Exception:
-                capped = notional
+                return adjusted, Decimal("0"), Decimal("0")
+            if equity <= Decimal("0"):
+                return adjusted, Decimal("0"), Decimal("0")
             capped = inverse_vol_capped_notional(capped, atr_pct)
-            if capped < notional:
-                min_buy_floor = max(
-                    market.filters.min_notional * Decimal("1.05"),
-                    getattr(settings, "min_buy_notional_usdc", Decimal("10.00")),
-                )
-                target = max(capped, min_buy_floor)
-                if target < notional:
-                    new_qty = quantize_down(target / price, market.filters.market_step_size)
-                    if new_qty * price < min_buy_floor and (new_qty + market.filters.market_step_size) < qty:
-                        new_qty = new_qty + market.filters.market_step_size
-                    if (
-                        new_qty >= max(market.filters.min_qty, market.filters.market_min_qty)
-                        and new_qty * price >= min_buy_floor
-                        and new_qty < qty
-                    ):
-                        qty = new_qty
-                        notional = new_qty * price
+            min_buy_floor = max(
+                market.filters.min_notional,
+                getattr(settings, "min_buy_notional_usdc", Decimal("0")),
+            )
+            # Minimum emir büyüklüğü bir risk tavanını yükseltme izni değildir.
+            # Kayma tamponu ve adım yuvarlaması da onaylanan bütçe içinde kalır.
+            capped = min(capped, notional)
+            sizing_price = price * (Decimal("1") + settings.extra_slippage_bps / Decimal("10000"))
+            step = market.filters.market_step_size
+            if step <= Decimal("0"):
+                step = market.filters.step_size
+            new_qty = quantize_down(min(qty, capped / sizing_price), step)
+            if (
+                new_qty <= Decimal("0")
+                or new_qty < max(market.filters.min_qty, market.filters.market_min_qty)
+                or new_qty * price < min_buy_floor
+            ):
+                return adjusted, Decimal("0"), Decimal("0")
+            qty = new_qty
+            notional = new_qty * price
         return adjusted, qty, notional
 
     def _resolve_live_unvalued_commissions(self, quote_ccy: str, settings: RiskSettings) -> None:

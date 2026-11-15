@@ -23,7 +23,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 import httpx
@@ -43,7 +43,12 @@ from .domain import (
     quantize_down,
 )
 from .market_data import _friendly_network_error
-from .security import LiveOrderBlockedError, assert_live_spot_request, redact_secrets
+from .security import (
+    STABLECOIN_OR_FIAT_ASSETS,
+    LiveOrderBlockedError,
+    assert_live_spot_request,
+    redact_secrets,
+)
 from .storage import SQLiteStorage
 
 
@@ -133,9 +138,26 @@ class BinanceLiveSpotExecutor:
         with self.storage.execution_lock():
             return self._fetch_live_spot_balances(ui_live_confirmed=ui_live_confirmed, quote_asset=quote_asset)
 
+    def fetch_live_spot_account_snapshot(
+        self, *, ui_live_confirmed: bool, quote_asset: str = "USDC"
+    ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+        """Gerçek Binance Spot hesabındaki (`free`, `free + locked`) varlık bakiyelerini birlikte döner."""
+        with self.storage.execution_lock():
+            return self._fetch_live_spot_account_snapshot(
+                ui_live_confirmed=ui_live_confirmed, quote_asset=quote_asset
+            )
+
     def _fetch_live_spot_balances(
         self, *, ui_live_confirmed: bool, quote_asset: str,
     ) -> dict[str, Decimal]:
+        free_balances, _ = self._fetch_live_spot_account_snapshot(
+            ui_live_confirmed=ui_live_confirmed, quote_asset=quote_asset
+        )
+        return free_balances
+
+    def _fetch_live_spot_account_snapshot(
+        self, *, ui_live_confirmed: bool, quote_asset: str,
+    ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
         q_norm = quote_asset.strip().upper() if quote_asset.strip().upper() in {"USDT", "USDC"} else "USDC"
         self.storage.ensure_quote_asset("LIVE_SPOT", q_norm)
         earn_key = f"LD{q_norm}"
@@ -146,15 +168,20 @@ class BinanceLiveSpotExecutor:
                 "Binance hesabınızda veya API anahtarınızda Spot alım-satım yetkisi ('canTrade') kapalı görünüyor."
             )
 
-        balances: dict[str, Decimal] = {}
+        balances_free: dict[str, Decimal] = {}
+        balances_total: dict[str, Decimal] = {}
         for item in data.get("balances", []):
             asset = str(item.get("asset", "")).upper()
             free_amt = Decimal(str(item.get("free", "0")))
+            locked_amt = Decimal(str(item.get("locked", "0")))
+            tot_amt = free_amt + locked_amt
             if free_amt > 0 or asset in {"USDC", "USDT", "LDUSDC", "LDUSDT"}:
-                balances[asset] = free_amt
+                balances_free[asset] = free_amt
+            if tot_amt > 0 or asset in {"USDC", "USDT", "LDUSDC", "LDUSDT"}:
+                balances_total[asset] = tot_amt
 
-        quote_free = balances.get(q_norm, Decimal("0"))
-        earn_free = balances.get(earn_key, Decimal("0"))
+        quote_free = balances_free.get(q_norm, Decimal("0"))
+        earn_free = balances_free.get(earn_key, Decimal("0"))
         self.storage.set_state("live_spot_cash_usdc", f"{quote_free:.8f}")
         self.storage.set_state("live_earn_ldusdc", f"{earn_free:.8f}")
         self.storage.set_state("live_balance_refresh_required", "0")
@@ -162,7 +189,7 @@ class BinanceLiveSpotExecutor:
         perms = {str(p).upper() for p in data.get("permissions", [])}
         spot_perm = ("SPOT" in perms) or any(p.startswith("TRD_GRP_") for p in perms)
         self.storage.set_state("live_spot_permission_ok", "1" if spot_perm else "0")
-        return balances
+        return balances_free, balances_total
 
     @staticmethod
     def _client_order_id(signal_key: str, side: str) -> str:
@@ -605,3 +632,570 @@ class BinanceLiveSpotExecutor:
                 strategy_source=strategy_source, position_id=current.position_id, close_reason=close_reason,
             )
             return self._submit_intent(intent, ui_live_confirmed=ui_live_confirmed, stop_requested=stop_requested)
+
+    @staticmethod
+    def _infer_base_asset(symbol: str, spot_filters_map: Mapping[str, SymbolFilters] | None = None) -> str:
+        if spot_filters_map and symbol in spot_filters_map:
+            return spot_filters_map[symbol].base_asset
+        for quote_sfx in ("USDT", "USDC", "FDUSD"):
+            if symbol.endswith(quote_sfx) and len(symbol) > len(quote_sfx):
+                return symbol[: -len(quote_sfx)]
+        return symbol
+
+    def reconcile_external_spot_positions(
+        self,
+        *,
+        spot_filters_map: Mapping[str, SymbolFilters] | None = None,
+        bid_by_symbol: Mapping[str, Decimal] | None = None,
+        ui_live_confirmed: bool,
+        close_reason: str = "HARICI_MANUEL_SATIS",
+        total_balances: Mapping[str, Decimal] | None = None,
+        inspect_my_trades: bool = True,
+        quote_asset: str = "USDT",
+    ) -> list[dict[str, Any]]:
+        """
+        Binance uygulaması/web üzerinden manuel satılan veya BNB'ye dönüştürülen varlıkların
+        SQLite `LIVE_SPOT` açık pozisyon kayıtlarını gerçek cüzdan bakiyesiyle (`free + locked`)
+        uzlaştırır; hayalet açık pozisyonları ve çifte bakiye sayımını anında temizler.
+        """
+        with self.storage.execution_lock():
+            self.reconcile_pending_orders(ui_live_confirmed=ui_live_confirmed)
+            open_positions = self.storage.get_open_positions(track="LIVE_SPOT")
+            if not open_positions:
+                return []
+
+            pending_syms = {
+                str(i.get("symbol", "")).upper()
+                for i in self.storage.list_pending_live_intents()
+            }
+            if total_balances is None:
+                _, total_balances = self._fetch_live_spot_account_snapshot(
+                    ui_live_confirmed=ui_live_confirmed, quote_asset=quote_asset
+                )
+
+            known_venue_ids: set[str] = set()
+            if inspect_my_trades:
+                for row in self.storage.get_orders(track="LIVE_SPOT", limit=500):
+                    oid = str(row.get("order_id", ""))
+                    if oid.startswith("LIVE-"):
+                        parts = oid.split("-")
+                        if len(parts) >= 2 and parts[1]:
+                            known_venue_ids.add(parts[1])
+
+            ordered_positions = sorted(open_positions, key=lambda p: str(p.opened_at_iso or ""))
+            wallet_avail: dict[str, Decimal] = {}
+            reconciled: list[dict[str, Any]] = []
+
+            for pos in ordered_positions:
+                if pos.symbol in pending_syms or pos.quantity <= Decimal("0"):
+                    continue
+                base_asset = self._infer_base_asset(pos.symbol, spot_filters_map)
+                avail = wallet_avail.setdefault(
+                    base_asset, Decimal(str(total_balances.get(base_asset, Decimal("0"))))
+                )
+                tol = max(Decimal("0.00000001"), pos.quantity * Decimal("0.005"))
+                if avail >= pos.quantity - tol:
+                    wallet_avail[base_asset] = max(Decimal("0"), avail - pos.quantity)
+                    continue
+
+                kept_qty = max(Decimal("0"), min(pos.quantity, avail))
+                wallet_avail[base_asset] = max(Decimal("0"), avail - kept_qty)
+                sold_qty = pos.quantity - kept_qty
+                if sold_qty <= Decimal("0"):
+                    continue
+
+                exit_px = Decimal("0")
+                ext_fee_quote = Decimal("0")
+                matched_venue_trade = False
+
+                if inspect_my_trades:
+                    try:
+                        opened_ms = int(datetime.fromisoformat(pos.opened_at_iso).timestamp() * 1000)
+                    except Exception:
+                        opened_ms = 0
+                    try:
+                        raw_trades = self._request_signed(
+                            "GET",
+                            "/api/v3/myTrades",
+                            {"symbol": pos.symbol, "limit": 30},
+                            ui_live_confirmed=ui_live_confirmed,
+                        )
+                    except Exception:
+                        raw_trades = []
+                    if isinstance(raw_trades, list):
+                        qty_sum = Decimal("0")
+                        quote_sum = Decimal("0")
+                        qfee_sum = Decimal("0")
+                        for tr in raw_trades:
+                            if not isinstance(tr, dict) or bool(tr.get("isBuyer", True)):
+                                continue
+                            tr_oid = str(tr.get("orderId", ""))
+                            if tr_oid and tr_oid in known_venue_ids:
+                                continue
+                            try:
+                                tr_time = int(tr.get("time", 0))
+                                tr_qty = Decimal(str(tr.get("qty", "0")))
+                                tr_quote = Decimal(str(tr.get("quoteQty", "0")))
+                                if tr_quote <= Decimal("0") and tr_qty > Decimal("0"):
+                                    tr_quote = tr_qty * Decimal(str(tr.get("price", "0")))
+                                tr_comm = Decimal(str(tr.get("commission", "0")))
+                                tr_comm_asset = str(tr.get("commissionAsset", "")).upper()
+                            except Exception:
+                                continue
+                            if tr_time < max(0, opened_ms - 5000) or tr_qty <= Decimal("0") or tr_quote <= Decimal("0"):
+                                continue
+                            qty_sum += tr_qty
+                            quote_sum += tr_quote
+                            if tr_comm > Decimal("0") and tr_comm_asset in {"USDT", "USDC"}:
+                                qfee_sum += tr_comm
+                        if qty_sum > Decimal("0") and quote_sum > Decimal("0"):
+                            exit_px = quote_sum / qty_sum
+                            scale = min(Decimal("1"), sold_qty / qty_sum)
+                            ext_fee_quote = qfee_sum * scale
+                            matched_venue_trade = True
+
+                if exit_px <= Decimal("0"):
+                    bid_px = Decimal(str((bid_by_symbol or {}).get(pos.symbol, Decimal("0"))))
+                    exit_px = bid_px if bid_px > Decimal("0") else pos.entry_price
+                    if close_reason == "BINANCE_TOZ_OPTIMIZASYONU" and bid_px > Decimal("0"):
+                        ext_fee_quote = (sold_qty * exit_px) * Decimal("0.02")
+
+                now = datetime.now(timezone.utc)
+                now_iso = now.isoformat()
+                ist_date = self.storage.istanbul_date_str(now)
+
+                with self.storage.atomic():
+                    cur_pos = self.storage.get_position(pos.position_id, track="LIVE_SPOT")
+                    if cur_pos is None or cur_pos.status != "OPEN":
+                        continue
+                    fully_closed = kept_qty <= Decimal("0.00000001")
+                    ratio = Decimal("1") if fully_closed else (sold_qty / cur_pos.quantity)
+                    sold_cost = cur_pos.cost_basis_usdc if fully_closed else (cur_pos.cost_basis_usdc * ratio)
+                    sold_entry_fee = cur_pos.entry_fee_usdc if fully_closed else (cur_pos.entry_fee_usdc * ratio)
+                    gross_quote = sold_qty * exit_px
+                    pnl = gross_quote - ext_fee_quote - sold_cost - sold_entry_fee
+
+                    if fully_closed:
+                        self.storage.update_position_closed(
+                            cur_pos.position_id,
+                            closed_at_iso=now_iso,
+                            closed_istanbul_date=ist_date,
+                            exit_price=exit_px,
+                            exit_fee_usdc=ext_fee_quote,
+                            realized_pnl_usdc=pnl,
+                            close_reason=close_reason,
+                        )
+                    else:
+                        self.storage.update_position_remaining(
+                            cur_pos.position_id,
+                            quantity=kept_qty,
+                            cost_basis_usdc=max(Decimal("0"), cur_pos.cost_basis_usdc - sold_cost),
+                            entry_fee_usdc=max(Decimal("0"), cur_pos.entry_fee_usdc - sold_entry_fee),
+                        )
+                        suffix = hashlib.sha256(
+                            f"EXT:{cur_pos.position_id}:{now_iso}:{sold_qty}".encode()
+                        ).hexdigest()[:16]
+                        closed_id = f"LIVE-EXT-{suffix}"
+                        self.storage.insert_position(
+                            replace(
+                                cur_pos,
+                                position_id=closed_id,
+                                quantity=sold_qty,
+                                cost_basis_usdc=sold_cost,
+                                entry_fee_usdc=sold_entry_fee,
+                            ),
+                            track="LIVE_SPOT",
+                        )
+                        self.storage.update_position_closed(
+                            closed_id,
+                            closed_at_iso=now_iso,
+                            closed_istanbul_date=ist_date,
+                            exit_price=exit_px,
+                            exit_fee_usdc=ext_fee_quote,
+                            realized_pnl_usdc=pnl,
+                            close_reason=close_reason,
+                        )
+
+                    prefix = "DUST" if close_reason == "BINANCE_TOZ_OPTIMIZASYONU" else "EXT"
+                    ord_hash = hashlib.sha256(
+                        f"{close_reason}:{cur_pos.position_id}:{now_iso}:{sold_qty}".encode()
+                    ).hexdigest()[:12]
+                    label_tr = (
+                        "BİNANCE TOZ→BNB DÖNÜŞÜMÜ"
+                        if close_reason == "BINANCE_TOZ_OPTIMIZASYONU"
+                        else (
+                            "HARİCİ MANUEL SATIŞ (BORSA EŞLEŞTİ)"
+                            if matched_venue_trade
+                            else "HARİCİ BAKİYE UZLAŞTIRMASI"
+                        )
+                    )
+                    self.storage.record_order(
+                        SimulatedOrderResult(
+                            order_id=f"{prefix}-{ord_hash}",
+                            symbol=cur_pos.symbol,
+                            side="SELL",
+                            order_type="MARKET",
+                            status="FILLED",
+                            requested_qty=sold_qty,
+                            filled_qty=sold_qty,
+                            avg_fill_price=exit_px,
+                            gross_quote_usdc=gross_quote,
+                            fee_usdc=ext_fee_quote,
+                            slippage_bps=Decimal("0"),
+                            signal_key=f"{prefix}:{cur_pos.position_id}:{ord_hash}",
+                            strategy_source=close_reason,
+                            created_at_iso=now_iso,
+                            realized_pnl_usdc=pnl,
+                            explanation=f"{label_tr}: {_format_decimal_clean(sold_qty)} {base_asset} @ ~{exit_px:.6g} USDT.",
+                        ),
+                        ist_date,
+                        track="LIVE_SPOT",
+                    )
+                    reconciled.append(
+                        {
+                            "symbol": cur_pos.symbol,
+                            "asset": base_asset,
+                            "sold_qty": _format_decimal_clean(sold_qty),
+                            "kept_qty": _format_decimal_clean(Decimal("0") if fully_closed else kept_qty),
+                            "exit_price": f"{exit_px:.8g}",
+                            "gross_usdt": f"{gross_quote:.2f}",
+                            "realized_pnl_usdc": f"{pnl:.4f}",
+                            "close_reason": close_reason,
+                        }
+                    )
+
+            return reconciled
+
+    def _liquidate_untracked_spot_balance(
+        self,
+        *,
+        filters: SymbolFilters,
+        sell_qty: Decimal,
+        ui_live_confirmed: bool,
+        reason_label: str = "KUCUK_COIN_OPTIMIZASYONU",
+    ) -> dict[str, Any]:
+        """Yerel açık pozisyonu olmayan küçük Spot bakiyesini doğrudan USDT'ye satar."""
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        ist_date = self.storage.istanbul_date_str(now)
+        sig_key = f"UNTRACKED_SELL:{filters.symbol}:{int(now.timestamp() * 1000)}"
+        client_id = self._client_order_id(sig_key, "SELL")
+        order_params = {
+            "symbol": filters.symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": _format_decimal_clean(sell_qty),
+            "newClientOrderId": client_id,
+            "newOrderRespType": "FULL",
+        }
+        self._request_signed("POST", "/api/v3/order/test", order_params, ui_live_confirmed=ui_live_confirmed)
+        resp = self._request_signed("POST", "/api/v3/order", order_params, ui_live_confirmed=ui_live_confirmed)
+        executed = Decimal(str(resp.get("executedQty", "0")))
+        quote = Decimal(str(resp.get("cummulativeQuoteQty", "0")))
+        avg_px = (quote / executed) if executed > 0 else Decimal("0")
+        q_fee = Decimal("0")
+        for f in resp.get("fills") or []:
+            if isinstance(f, dict) and str(f.get("commissionAsset", "")).upper() in {"USDT", "USDC"}:
+                q_fee += Decimal(str(f.get("commission", "0")))
+        if executed > 0:
+            self.storage.record_order(
+                SimulatedOrderResult(
+                    order_id=f"OPT-{resp.get('orderId', client_id)}-{_format_decimal_clean(executed)}",
+                    symbol=filters.symbol,
+                    side="SELL",
+                    order_type="MARKET",
+                    status="FILLED",
+                    requested_qty=sell_qty,
+                    filled_qty=executed,
+                    avg_fill_price=avg_px,
+                    gross_quote_usdc=quote,
+                    fee_usdc=q_fee,
+                    slippage_bps=Decimal("0"),
+                    signal_key=sig_key,
+                    strategy_source=reason_label,
+                    created_at_iso=now_iso,
+                    realized_pnl_usdc=Decimal("0"),
+                    explanation=f"KÜÇÜK COİN SATIŞI: {_format_decimal_clean(executed)} {filters.base_asset} -> {quote:.2f} {filters.quote_asset}.",
+                ),
+                ist_date,
+                track="LIVE_SPOT",
+            )
+        return {
+            "symbol": filters.symbol,
+            "asset": filters.base_asset,
+            "sold_qty": _format_decimal_clean(executed),
+            "received_usdt": f"{quote:.2f}",
+        }
+
+    def optimize_small_spot_balances(
+        self,
+        *,
+        spot_filters_map: Mapping[str, SymbolFilters],
+        bid_by_symbol: Mapping[str, Decimal],
+        ui_live_confirmed: bool,
+        max_small_usdt: Decimal = Decimal("9.20"),
+        keep_bnb_reserve_usdt: Decimal = Decimal("2.00"),
+    ) -> dict[str, Any]:
+        """
+        1) Manuel satılmış hayalet açık pozisyonları gerçek Binance bakiyesiyle uzlaştırır.
+        2) Satılabilir küçük Spot bakiyelerini (`< max_small_usdt` ve açık maliyeti `< max_small_usdt`)
+           doğrudan USDT'ye (`MARKET SELL`) çevirir (`>= 10 USDT` aktif pozisyonlara ASLA dokunmaz!).
+        3) Borsa alt sınırının altındaki toz (dust) bakiyeleri resmi Binance `/sapi/v1/asset/dust`
+           uç noktasıyla BNB'ye süpürür (değeri yüksekten düşüğe sıralı).
+        4) BNB komisyon rezervi (`~2 USDT`) üzerinde satılabilir fazlalık oluşursa USDT'ye çevirir ve
+           dönüşen tüm toz kayıtları SQLite'ta kapatır.
+        """
+        with self.storage.execution_lock():
+            free_bal, total_bal = self._fetch_live_spot_account_snapshot(
+                ui_live_confirmed=ui_live_confirmed, quote_asset="USDT"
+            )
+            reconciled_manual = self.reconcile_external_spot_positions(
+                spot_filters_map=spot_filters_map,
+                bid_by_symbol=bid_by_symbol,
+                ui_live_confirmed=ui_live_confirmed,
+                close_reason="HARICI_MANUEL_SATIS",
+                total_balances=total_bal,
+                inspect_my_trades=True,
+                quote_asset="USDT",
+            )
+
+            # Aktif >= max_small_usdt pozisyonları kesin koruma kümesine al
+            open_after_reconcile = self.storage.get_open_positions(track="LIVE_SPOT")
+            protected_assets: set[str] = set()
+            open_by_symbol: dict[str, Position] = {}
+            for p in open_after_reconcile:
+                b_asset = self._infer_base_asset(p.symbol, spot_filters_map)
+                bid_now = bid_by_symbol.get(p.symbol, Decimal("0"))
+                cur_val = p.quantity * (bid_now if bid_now > 0 else p.entry_price)
+                if p.cost_basis_usdc >= max_small_usdt or cur_val >= max_small_usdt:
+                    protected_assets.add(b_asset)
+                else:
+                    open_by_symbol.setdefault(p.symbol, p)
+
+            sold_to_usdt: list[dict[str, Any]] = []
+            sell_errors: list[str] = []
+
+            # Aşama 1: Doğrudan USDT'ye satılabilen küçük coinleri (< max_small_usdt) nakde çevir
+            for asset, free_qty in sorted(free_bal.items()):
+                if (
+                    free_qty <= Decimal("0")
+                    or asset in STABLECOIN_OR_FIAT_ASSETS
+                    or asset == "BNB"
+                    or asset.startswith("LD")
+                    or asset in protected_assets
+                ):
+                    continue
+                symbol = f"{asset}USDT"
+                flt = spot_filters_map.get(symbol)
+                bid_px = bid_by_symbol.get(symbol, Decimal("0"))
+                tot_qty = total_bal.get(asset, free_qty)
+                if flt is None or not flt.is_spot_trading_allowed or flt.status != "TRADING" or bid_px <= Decimal("0"):
+                    continue
+                if (tot_qty * bid_px) >= max_small_usdt:
+                    protected_assets.add(asset)
+                    continue
+                sell_qty = quantize_down(free_qty, flt.market_step_size)
+                if sell_qty < max(flt.min_qty, flt.market_min_qty) or (sell_qty * bid_px) < flt.min_notional:
+                    continue
+
+                tracked_pos = open_by_symbol.get(symbol)
+                try:
+                    if tracked_pos is not None:
+                        pos_sell_qty = quantize_down(min(tracked_pos.quantity, free_qty), flt.market_step_size)
+                        if pos_sell_qty >= max(flt.min_qty, flt.market_min_qty) and (pos_sell_qty * bid_px) >= flt.min_notional:
+                            ord_res = self.execute_live_market_sell(
+                                position=tracked_pos,
+                                filters=flt,
+                                signal_key=f"OPT_SMALL_SELL:{tracked_pos.position_id}:{int(time.time() * 1000)}",
+                                strategy_source="KUCUK_COIN_OPTIMIZASYON",
+                                close_reason="KUCUK_COIN_OPTIMIZASYONU",
+                                ui_live_confirmed=ui_live_confirmed,
+                                estimated_bid=bid_px,
+                            )
+                            sold_to_usdt.append(
+                                {
+                                    "symbol": symbol,
+                                    "asset": asset,
+                                    "sold_qty": _format_decimal_clean(ord_res.filled_qty),
+                                    "received_usdt": f"{ord_res.gross_quote_usdc:.2f}",
+                                }
+                            )
+                            rem_free = max(Decimal("0"), free_qty - ord_res.filled_qty)
+                            rem_sell = quantize_down(rem_free, flt.market_step_size)
+                            if rem_sell >= max(flt.min_qty, flt.market_min_qty) and (rem_sell * bid_px) >= flt.min_notional:
+                                extra_res = self._liquidate_untracked_spot_balance(
+                                    filters=flt, sell_qty=rem_sell, ui_live_confirmed=ui_live_confirmed
+                                )
+                                sold_to_usdt.append(extra_res)
+                        else:
+                            extra_res = self._liquidate_untracked_spot_balance(
+                                filters=flt, sell_qty=sell_qty, ui_live_confirmed=ui_live_confirmed
+                            )
+                            sold_to_usdt.append(extra_res)
+                    else:
+                        extra_res = self._liquidate_untracked_spot_balance(
+                            filters=flt, sell_qty=sell_qty, ui_live_confirmed=ui_live_confirmed
+                        )
+                        sold_to_usdt.append(extra_res)
+                except Exception as exc:
+                    sell_errors.append(f"{asset}: {redact_secrets(str(exc))[:140]}")
+
+            # Aşama 2: Kalan satılamayan küçük/toz bakiyeleri Binance Dust API ile BNB'ye dönüştür
+            converted_to_bnb: list[dict[str, Any]] = []
+            total_bnb_received = Decimal("0")
+            dust_note = ""
+            try:
+                dust_info = self._request_signed(
+                    "POST",
+                    "/sapi/v1/asset/dust-btc",
+                    {"accountType": "SPOT"},
+                    ui_live_confirmed=ui_live_confirmed,
+                )
+                details = dust_info.get("details", []) if isinstance(dust_info, dict) else []
+                eligible_items: list[tuple[Decimal, str]] = []
+                for item in details:
+                    if not isinstance(item, dict):
+                        continue
+                    d_asset = str(item.get("asset", "")).strip().upper()
+                    if (
+                        not d_asset
+                        or d_asset in STABLECOIN_OR_FIAT_ASSETS
+                        or d_asset == "BNB"
+                        or d_asset.startswith("LD")
+                        or d_asset in protected_assets
+                    ):
+                        continue
+                    try:
+                        to_bnb = Decimal(str(item.get("toBNB", "0")))
+                        amt_free = Decimal(str(item.get("amountFree", "0")))
+                    except Exception:
+                        continue
+                    if to_bnb <= Decimal("0") or amt_free <= Decimal("0"):
+                        continue
+                    sym_check = f"{d_asset}USDT"
+                    bid_chk = bid_by_symbol.get(sym_check, Decimal("0"))
+                    if bid_chk > Decimal("0") and (amt_free * bid_chk) >= max_small_usdt:
+                        continue
+                    eligible_items.append((to_bnb, d_asset))
+
+                eligible_items.sort(key=lambda x: x[0], reverse=True)
+                dust_assets = [a for _, a in eligible_items]
+
+                for start_idx in range(0, len(dust_assets), 20):
+                    batch = dust_assets[start_idx : start_idx + 20]
+                    if not batch:
+                        break
+                    try:
+                        dust_resp = self._request_signed(
+                            "POST",
+                            "/sapi/v1/asset/dust",
+                            {"asset": batch, "accountType": "SPOT"},
+                            ui_live_confirmed=ui_live_confirmed,
+                        )
+                        if isinstance(dust_resp, dict):
+                            for tr in dust_resp.get("transferResult") or []:
+                                if not isinstance(tr, dict):
+                                    continue
+                                f_asset = str(tr.get("fromAsset", "")).upper()
+                                f_amt = Decimal(str(tr.get("amount", "0")))
+                                bnb_amt = Decimal(str(tr.get("transferedAmount", "0")))
+                                total_bnb_received += bnb_amt
+                                converted_to_bnb.append(
+                                    {
+                                        "asset": f_asset,
+                                        "amount": _format_decimal_clean(f_amt),
+                                        "bnb_received": _format_decimal_clean(bnb_amt),
+                                    }
+                                )
+                    except Exception as batch_exc:
+                        if start_idx == 0:
+                            dust_note = redact_secrets(str(batch_exc))[:200]
+                        break
+            except Exception as exc:
+                dust_note = redact_secrets(str(exc))[:200]
+
+            # Aşama 3: Son cüzdan durumunu oku; yüksek BNB fazlası varsa USDT'ye çevir; dönüşen tozları kapat
+            free_bal_after, total_bal_after = self._fetch_live_spot_account_snapshot(
+                ui_live_confirmed=ui_live_confirmed, quote_asset="USDT"
+            )
+            bnb_flt = spot_filters_map.get("BNBUSDT")
+            bnb_bid = bid_by_symbol.get("BNBUSDT", Decimal("0"))
+            bnb_free_now = free_bal_after.get("BNB", Decimal("0"))
+            if (
+                bnb_flt is not None
+                and bnb_flt.is_spot_trading_allowed
+                and bnb_bid > Decimal("0")
+                and "BNB" not in protected_assets
+            ):
+                bnb_usd_now = bnb_free_now * bnb_bid
+                excess_bnb_usd = bnb_usd_now - keep_bnb_reserve_usdt
+                if excess_bnb_usd >= max(bnb_flt.min_notional, Decimal("5.20")):
+                    excess_bnb_qty = quantize_down(excess_bnb_usd / bnb_bid, bnb_flt.market_step_size)
+                    if excess_bnb_qty >= max(bnb_flt.min_qty, bnb_flt.market_min_qty):
+                        try:
+                            bnb_sale = self._liquidate_untracked_spot_balance(
+                                filters=bnb_flt,
+                                sell_qty=excess_bnb_qty,
+                                ui_live_confirmed=ui_live_confirmed,
+                                reason_label="BNB_FAZLASI_OPTIMIZASYONU",
+                            )
+                            sold_to_usdt.append(bnb_sale)
+                            free_bal_after, total_bal_after = self._fetch_live_spot_account_snapshot(
+                                ui_live_confirmed=ui_live_confirmed, quote_asset="USDT"
+                            )
+                        except Exception as exc:
+                            sell_errors.append(f"BNB: {redact_secrets(str(exc))[:140]}")
+
+            reconciled_dust = self.reconcile_external_spot_positions(
+                spot_filters_map=spot_filters_map,
+                bid_by_symbol=bid_by_symbol,
+                ui_live_confirmed=ui_live_confirmed,
+                close_reason="BINANCE_TOZ_OPTIMIZASYONU",
+                total_balances=total_bal_after,
+                inspect_my_trades=False,
+                quote_asset="USDT",
+            )
+
+            new_free_usdt = free_bal_after.get("USDT", Decimal("0"))
+            new_free_bnb = free_bal_after.get("BNB", Decimal("0"))
+            new_bnb_usdt = new_free_bnb * bnb_bid if bnb_bid > Decimal("0") else Decimal("0")
+
+            parts_msg: list[str] = []
+            if reconciled_manual:
+                syms_m = ", ".join(sorted({r["asset"] for r in reconciled_manual}))
+                parts_msg.append(f"{len(reconciled_manual)} manuel satış uzlaştırıldı ({syms_m})")
+            if sold_to_usdt:
+                syms_s = ", ".join(f"{r['asset']} ({r['received_usdt']} USDT)" for r in sold_to_usdt)
+                parts_msg.append(f"{len(sold_to_usdt)} küçük coin doğrudan USDT'ye satıldı: {syms_s}")
+            if converted_to_bnb:
+                syms_d = ", ".join(r["asset"] for r in converted_to_bnb[:10])
+                more_d = f" +{len(converted_to_bnb) - 10}" if len(converted_to_bnb) > 10 else ""
+                parts_msg.append(
+                    f"{len(converted_to_bnb)} toz bakiye BNB'ye dönüştürüldü (+{_format_decimal_clean(total_bnb_received)} BNB: {syms_d}{more_d})"
+                )
+            elif dust_note:
+                if "-6005" in dust_note or "hour" in dust_note.lower() or "frequent" in dust_note.lower():
+                    parts_msg.append("Binance toz→BNB dönüşümü saatlik bekleme süresinde")
+                else:
+                    parts_msg.append(f"Toz dönüşüm notu: {dust_note[:110]}")
+            if not parts_msg:
+                parts_msg.append("Optimize edilecek ek küçük bakiye veya uzlaştırılacak manuel satış bulunmadı")
+            parts_msg.append(f"Güncel serbest nakit: {new_free_usdt:.2f} USDT (BNB rezervi: ~{new_bnb_usdt:.2f} USDT)")
+
+            return {
+                "ok": True,
+                "reconciled_manual_count": len(reconciled_manual),
+                "reconciled_manual": reconciled_manual,
+                "sold_to_usdt_count": len(sold_to_usdt),
+                "sold_to_usdt": sold_to_usdt,
+                "converted_to_bnb_count": len(converted_to_bnb),
+                "converted_to_bnb": converted_to_bnb,
+                "reconciled_dust_count": len(reconciled_dust),
+                "total_bnb_received": _format_decimal_clean(total_bnb_received),
+                "free_usdt": f"{new_free_usdt:.2f}",
+                "free_bnb": _format_decimal_clean(new_free_bnb),
+                "free_bnb_usdt": f"{new_bnb_usdt:.2f}",
+                "dust_note": dust_note,
+                "sell_errors": sell_errors,
+                "message": " • ".join(parts_msg),
+            }

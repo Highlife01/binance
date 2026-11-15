@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable
@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from .domain import Candle, OrderBookSnapshot, RiskSettings, SymbolFilters
-from .strategy import StrategyParams, compute_indicator_frame, evaluate_rule_signal_from_frame
+from .strategy import StrategyParams, compute_indicator_frame
 from .validation import SliceBacktestMetrics, run_no_lookahead_slice_simulation
 
 
@@ -502,7 +502,7 @@ class SelfRetrainingSignalModel:
         self.train_window_bars = max(40, int(train_window_bars))
         self.di_threshold = float(di_threshold)
         self.ridge_alpha = float(ridge_alpha)
-        self._model_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._model_cache: dict[tuple[str, str, StrategyParams, int], dict[str, Any]] = {}
 
     @staticmethod
     def _build_features(df: pd.DataFrame) -> np.ndarray:
@@ -565,11 +565,16 @@ class SelfRetrainingSignalModel:
                 symbol, interval, 0.5, 0.0, 0.0, False, 0, 0, "FreqAI eğitim penceresi yetersiz."
             )
 
-        retrain_bucket = last_idx // self.retrain_interval_bars
-        cache_key = (symbol, interval, retrain_bucket)
+        # A live client supplies a fixed-length rolling window, so its row index
+        # does not advance. Anchor retraining to the actual candle time instead.
+        bar_duration_ms = max(1, closed_candles[-1].close_time_ms - closed_candles[-1].open_time_ms + 1)
+        absolute_bar = closed_candles[-1].open_time_ms // bar_duration_ms
+        retrain_bucket = absolute_bar // self.retrain_interval_bars
+        cache_key = (symbol, interval, params or StrategyParams(), retrain_bucket)
         model = self._model_cache.get(cache_key)
 
-        if model is None or int(model.get("trainable_end", 0)) > trainable_end:
+        if (model is None
+                or int(model.get("trained_through_time_ms", 0)) > closed_candles[-1].close_time_ms):
             start_idx = max(20, trainable_end - self.train_window_bars)
             X_tr = X_all[start_idx : trainable_end + 1]
             y_tr = ((closes[start_idx + h : trainable_end + 1 + h] / np.maximum(closes[start_idx : trainable_end + 1], 1e-12)) - 1.0) * 100.0
@@ -607,6 +612,7 @@ class SelfRetrainingSignalModel:
                 "mean_nn": di_scale,
                 "retrain_bar": retrain_bucket * self.retrain_interval_bars,
                 "trainable_end": trainable_end,
+                "trained_through_time_ms": closed_candles[-1].close_time_ms,
                 "samples": len(Z_tr),
             }
             if len(self._model_cache) > 128:
@@ -940,108 +946,40 @@ def build_research_plan(question: str, *, default_symbol: str = "SOLUSDT", defau
     }
 
 
-def _compute_causal_curve_and_stats(
-    candles: list[Candle],
-    *,
-    symbol: str,
-    interval: str,
-    params: StrategyParams,
-    settings: RiskSettings,
-    initial_balance: Decimal,
-    symbol_filters: SymbolFilters | None = None,
-) -> dict[str, Any]:
+def _compute_curve_and_stats(metrics: SliceBacktestMetrics) -> dict[str, Any]:
+    """Derive every chart/statistic from the authoritative simulation's fills.
+
+    Sharpe/Sortino use zero cash return and the observed sample length, rather
+    than claiming annualized ratios from a short historical window.
     """
-    Eğitim dışı pencerede bar-bar nedensel getiri eğrisi, Sharpe, Sortino ve Profit Factor üretir.
-    """
-    df = compute_indicator_frame(candles, params=params)
-    start_t = max(35, int(len(candles) * 0.25))
-    cash = float(initial_balance)
-    qty = 0.0
-    entry_px = 0.0
-    pos_cost = 0.0
-    fee_rate = float(settings.estimated_fee_rate)
-    sl_pct = float(settings.stop_loss_pct)
-    tp_pct = float(settings.take_profit_pct)
-    max_alloc = float(settings.max_position_size_usdc)
-    min_notional = float(symbol_filters.min_notional) if symbol_filters else 5.0
-
-    bench_entry = float(candles[start_t + 1].open) if start_t + 1 < len(candles) else float(candles[-1].close)
-    bench_qty = min(max_alloc, cash) / max(bench_entry, 1e-12)
-    bench_cash = cash - min(max_alloc, cash)
-
-    curve: list[dict[str, Any]] = []
-    bar_returns: list[float] = []
-    trade_pnls: list[float] = []
-    prev_eq = cash
-
-    for t in range(start_t, len(candles) - 1):
-        sig = evaluate_rule_signal_from_frame(df, symbol=symbol, interval=interval, row_index=t, params=params)
-        nxt = candles[t + 1]
-        o_px = float(nxt.open)
-        c_px = float(nxt.close)
-
-        if qty > 0:
-            hit_sl = sl_pct > 0 and float(nxt.low) <= entry_px * (1.0 - sl_pct)
-            hit_tp = tp_pct > 0 and float(nxt.high) >= entry_px * (1.0 + tp_pct)
-            exit_px = None
-            if hit_sl:
-                exit_px = min(o_px, entry_px * (1.0 - sl_pct))
-            elif hit_tp:
-                exit_px = max(o_px, entry_px * (1.0 + tp_pct))
-            elif sig.action == "SAT":
-                exit_px = o_px
-            if exit_px is not None:
-                gross = qty * exit_px * (1.0 - 0.00015)
-                fee = gross * fee_rate
-                pnl = gross - fee - pos_cost
-                cash += gross - fee
-                trade_pnls.append(pnl)
-                qty = 0.0
-                entry_px = 0.0
-                pos_cost = 0.0
-        elif sig.action == "AL":
-            alloc = min(max_alloc, cash / (1.0 + fee_rate))
-            if alloc >= min_notional and o_px > 0:
-                buy_px = o_px * (1.0 + 0.00015)
-                new_qty = alloc / buy_px
-                fee = alloc * fee_rate
-                pos_cost = alloc + fee
-                cash -= pos_cost
-                qty = new_qty
-                entry_px = buy_px
-
-        eq = cash + qty * c_px * (1.0 - fee_rate)
-        b_eq = bench_cash + bench_qty * c_px
-        ret = (eq / max(prev_eq, 1e-9)) - 1.0
-        bar_returns.append(ret)
-        prev_eq = eq
-        if len(candles) - start_t <= 140 or t % max(1, (len(candles) - start_t) // 70) == 0 or t == len(candles) - 2:
-            curve.append(
-                {
-                    "t": int(nxt.open_time_ms),
-                    "strategy": round(eq, 4),
-                    "benchmark": round(b_eq, 4),
-                }
-            )
-
+    curve = [
+        {"t": point.time_ms, "strategy": round(float(point.strategy_equity_usdc), 4),
+         "benchmark": round(float(point.benchmark_equity_usdc), 4)}
+        for point in metrics.equity_curve
+    ]
+    equities = [float(metrics.initial_equity_usdc)]
+    # The trace begins with the initial balance before the first executable bar.
+    equities.extend(float(point.strategy_equity_usdc) for point in metrics.equity_curve[1:])
+    bar_returns = [(current / previous) - 1.0 for previous, current in zip(equities, equities[1:])
+                   if previous > 0]
     rets_arr = np.asarray(bar_returns, dtype=np.float64)
-    ann_factor = math.sqrt(max(len(rets_arr), 1))
+    sample_factor = math.sqrt(max(len(rets_arr), 1))
     mean_r = float(np.mean(rets_arr)) if len(rets_arr) else 0.0
     std_r = float(np.std(rets_arr, ddof=1)) if len(rets_arr) > 1 else 0.0
-    down_r = rets_arr[rets_arr < 0]
-    down_std = float(np.sqrt(np.mean(down_r ** 2))) if len(down_r) > 0 else 0.0
-    sharpe = round((mean_r / std_r) * ann_factor, 2) if std_r > 1e-9 else 0.0
-    sortino = round((mean_r / down_std) * ann_factor, 2) if down_std > 1e-9 else 0.0
+    down_std = float(np.sqrt(np.mean(np.minimum(rets_arr, 0.0) ** 2))) if len(rets_arr) else 0.0
+    sharpe = round((mean_r / std_r) * sample_factor, 2) if std_r > 1e-9 else 0.0
+    sortino = round((mean_r / down_std) * sample_factor, 2) if down_std > 1e-9 else 0.0
 
-    gains = sum(p for p in trade_pnls if p > 0)
-    losses = abs(sum(p for p in trade_pnls if p < 0))
-    profit_factor = round(gains / max(losses, 1e-6), 2) if trade_pnls else 0.0
+    gains = sum((p for p in metrics.trade_pnls_usdc if p > 0), Decimal("0"))
+    losses = -sum((p for p in metrics.trade_pnls_usdc if p < 0), Decimal("0"))
+    # No losing trades means the ratio is undefined; do not invent a capped 99.
+    profit_factor = round(float(gains / losses), 2) if losses > 0 else None
 
     return {
         "curve": curve,
         "sharpe": sharpe,
         "sortino": sortino,
-        "profit_factor": min(profit_factor, 99.0),
+        "profit_factor": profit_factor,
     }
 
 
@@ -1057,6 +995,8 @@ def run_quant_research(
     """
     Doğal dil araştırma sorusuna tam kantitatif backtest + Kronos kestirimi + skfolio/FreqAI raporu üretir.
     """
+    if settings.leverage != 1:
+        raise ValueError("Bu araştırma testi yalnızca kaldıraçsız Spot işlemleri doğrular; marjin testi desteklenmez.")
     plan = build_research_plan(question)
     primary = plan["symbols"][0]
     candles = closed_candles_by_symbol.get(primary) or []
@@ -1067,30 +1007,21 @@ def run_quant_research(
             "plan": {k: v for k, v in plan.items() if k != "params"},
         }
 
-    spot_settings = replace(settings, leverage=1)
     flt = filters_by_symbol.get(primary)
     eval_start = int(len(candles) * 0.25)
     bt: SliceBacktestMetrics = run_no_lookahead_slice_simulation(
         candles,
         eval_start_idx=eval_start,
         eval_end_idx=len(candles),
-        slice_name=f"OUT_OF_SAMPLE_{plan['strategy_mode']}",
+        slice_name=f"HISTORICAL_SPOT_{plan['strategy_mode']}",
         symbol=primary,
         interval=plan["interval"],
         params=plan["params"],
-        settings=spot_settings,
+        settings=settings,
         initial_balance_usdc=initial_balance,
         symbol_filters=flt,
     )
-    curve_stats = _compute_causal_curve_and_stats(
-        candles,
-        symbol=primary,
-        interval=plan["interval"],
-        params=plan["params"],
-        settings=spot_settings,
-        initial_balance=initial_balance,
-        symbol_filters=flt,
-    )
+    curve_stats = _compute_curve_and_stats(bt)
 
     ret_map: dict[str, np.ndarray] = {}
     for sym, c_list in closed_candles_by_symbol.items():
@@ -1099,7 +1030,7 @@ def run_quant_research(
             ret_map[sym] = np.diff(np.log(np.maximum(cls, 1e-12)))
 
     ob = order_books_by_symbol.get(primary) or OrderBookSnapshot(
-        symbol=primary, bids=[], asks=[], fetched_at_utc=datetime.now(timezone.utc)
+        symbol=primary, bids=[], asks=[], fetched_at_utc=datetime.now(timezone.utc), source_url="unavailable"
     )
     quant = evaluate_quant_bundle(
         closed_candles=candles,
@@ -1112,10 +1043,10 @@ def run_quant_research(
 
     narrative_tr = (
         f"{primary} ({plan['interval']}, {len(candles)} mum, {plan['strategy_mode']}): "
-        f"Test getirisi %{float(bt.net_return_pct):+.2f} (Referans Al-Tut %{float(bt.benchmark_return_pct):+.2f}), "
+        f"Geçmiş Spot getirisi %{float(bt.net_return_pct):+.2f} (Referans Al-Tut %{float(bt.benchmark_return_pct):+.2f}), "
         f"{bt.trade_count} işlem (%{float(bt.win_rate_pct):.1f} başarı), "
         f"Sharpe {curve_stats['sharpe']:.2f}, MaxDD %{float(bt.max_drawdown_pct):.2f}. "
-        f"{quant.kronos.summary_tr}. {quant.freqai.reason}"
+        f"{quant.kronos.summary_tr}. {quant.freqai.reason} {bt.verdict_text}"
     )
 
     return {
@@ -1124,6 +1055,15 @@ def run_quant_research(
         "interval": plan["interval"],
         "strategy_mode": plan["strategy_mode"],
         "candles_tested": len(candles),
+        "simulation_scope": "SINGLE_SYMBOL_SPOT_OHLC",
+        "insufficient_data": bt.insufficient_data,
+        "verdict_text": bt.verdict_text,
+        "ratio_basis": "SAMPLE_PERIOD_ZERO_CASH_RETURN",
+        "limitations": [
+            "Sabit kurallı geçmiş Spot testi; kronolojik eğitim/doğrulama ile seçilmiş örneklem dışı başarı kanıtı değildir.",
+            "Çoklu zaman dilimi/quant giriş filtreleri, ATR boyutlandırması, kâr bekleme ve iz süren stop modellenmez.",
+            "Kronos/FreqAI skorları güncel betimleyici ölçümlerdir; geçmiş işlem eğrisinin doğrulanmış başarı olasılığı değildir.",
+        ],
         "metrics": {
             "net_return_pct": round(float(bt.net_return_pct), 2),
             "benchmark_return_pct": round(float(bt.benchmark_return_pct), 2),

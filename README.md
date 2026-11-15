@@ -1,5 +1,9 @@
 # Binance Global USDC Spot — Sanal Deneme & Çift Kilitli Canlı Karar Destek Sistemi
 
+15 Kasım 2026 tarihli kod, işlem geçmişi ve maliyetli geçmiş test incelemesi:
+[Ayrıntılı analiz raporu](ANALIZ_RAPORU.md). Tekrarlanabilir, hesap anahtarı kullanmayan
+Spot temel testi: `scripts/analyze_profitability.py`; kaydedilmiş sonuçlar: `reports/profitability.json`.
+
 Windows 10/11 bilgisayarınızda yerel olarak (`127.0.0.1`) çalışan, Türkçe arayüzlü, **86 USDC** başlangıç sanal bakiyesiyle önce risksiz deneme yapan ve isteğe bağlı **5 Katmanlı Güvenlik Kilitli Canlı Spot** modülünü barındıran modüler Python işlem sistemidir.
 
 > **ÖNEMLİ UYARI (Yatırım Tavsiyesi Değildir):**

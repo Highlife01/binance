@@ -1489,6 +1489,7 @@
             <button id="scanNowBtn" class="btn-primary" type="button">▶️ Şimdi Piyasayı Tara</button>
             <button id="toggleAutoBtn" type="button">⏱️ 7/24 Otomatik: Açık</button>
             <button id="togglePauseBtn" type="button">⏸️ Yeni Alımları Durdur</button>
+            <button id="optimizeDustTopBtn" class="btn-amber" type="button" title="Manuel satışları uzlaştırır, küçük coinleri USDT/BNB'ye dönüştürür">🧹 Küçük Coinleri Optimize Et</button>
             <button id="closeAllBtn" class="btn-danger" type="button">🛑 Tüm Pozisyonları Kapat</button>
           </div>
         </div>
@@ -1669,7 +1670,10 @@
             <h3>💼 Gerçek Binance Cüzdanım</h3>
             <div class="section-sub">Spot + Çapraz Marjin + Simple Earn bakiye dağılımı</div>
           </div>
-          <button id="checkWalletBtn" class="btn-active-teal" type="button">🔄 Cüzdanı Yenile</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="optimizeDustBtn" class="btn-amber" type="button" title="Manuel satışları uzlaştırır, satılabilir küçük coinleri USDT'ye ve toz bakiyeleri BNB'ye çevirir">🧹 Küçük Coinleri Optimize Et</button>
+            <button id="checkWalletBtn" class="btn-active-teal" type="button">🔄 Cüzdanı Yenile</button>
+          </div>
         </div>
         <div id="walletContent" class="muted">
           Gerçek Binance cüzdanınız yükleniyor...
@@ -2857,13 +2861,15 @@
           <span class="chip num">Parite: <b>${esc(res.symbol)} (${esc(res.interval)})</b></span>
           <span class="chip num">Strateji Getirisi: <b class="${netR >= 0 ? "pos" : "neg"}">${netR >= 0 ? "+" : ""}${netR.toFixed(2)}%</b></span>
           <span class="chip num">Al-Tut Referans: <b>${benR >= 0 ? "+" : ""}${benR.toFixed(2)}%</b></span>
-          <span class="chip num">Sharpe / Sortino: <b>${esc(m.sharpe)} / ${esc(m.sortino)}</b></span>
-          <span class="chip num">Profit Factor: <b>${esc(m.profit_factor)}</b></span>
+          <span class="chip num">Dönem Sharpe / Sortino: <b>${esc(m.sharpe)} / ${esc(m.sortino)}</b></span>
+          <span class="chip num">Profit Factor: <b>${m.profit_factor == null ? "Tanımsız" : esc(m.profit_factor)}</b></span>
           <span class="chip num">MaxDD: <b class="neg">-%${esc(m.max_drawdown_pct)}</b></span>
           <span class="chip num">İşlem / Başarı: <b>${esc(m.trade_count)} (%${esc(m.win_rate_pct)})</b></span>
           <span class="chip num">Kronos +5m p50: <b>${Number(q.kronos_p50_pct || 0) >= 0 ? "+" : ""}${Number(q.kronos_p50_pct || 0).toFixed(2)}%</b> (%${Math.round(Number(q.kronos_up_prob || 0) * 100)}↑)</span>
         </div>
+        ${res.insufficient_data ? '<div class="alert">Tamamlanmış işlem sayısı sonuç çıkarmak için yetersiz.</div>' : ""}
         <div style="font-size:0.84rem;color:#e2e8f0;margin-bottom:10px;line-height:1.55;">${esc(res.narrative_tr || "")}</div>
+        ${(res.limitations || []).map((note) => `<div class="muted">${esc(note)}</div>`).join("")}
         ${chartHtml}
       `;
     }
@@ -3387,6 +3393,26 @@
         $("walletContent").innerHTML = `<div class="alert" style="margin:0;"><span>${esc(err.message)}</span></div>`;
       }
     }
+
+    async function runOptimizeSmallCoins(btn) {
+      if (!confirm("Manuel satılan coin kayıtları gerçek Binance cüzdanınızla eşitlenecek; 10 USDT altındaki küçük coinler doğrudan USDT'ye, satılamayan toz bakiyeler ise BNB komisyon rezervine dönüştürülecek (10 USDT ve üzeri aktif pozisyonlarınıza dokunulmaz). Onaylıyor musunuz?")) {
+        return;
+      }
+      setBtnBusy(btn, true, "⏳ Optimize Ediliyor...");
+      try {
+        const res = await apiCall("/api/optimize-dust", "POST", { confirm: "EVET" }, 45000);
+        showToast(res.message || "Küçük coin optimizasyonu tamamlandı.");
+        if (res.wallet) renderWalletData(res.wallet);
+        if (res.dashboard) renderDashboard(res.dashboard);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        setBtnBusy(btn, false);
+      }
+    }
+
+    $("optimizeDustBtn").addEventListener("click", () => runOptimizeSmallCoins($("optimizeDustBtn")));
+    $("optimizeDustTopBtn").addEventListener("click", () => runOptimizeSmallCoins($("optimizeDustTopBtn")));
 
     $("checkWalletBtn").addEventListener("click", async () => {
       const btn = $("checkWalletBtn");

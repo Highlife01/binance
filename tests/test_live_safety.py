@@ -771,3 +771,225 @@ def test_strict_10_usd_min_buy_blocks_legacy_db_settings_and_step_rounding(tmp_p
             ui_live_confirmed=True,
         )
 
+
+def test_reconcile_external_manual_sales_and_optimize_small_spot_balances(tmp_path):
+    """
+    Verifies:
+    1) Manually sold Spot positions (`free + locked == 0` or reduced) reconcile via `/api/v3/myTrades`
+       and close (`HARICI_MANUEL_SATIS`), while locked limit-order balances remain untouched.
+    2) Active >= $10 positions (even if slightly dipped in market price) are strictly protected.
+    3) Sellable < $9.20 small coins (e.g. DOGE $1.20) are sold directly to USDT via `/api/v3/order`.
+    4) Remaining sub-notional dust (ZEC, BTC) converts to BNB via `/sapi/v1/asset/dust-btc` + `/sapi/v1/asset/dust`
+       with valid `doseq=True` HMAC-SHA256 multi-asset query string signing, and dust rows close cleanly.
+    """
+    import hashlib
+    import hmac
+    from urllib.parse import parse_qs
+
+    now_dt = datetime.now(timezone.utc)
+    now_ms = int(now_dt.timestamp() * 1000)
+
+    wallet: dict[str, tuple[str, str]] = {
+        "USDT": ("25.18", "0"),
+        "MSTRB": ("0", "0"),          # User manually sold all 0.15 MSTRB on Binance!
+        "NIGHT": ("0", "200.0"),      # Open >= $10 position sitting in a locked limit order -> MUST NOT close or sell!
+        "QNT": ("0.066", "0"),        # Open >= $10 cost-basis ($10.15), dipped to $9.40 -> MUST NOT sell as small!
+        "DOGE": ("20.876", "0"),      # $1.25 small coin (minNotional $1.00) -> sell 20 DOGE to USDT + 0.876 dust to BNB!
+        "ZEC": ("0.00095", "0"),      # $0.85 sub-notional dust -> convert to BNB!
+        "BTC": ("0.0000092", "0"),    # $0.60 sub-notional dust -> convert to BNB!
+        "BNB": ("0.0028", "0"),       # ~$1.68 fee reserve -> keep!
+    }
+    dust_calls: list[list[str]] = []
+
+    def mk_flt(sym: str, base: str, step: str, min_notional: str = "5.0"):
+        return parse_symbol_filters(
+            {
+                "symbol": sym,
+                "baseAsset": base,
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "isSpotTradingAllowed": True,
+                "filters": [
+                    {"filterType": "LOT_SIZE", "stepSize": step, "minQty": step, "maxQty": "1000000"},
+                    {"filterType": "NOTIONAL", "minNotional": min_notional},
+                ],
+            }
+        )
+
+    spot_map = {
+        "MSTRBUSDT": mk_flt("MSTRBUSDT", "MSTRB", "0.001", "5.0"),
+        "NIGHTUSDT": mk_flt("NIGHTUSDT", "NIGHT", "1", "5.0"),
+        "QNTUSDT": mk_flt("QNTUSDT", "QNT", "0.001", "5.0"),
+        "DOGEUSDT": mk_flt("DOGEUSDT", "DOGE", "1", "1.0"),
+        "ZECUSDT": mk_flt("ZECUSDT", "ZEC", "0.001", "5.0"),
+        "BTCUSDT": mk_flt("BTCUSDT", "BTC", "0.00001", "5.0"),
+        "BNBUSDT": mk_flt("BNBUSDT", "BNB", "0.001", "5.0"),
+    }
+    bids = {
+        "MSTRBUSDT": D("102.00"),
+        "NIGHTUSDT": D("0.051"),
+        "QNTUSDT": D("142.42"),  # 0.066 * 142.42 = $9.40, but cost_basis is $10.15 -> protected!
+        "DOGEUSDT": D("0.060"),
+        "ZECUSDT": D("890.00"),
+        "BTCUSDT": D("65000.00"),
+        "BNBUSDT": D("600.00"),
+    }
+
+    secret = "dust-test-secret"
+
+    def verify_sig(req: httpx.Request) -> None:
+        raw_q = req.url.query.decode("utf-8")
+        head, sig_part = raw_q.rsplit("&signature=", 1)
+        expected = hmac.new(secret.encode("utf-8"), head.encode("utf-8"), hashlib.sha256).hexdigest()
+        assert sig_part == expected, "HMAC signature mismatch on signed request!"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/api/v3/time":
+            return httpx.Response(200, json={"serverTime": now_ms})
+        verify_sig(req)
+        if path == "/api/v3/account":
+            return httpx.Response(
+                200,
+                json={
+                    "canTrade": True,
+                    "permissions": ["SPOT"],
+                    "balances": [
+                        {"asset": a, "free": f_amt, "locked": l_amt}
+                        for a, (f_amt, l_amt) in wallet.items()
+                    ],
+                },
+            )
+        if path == "/api/v3/myTrades":
+            sym = parse_qs(req.url.query.decode("utf-8"))["symbol"][0]
+            if sym == "MSTRBUSDT":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "orderId": 999888,
+                            "isBuyer": False,
+                            "time": now_ms + 1000,
+                            "qty": "0.150",
+                            "price": "102.00",
+                            "quoteQty": "15.30",
+                            "commission": "0.0153",
+                            "commissionAsset": "USDT",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
+        if path == "/api/v3/order/test":
+            return httpx.Response(200, json={})
+        if path == "/api/v3/order" and req.method == "POST":
+            qs = parse_qs(req.url.query.decode("utf-8"))
+            assert qs["symbol"] == ["DOGEUSDT"]
+            assert qs["side"] == ["SELL"]
+            assert qs["quantity"] == ["20"]
+            wallet["DOGE"] = ("0.876", "0")
+            wallet["USDT"] = ("26.38", "0")
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": 777111,
+                    "symbol": "DOGEUSDT",
+                    "status": "FILLED",
+                    "executedQty": "20",
+                    "cummulativeQuoteQty": "1.20",
+                    "fills": [{"qty": "20", "price": "0.060", "commission": "0.0012", "commissionAsset": "USDT"}],
+                },
+            )
+        if path == "/sapi/v1/asset/dust-btc":
+            return httpx.Response(
+                200,
+                json={
+                    "details": [
+                        {"asset": "BTC", "amountFree": wallet["BTC"][0], "toBNB": "0.0010"},
+                        {"asset": "ZEC", "amountFree": wallet["ZEC"][0], "toBNB": "0.0014"},
+                        {"asset": "DOGE", "amountFree": wallet["DOGE"][0], "toBNB": "0.00008"},
+                        {"asset": "QNT", "amountFree": wallet["QNT"][0], "toBNB": "0.0156"},  # Must be skipped!
+                    ]
+                },
+            )
+        if path == "/sapi/v1/asset/dust":
+            qs = parse_qs(req.url.query.decode("utf-8"))
+            assets = qs["asset"]
+            dust_calls.append(assets)
+            # Sorted by toBNB descending and QNT excluded!
+            assert assets == ["ZEC", "BTC", "DOGE"]
+            for a in assets:
+                wallet[a] = ("0", "0")
+            wallet["BNB"] = ("0.00528", "0")
+            return httpx.Response(
+                200,
+                json={
+                    "totalServiceCharge": "0.00005",
+                    "totalTransfered": "0.00248",
+                    "transferResult": [
+                        {"fromAsset": "ZEC", "amount": "0.00095", "transferedAmount": "0.0014"},
+                        {"fromAsset": "BTC", "amount": "0.0000092", "transferedAmount": "0.0010"},
+                        {"fromAsset": "DOGE", "amount": "0.876", "transferedAmount": "0.00008"},
+                    ],
+                },
+            )
+        raise AssertionError(f"Unexpected {req.method} {path}")
+
+    cfg = AppConfig(
+        sqlite_db_path=tmp_path / "opt.db",
+        enable_live_trading=True,
+        binance_api_key="test-k",
+        binance_api_secret=secret,
+    )
+    st = SQLiteStorage(cfg.sqlite_db_path)
+    ex = BinanceLiveSpotExecutor(cfg, st, httpx.Client(transport=httpx.MockTransport(handler)))
+
+    opened_iso = now_dt.isoformat()
+    for pid, sym, qty, px, cost in [
+        ("POS-MSTRB", "MSTRBUSDT", "0.150", "100.00", "15.00"),
+        ("POS-NIGHT", "NIGHTUSDT", "200.0", "0.0505", "10.10"),
+        ("POS-QNT", "QNTUSDT", "0.066", "153.78", "10.15"),
+        ("POS-DOGE", "DOGEUSDT", "20.876", "0.058", "1.21"),
+        ("POS-ZEC", "ZECUSDT", "0.00095", "890.00", "0.85"),
+        ("POS-BTC", "BTCUSDT", "0.0000092", "65000.00", "0.60"),
+    ]:
+        st.insert_position(
+            Position(
+                position_id=pid,
+                symbol=sym,
+                quantity=D(qty),
+                entry_price=D(px),
+                cost_basis_usdc=D(cost),
+                entry_fee_usdc=D("0.01"),
+                opened_at_iso=opened_iso,
+                signal_key=f"SIG-{pid}",
+                strategy_source="TEST",
+            ),
+            track="LIVE_SPOT",
+        )
+
+    res = ex.optimize_small_spot_balances(
+        spot_filters_map=spot_map,
+        bid_by_symbol=bids,
+        ui_live_confirmed=True,
+    )
+    assert res["ok"] is True
+    assert res["reconciled_manual_count"] == 1
+    assert res["reconciled_manual"][0]["symbol"] == "MSTRBUSDT"
+    assert res["sold_to_usdt_count"] == 1
+    assert res["sold_to_usdt"][0]["symbol"] == "DOGEUSDT"
+    assert res["converted_to_bnb_count"] == 3
+    assert dust_calls == [["ZEC", "BTC", "DOGE"]]
+    assert res["free_usdt"] == "26.38"
+
+    # Only NIGHTUSDT (locked >= $10) and QNTUSDT (active >= $10 cost basis) remain OPEN!
+    rem_open = {p.symbol for p in st.get_open_positions(track="LIVE_SPOT")}
+    assert rem_open == {"NIGHTUSDT", "QNTUSDT"}
+
+    # MSTRB closed with HARICI_MANUEL_SATIS and positive realized PnL from $102 match!
+    mstrb_closed = st.get_position("POS-MSTRB", track="LIVE_SPOT")
+    assert mstrb_closed.status == "CLOSED"
+    assert mstrb_closed.close_reason == "HARICI_MANUEL_SATIS"
+    assert mstrb_closed.exit_price == D("102.00")
+    assert mstrb_closed.realized_pnl_usdc > D("0.25")
+
+

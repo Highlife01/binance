@@ -46,6 +46,8 @@ ALLOWED_LIVE_SPOT_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v3/myTrades"),
         ("GET", "/api/v3/openOrders"),
         ("DELETE", "/api/v3/order"),
+        ("POST", "/sapi/v1/asset/dust-btc"),
+        ("POST", "/sapi/v1/asset/dust"),
     }
 )
 

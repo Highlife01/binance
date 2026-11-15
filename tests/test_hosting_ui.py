@@ -133,6 +133,10 @@ def test_dashboard_optimizations_and_safety_features_present() -> None:
     assert "coinBadgeHtml" in js
     assert "fmtSmartNum" in js
     assert "resp-table" in text
+    assert "/api/optimize-dust" in js
+    assert "optimizeDustBtn" in text
+    assert "optimizeDustTopBtn" in text
+    assert "runOptimizeSmallCoins" in js
 
 
 def test_dashboard_inline_module_script_valid_js() -> None:

@@ -12,6 +12,8 @@ logs/
 tests/
 hosting/
 scripts/
+reports/
+ANALIZ_RAPORU.md
 .firebase/
 firebase-debug.log
 *.bat

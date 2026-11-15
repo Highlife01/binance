@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Iterable, Sequence
 
 from .domain import Candle, Position
@@ -162,7 +162,8 @@ def dynamic_exits(
     """
     Zarar-Kes: 4x ATR (volatiliteye uyumlu), profil/kaldıraç tavanından GENİŞ olamaz ve
     kaldıraca göre alt sınırın (komisyon+gürültü) altına inemez.
-    Kâr-Al: en az profil hedefi; risk/getiri >= ~1.2 olacak şekilde stop'a oranlanır (üst sınır 1.6x).
+    Kâr-Al: en az profil hedefi; stop'un 1.2 katını hedefler, profil hedefinin
+    1.6 katını aşmaz. Bu tavan nedeniyle 1.2 getiri/risk oranı garanti edilmez.
     """
     lev = max(1, min(5, int(leverage)))
     floor_sl = max(base_sl * Decimal("0.40"), Decimal("0.0045"))
@@ -171,7 +172,12 @@ def dynamic_exits(
     sl = min(max(raw_sl, floor_sl), base_sl)
     tp = max(base_tp, min(sl * Decimal("1.2"), base_tp * Decimal("1.6")))
     _ = lev
-    return sl.quantize(Decimal("0.0001")), tp.quantize(Decimal("0.0001"))
+    # Nearest rounding could widen a user cap (e.g. 0.00955 -> 0.0096).
+    # Preserve sub-tick positive stops rather than rounding them to zero (disabled).
+    rounded_sl = sl.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    if sl > Decimal("0") and rounded_sl == Decimal("0"):
+        rounded_sl = sl
+    return min(rounded_sl, base_sl), tp.quantize(Decimal("0.0001"))
 
 
 def risk_capped_notional(

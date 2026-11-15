@@ -315,6 +315,9 @@ def test_research_and_settings_ignore_invalid_payloads(tmp_path: Path):
     assert r_research.body["ok"] is True
     assert r_research.body["symbol"].endswith("USDT")
     assert r_research.body["interval"] == "5m"
+    assert r_research.body["requested_leverage"] == 2
+    assert r_research.body["simulated_leverage"] == 1
+    assert "1x Spot" in r_research.body["limitations"][0]
 
     r_settings = app.handle(
         "POST",

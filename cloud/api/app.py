@@ -491,13 +491,16 @@ class CloudBotApplication:
             storage.save_risk_settings(upgraded)
             for trk in ("LIVE_SPOT", "MAIN"):
                 for pos in storage.get_open_positions(track=trk):
+                    if pos.stop_loss_price is not None and pos.stop_loss_price > pos.entry_price:
+                        continue
+                    pos_sl, pos_tp, _ = prof.leverage_adjusted_targets(pos.leverage)
                     storage.update_position_remaining(
                         pos.position_id,
                         quantity=pos.quantity,
                         cost_basis_usdc=pos.cost_basis_usdc,
                         entry_fee_usdc=pos.entry_fee_usdc,
-                        stop_loss_price=pos.entry_price * (Decimal("1") - prof.stop_loss_pct),
-                        take_profit_price=pos.entry_price * (Decimal("1") + prof.take_profit_pct),
+                        stop_loss_price=max(pos.stop_loss_price or Decimal("0"), pos.entry_price * (Decimal("1") - pos_sl)),
+                        take_profit_price=pos.entry_price * (Decimal("1") + pos_tp),
                         update_exit_targets=True,
                     )
             storage.set_state("profit_target_v2_15usdt", "1")
@@ -811,13 +814,53 @@ class CloudBotApplication:
 
         prefetched_live = False
         live_free_balances: dict[str, Decimal] | None = None
+        live_total_balances: dict[str, Decimal] | None = None
         last_error = ""
+        spot_map_cycle: dict[str, Any] = getattr(eng.market_client, "_exchange_info_cache", {}) or {}
+        if is_live_spot and not spot_map_cycle:
+            discover_fn = getattr(eng.market_client, "discover_spot_pairs", None)
+            if discover_fn is not None:
+                try:
+                    spot_map_cycle = discover_fn(
+                        quote_asset="USDT",
+                        allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
+                    ) or {}
+                except Exception:
+                    spot_map_cycle = {}
+
         if is_live_spot:
+            if (
+                "PYTEST_CURRENT_TEST" not in os.environ
+                and eng.config.enable_live_trading
+                and eng.config.has_binance_live_keys
+                and st.get_state("auto_spot_optimize_v1_20261115", "0") != "1"
+            ):
+                try:
+                    self._execute_spot_optimize(eng)
+                except Exception as opt_exc:
+                    logging.warning("Otomatik kucuk coin optimizasyonu uyarisi: %s", _safe_text(opt_exc, 180))
+                    st.set_state("auto_spot_optimize_v1_20261115", "1")
             try:
-                live_free_balances = eng.live_executor.fetch_live_spot_balances(
-                    ui_live_confirmed=True, quote_asset="USDT"
-                )
+                snap_fn = getattr(eng.live_executor, "fetch_live_spot_account_snapshot", None)
+                if snap_fn is not None:
+                    live_free_balances, live_total_balances = snap_fn(
+                        ui_live_confirmed=True, quote_asset="USDT"
+                    )
+                else:
+                    live_free_balances = eng.live_executor.fetch_live_spot_balances(
+                        ui_live_confirmed=True, quote_asset="USDT"
+                    )
+                    live_total_balances = live_free_balances
                 prefetched_live = True
+                reconcile_ext_fn = getattr(eng.live_executor, "reconcile_external_spot_positions", None)
+                if reconcile_ext_fn is not None and live_total_balances is not None:
+                    reconcile_ext_fn(
+                        spot_filters_map=spot_map_cycle,
+                        bid_by_symbol={k: v[1] for k, v in self._bid_cache.items()},
+                        ui_live_confirmed=True,
+                        total_balances=live_total_balances,
+                        quote_asset="USDT",
+                    )
             except Exception as exc:
                 last_error = self._friendly_live_error(str(exc))
                 st.set_state("cloud_last_error", last_error)
@@ -831,7 +874,7 @@ class CloudBotApplication:
                 last_error = self._friendly_live_error(str(exc))
                 st.set_state("cloud_last_error", last_error)
 
-        ex_cache = getattr(eng.market_client, "_exchange_info_cache", {}) or {}
+        ex_cache = spot_map_cycle or (getattr(eng.market_client, "_exchange_info_cache", {}) or {})
 
         def _is_non_dust(pos_obj: Any) -> bool:
             flt = ex_cache.get(pos_obj.symbol)
@@ -895,10 +938,11 @@ class CloudBotApplication:
         scanned: list[dict[str, Any]] = []
         orders_executed = 0
         for idx, sym in enumerate(cycle_symbols):
-            if (time.monotonic() - t_cycle_start) > 45.0 and idx > 0:
-                break
             cur_open = [p for p in st.get_open_positions(track=track) if _is_non_dust(p)]
             cur_open_syms = {p.symbol for p in cur_open}
+            # The entry-scan budget must not skip protection of an existing trade.
+            if (time.monotonic() - t_cycle_start) > 45.0 and idx > 0 and sym not in cur_open_syms:
+                break
             if sym not in cur_open_syms and (len(cur_open) >= settings.max_open_positions or paused):
                 break
             is_last = idx == len(cycle_symbols) - 1 or (time.monotonic() - t_cycle_start) > 40.0
@@ -1139,11 +1183,25 @@ class CloudBotApplication:
         ist_today = st.istanbul_date_str(now_dt)
         ai_summary = st.get_ai_usage_summary(ist_today)
 
+        ex_dash = getattr(eng.market_client, "_exchange_info_cache", {}) or {}
+        if not ex_dash and open_positions:
+            discover_fn = getattr(eng.market_client, "discover_spot_pairs", None)
+            if discover_fn is not None:
+                try:
+                    ex_dash = discover_fn(
+                        quote_asset="USDT",
+                        allow_stablecoin_conversion=settings.allow_stablecoin_conversion,
+                    ) or {}
+                except Exception:
+                    ex_dash = {}
+
         pos_rows: list[dict[str, Any]] = []
         for pos in open_positions:
-            if is_substep_dust_position(pos):
-                continue
             cur_bid = bids.get(pos.symbol)
+            if is_effective_dust_position(
+                pos, ex_dash.get(pos.symbol), mark_price=cur_bid if cur_bid is not None else pos.entry_price
+            ):
+                continue
             unreal_pnl: Decimal | None = None
             unreal_pct: Decimal | None = None
             if cur_bid is not None:
@@ -1422,14 +1480,24 @@ class CloudBotApplication:
             closed_candles_by_symbol=candles_by_sym,
             order_books_by_symbol=books_by_sym,
             filters_by_symbol=filters_by_sym,
-            settings=params_active["settings"],
+            settings=dataclasses.replace(params_active["settings"], leverage=1),
             initial_balance=self.config.initial_balance_usdc,
         )
+        report["requested_leverage"] = params_active["settings"].leverage
+        report["simulated_leverage"] = 1
+        if report.get("ok"):
+            scope_note = (
+                f"Bu araştırma 1x Spot temel testidir. Seçili {params_active['settings'].leverage}x "
+                "ayarının marjin borcu, faizi ve likidasyon davranışı test edilmez."
+            )
+            report["limitations"].insert(0, scope_note)
+            report["narrative_tr"] = scope_note + " " + report["narrative_tr"]
         return report
 
     def _apply_settings_update(self, eng: TradingSystemEngine, payload: dict[str, Any]) -> str:
         st = eng.storage
         notes: list[str] = []
+        profile_changed = False
 
         if "cloud_auto_enabled" in payload:
             enabled = bool(payload["cloud_auto_enabled"])
@@ -1439,6 +1507,7 @@ class CloudBotApplication:
         if "profile" in payload and isinstance(payload["profile"], str):
             pkey = payload["profile"].strip().upper()
             if pkey in TRADING_PROFILES:
+                profile_changed = pkey != st.get_state("cloud_profile", "AL_YUKSELINCE_SAT")
                 st.set_state("cloud_profile", pkey)
                 notes.append(f"Profil '{pkey}' olarak güncellendi.")
 
@@ -1621,18 +1690,27 @@ class CloudBotApplication:
             active_p = self._active_cloud_params(eng)
             eff_s: RiskSettings = active_p["settings"]
             st.save_risk_settings(eff_s)
+
+        # Budget, mode and leverage edits govern new entries. Existing trades keep
+        # the exits used to size their risk, including ATR and trailing adjustments.
+        if profile_changed:
+            active_p = self._active_cloud_params(eng)
             for pos in st.get_open_positions(track=active_p["track"]):
                 if is_substep_dust_position(pos):
                     continue
                 if pos.stop_loss_price is not None and pos.stop_loss_price > pos.entry_price:
                     continue  # trailing stop ile kâra kilitlenmiş pozisyonun hedeflerini geriye alma
                 pos_sl, pos_tp, _ = active_p["profile"].leverage_adjusted_targets(max(1, int(pos.leverage)))
+                proposed_stop = pos.entry_price * (Decimal("1") - pos_sl)
+                # A profile change may tighten protection, but cannot enlarge the
+                # loss budget of an already funded long position.
+                protected_stop = max(pos.stop_loss_price or Decimal("0"), proposed_stop)
                 st.update_position_remaining(
                     pos.position_id,
                     quantity=pos.quantity,
                     cost_basis_usdc=pos.cost_basis_usdc,
                     entry_fee_usdc=pos.entry_fee_usdc,
-                    stop_loss_price=pos.entry_price * (Decimal("1") - pos_sl),
+                    stop_loss_price=protected_stop,
                     take_profit_price=pos.entry_price * (Decimal("1") + pos_tp),
                     update_exit_targets=True,
                 )
@@ -1730,6 +1808,80 @@ class CloudBotApplication:
         return {
             "ok": True,
             "message": _safe_text(summary["message"], 340),
+            "summary": summary,
+            "wallet": self._fetch_real_wallet_summary(eng),
+            "dashboard": self._build_dashboard(eng),
+        }
+
+    def _execute_spot_optimize(
+        self,
+        eng: TradingSystemEngine,
+        *,
+        max_small_usdt: Decimal = Decimal("9.20"),
+    ) -> dict[str, Any]:
+        st = eng.storage
+        spot_map = eng.market_client.discover_spot_pairs(quote_asset="USDT", allow_stablecoin_conversion=False)
+        px_map: dict[str, Decimal] = {}
+        get_json_fn = getattr(eng.market_client, "_get_json", None)
+        if get_json_fn is not None:
+            try:
+                raw_tickers, _ = get_json_fn("/api/v3/ticker/bookTicker")
+                if isinstance(raw_tickers, list):
+                    for item in raw_tickers:
+                        if isinstance(item, dict):
+                            bp = Decimal(str(item.get("bidPrice", "0")))
+                            if bp > Decimal("0"):
+                                px_map[str(item.get("symbol", "")).upper()] = bp
+            except Exception:
+                px_map = {}
+        if not px_map:
+            for sym in list(spot_map.keys())[:40]:
+                try:
+                    ob = eng.market_client.fetch_order_book(sym, depth_limit=5)
+                    if ob.best_bid is not None and ob.best_bid > Decimal("0"):
+                        px_map[sym] = ob.best_bid
+                except Exception:
+                    pass
+
+        summary = eng.live_executor.optimize_small_spot_balances(
+            spot_filters_map=spot_map,
+            bid_by_symbol=px_map,
+            ui_live_confirmed=True,
+            max_small_usdt=max_small_usdt,
+        )
+        try:
+            active_settings = self._active_cloud_params(eng)["settings"]
+            eng._resolve_live_unvalued_commissions("USDT", active_settings)
+        except Exception:
+            pass
+        st.set_state("auto_spot_optimize_v1_20261115", "1")
+        st.set_state("last_spot_optimize_json", json.dumps(summary, ensure_ascii=False))
+        self.state_sync.persist(self.config.db_path)
+        if self.notifier.enabled and (
+            summary.get("reconciled_manual_count")
+            or summary.get("sold_to_usdt_count")
+            or summary.get("converted_to_bnb_count")
+        ):
+            self.notifier.send(f"[SPOT OPTİMİZASYON] {_safe_text(summary.get('message', ''), 340)}")
+        return summary
+
+    def _handle_spot_optimize(self, eng: TradingSystemEngine, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not eng.config.enable_live_trading or not eng.config.has_binance_live_keys:
+            raise ValueError(
+                "Canlı Spot optimizasyonu kilitli: Sunucuda ENABLE_LIVE_TRADING=true ve Binance API anahtarları tanımlı olmalıdır."
+            )
+        max_small = Decimal("9.20")
+        if "max_small_usdt" in payload:
+            try:
+                cand = Decimal(str(payload["max_small_usdt"]))
+                if Decimal("1.00") <= cand <= Decimal("9.90"):
+                    max_small = cand
+            except InvalidOperation:
+                pass
+        summary = self._execute_spot_optimize(eng, max_small_usdt=max_small)
+        return {
+            "ok": True,
+            "message": _safe_text(summary.get("message", "Küçük coin optimizasyonu tamamlandı."), 380),
             "summary": summary,
             "wallet": self._fetch_real_wallet_summary(eng),
             "dashboard": self._build_dashboard(eng),
@@ -1921,6 +2073,7 @@ class CloudBotApplication:
             "/api/settings",
             "/api/close-positions",
             "/api/margin-liquidate",
+            "/api/optimize-dust",
             "/api/reset-paper",
             "/api/research",
         }
@@ -2013,6 +2166,8 @@ class CloudBotApplication:
                     )
                 if route == "/api/margin-liquidate":
                     return respond(200, self._handle_margin_liquidate(eng, payload))
+                if route == "/api/optimize-dust":
+                    return respond(200, self._handle_spot_optimize(eng, payload))
                 if route == "/api/research":
                     return respond(200, self._handle_research(eng, payload))
                 if route == "/api/reset-paper":

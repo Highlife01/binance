@@ -140,7 +140,11 @@ class RiskManager:
         for pos in open_positions:
             bid = bid_prices_by_symbol.get(pos.symbol, pos.entry_price)
             _, unreal_net = compute_open_position_unrealized_net_pnl(
-                pos, current_bid=bid, estimated_fee_rate=settings.estimated_fee_rate
+                pos,
+                current_bid=bid,
+                estimated_fee_rate=settings.estimated_fee_rate,
+                hourly_interest_rate=settings.hourly_margin_interest_rate,
+                now_utc=now_utc,
             )
             unrealized_total += unreal_net
 

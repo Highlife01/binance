@@ -27,6 +27,8 @@ data/*.lock
 *.execution.lock
 logs/
 exports/*.csv
+reports/deployment/
+reports/market_data/
 
 # Isletim sistemi ve araclari gecici dosyalari
 Thumbs.db

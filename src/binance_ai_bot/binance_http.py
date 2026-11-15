@@ -79,8 +79,8 @@ def parse_retry_after_sec(resp: httpx.Response, default_sec: int = 15) -> int:
 
 
 def sign_hmac_sha256(secret: str, params: dict[str, Any]) -> str:
-    """Binance HMAC-SHA256 imzalı sorgu dizgesi üretir."""
-    query_str = urlencode(params)
+    """Binance HMAC-SHA256 imzalı sorgu dizgesi üretir (çoklu dizi parametreleri için `doseq=True`)."""
+    query_str = urlencode(params, doseq=True)
     signature = hmac.new(
         secret.encode("utf-8"),
         query_str.encode("utf-8"),

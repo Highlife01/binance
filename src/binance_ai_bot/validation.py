@@ -49,6 +49,15 @@ def _validate_candles(candles: list[Candle]) -> None:
 
 
 @dataclass(frozen=True)
+class BacktestEquityPoint:
+    """One closed-bar valuation from the same fills used by the summary metrics."""
+
+    time_ms: int
+    strategy_equity_usdc: Decimal
+    benchmark_equity_usdc: Decimal
+
+
+@dataclass(frozen=True)
 class SliceBacktestMetrics:
     slice_name: str
     candle_count: int
@@ -68,6 +77,8 @@ class SliceBacktestMetrics:
     estimated_ai_cost_usd: Decimal
     verdict_text: str
     insufficient_data: bool
+    equity_curve: tuple[BacktestEquityPoint, ...] = ()
+    trade_pnls_usdc: tuple[Decimal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -159,6 +170,8 @@ def run_no_lookahead_slice_simulation(
     total_fees = Decimal("0")
     trade_count = 0
     winning_trades = 0
+    trade_pnls: list[Decimal] = []
+    equity_curve: list[BacktestEquityPoint] = []
     ai_cost_total = Decimal("0")
     daily_entries = 0
     daily_realized = Decimal("0")
@@ -224,6 +237,7 @@ def run_no_lookahead_slice_simulation(
         gross = quantity * execution_price
         fee = gross * settings.estimated_fee_rate
         pnl = gross - fee - allocated_cost
+        trade_pnls.append(pnl)
         cash += gross - fee
         total_fees += fee
         daily_realized += pnl
@@ -239,6 +253,21 @@ def run_no_lookahead_slice_simulation(
 
     # t mumunun kapanışında sinyal üretilir -> t+1 mumunun açılışında uygulanır (eval_end_idx - 1 son uygulanabilir t'dir)
     start_t = max(eval_start_idx, 35)
+    # Buy-and-hold starts at the first executable bar and pays the same assumed
+    # entry/exit friction and quantity filters as the strategy.
+    benchmark_qty = Decimal("0")
+    benchmark_cash = initial_balance_usdc
+    if start_t + 1 < eval_end_idx:
+        benchmark_price = candles[start_t + 1].open * buy_mult
+        benchmark_alloc = min(
+            settings.max_position_size_usdc,
+            initial_balance_usdc / (Decimal("1") + settings.estimated_fee_rate),
+        )
+        benchmark_qty = permitted_quantity(benchmark_alloc / benchmark_price, benchmark_price)
+        benchmark_cash -= benchmark_qty * benchmark_price * (Decimal("1") + settings.estimated_fee_rate)
+        equity_curve.append(BacktestEquityPoint(
+            candles[start_t].close_time_ms, initial_balance_usdc, initial_balance_usdc,
+        ))
     for t in range(start_t, eval_end_idx - 1):
         sig = evaluate_rule_signal_from_frame(
             full_df, symbol=symbol, interval=interval, row_index=t, params=params
@@ -289,7 +318,8 @@ def run_no_lookahead_slice_simulation(
                 gross_cost = qty * exec_buy_price
                 entry_fee = gross_cost * settings.estimated_fee_rate
                 total_out = gross_cost + entry_fee
-                if qty > 0 and total_out <= cash:
+                if (qty > 0 and total_out <= cash
+                        and gross_cost >= settings.min_buy_notional_usdc):
                     cash -= total_out
                     open_qty = qty
                     entry_price = exec_buy_price
@@ -330,6 +360,11 @@ def run_no_lookahead_slice_simulation(
                     mark_equity(next_bar.high)
                     mark_equity(next_bar.low)
         mark_equity(next_bar.close)
+        equity_curve.append(BacktestEquityPoint(
+            next_bar.close_time_ms,
+            cash + open_qty * next_bar.close * sell_mult * (Decimal("1") - settings.estimated_fee_rate),
+            benchmark_cash + benchmark_qty * next_bar.close * sell_mult * (Decimal("1") - settings.estimated_fee_rate),
+        ))
 
     # Dilim sonunda açık pozisyon kaldıysa son kapanış alış değerinden değerle
     last_close = slice_candles[-1].close
@@ -342,15 +377,8 @@ def run_no_lookahead_slice_simulation(
     net_ret_usdc = final_equity - initial_balance_usdc
     net_ret_pct = (net_ret_usdc / initial_balance_usdc) * Decimal("100")
 
-    # Eşdeğer riskli referans (10 USDC pariteye yatırılmış, 76 USDC nakitte tutulmuş Al-ve-Tut)
-    first_open = slice_candles[0].open
-    alloc_bench = min(settings.max_position_size_usdc, initial_balance_usdc)
-    if first_open > 0:
-        asset_ret_ratio = (last_close - first_open) / first_open
-        bench_net_usdc = (alloc_bench * asset_ret_ratio) - (alloc_bench * settings.estimated_fee_rate * Decimal("2"))
-        bench_ret_pct = (bench_net_usdc / initial_balance_usdc) * Decimal("100")
-    else:
-        bench_ret_pct = Decimal("0")
+    benchmark_final = benchmark_cash + benchmark_qty * last_close * sell_mult * (Decimal("1") - settings.estimated_fee_rate)
+    bench_ret_pct = ((benchmark_final - initial_balance_usdc) / initial_balance_usdc) * Decimal("100")
 
     win_rate = (
         (Decimal(winning_trades) / Decimal(trade_count)) * Decimal("100")
@@ -374,6 +402,7 @@ def run_no_lookahead_slice_simulation(
     verdict += (
         " Tek parite Spot simülasyonu; mum içi temaslarda zarar-kes önce uygulanır."
         " Günlük giriş/risk kilidi İstanbul gününde sıfırlanır; manuel duraklatmalar modellenmez."
+        " Çoklu zaman dilimi/quant giriş filtreleri, ATR boyutlandırması, kâr bekleme ve iz süren stop modellenmez; canlı motor eşliği doğrulanmaz."
     )
     if symbol_filters is None:
         verdict += " Borsa filtreleri sağlanmadı; minimum tutar/miktar ve adım uygunluğu doğrulanmadı."
@@ -399,6 +428,8 @@ def run_no_lookahead_slice_simulation(
         estimated_ai_cost_usd=ai_cost_total,
         verdict_text=verdict,
         insufficient_data=insufficient,
+        equity_curve=tuple(equity_curve),
+        trade_pnls_usdc=tuple(trade_pnls),
     )
 
 

@@ -86,6 +86,14 @@ def test_daily_entry_limit_is_enforced(monkeypatch):
     assert metrics.trade_count == 1
 
 
+def test_user_minimum_buy_cannot_be_ignored_by_historical_simulation(monkeypatch):
+    alternating_signals(monkeypatch)
+    metrics = simulate(candles(), settings(min_buy_notional_usdc=D("11"),
+                                           max_position_size_usdc=D("10")))
+    assert metrics.trade_count == 0
+    assert metrics.final_equity_usdc == metrics.initial_equity_usdc
+
+
 def test_daily_loss_latches_entries_even_if_market_recovers(monkeypatch):
     alternating_signals(monkeypatch)
     metrics = simulate(candles(), settings(estimated_fee_rate=D("0.001"), daily_loss_limit_usdc=D("0.01")))
