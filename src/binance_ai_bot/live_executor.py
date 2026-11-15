@@ -540,6 +540,12 @@ class BinanceLiveSpotExecutor:
                 recycle_dust=(dust_same_sym is not None),
                 stop_loss_pct=str(settings.stop_loss_pct), take_profit_pct=str(settings.take_profit_pct),
             )
+            cfg_min_buy = getattr(settings, "min_buy_notional_usdc", Decimal("0"))
+            min_buy_floor = max(filters.min_notional, cfg_min_buy)
+            if approved_notional is None and cfg_min_buy > Decimal("0"):
+                raise LiveExecutionError(
+                    f"Minimum {min_buy_floor:.2f} {filters.quote_asset} alt sınırı aktifken onaylı alım bütçesi zorunludur."
+                )
             if approved_notional is not None:
                 if not approved_notional.is_finite() or approved_notional <= 0:
                     raise LiveExecutionError("Onaylı canlı alış bütçesi geçersiz.")
@@ -547,14 +553,18 @@ class BinanceLiveSpotExecutor:
                     min(approved_notional, settings.max_position_size_usdc,
                         free_quote / (1 + settings.estimated_fee_rate)), Decimal("0.00000001"),
                 )
-                min_buy_floor = max(
-                    filters.min_notional,
-                    getattr(settings, "min_buy_notional_usdc", Decimal("0")),
-                )
                 if budget < min_buy_floor:
                     raise LiveExecutionError(
                         f"Güncel bakiye ve komisyon payıyla minimum emir tutarı ({min_buy_floor:.2f} {filters.quote_asset}) karşılanamıyor."
                     )
+                if cfg_min_buy > Decimal("0") and est_price is not None and est_price > Decimal("0"):
+                    est_exec_qty = quantize_down(budget / est_price, filters.market_step_size)
+                    est_exec_quote = est_exec_qty * est_price
+                    if est_exec_quote < min_buy_floor:
+                        raise LiveExecutionError(
+                            f"Lot adımı yuvarlaması sonrası gerçekleşecek tutar (~{est_exec_quote:.2f} {filters.quote_asset}), "
+                            f"minimum alım alt sınırının ({min_buy_floor:.2f} {filters.quote_asset}) altında kaldığı için alım yapılmadı."
+                        )
                 intent["quote_budget"] = str(budget)
                 del intent["order_params"]["quantity"]
                 intent["order_params"]["quoteOrderQty"] = _format_decimal_clean(budget)

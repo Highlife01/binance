@@ -555,18 +555,26 @@ class CloudBotApplication:
                 storage.save_risk_settings(upgraded_u)
             storage.set_state("unlimited_open_positions_v1", "1")
             changed = True
-        if storage.get_state("min_buy_notional_v1_10usdt", "") != "1":
+        if storage.get_state("min_buy_notional_v2_strict10", "") != "1":
             cur_m = storage.load_risk_settings(
                 RiskSettings(
                     max_open_positions=999,
                     max_position_size_usdc=Decimal("15.00"),
                     daily_loss_limit_usdc=Decimal("2.00"),
-                    min_buy_notional_usdc=Decimal("10.00"),
+                    min_buy_notional_usdc=Decimal("0"),
                 )
             )
-            if cur_m.min_buy_notional_usdc < Decimal("10.00") and cur_m.max_position_size_usdc >= Decimal("10.00"):
-                storage.save_risk_settings(dataclasses.replace(cur_m, min_buy_notional_usdc=Decimal("10.00")))
+            strict_pos_size = max(Decimal("10.00"), cur_m.max_position_size_usdc)
+            strict_min_buy = max(Decimal("10.00"), cur_m.min_buy_notional_usdc)
+            storage.save_risk_settings(
+                dataclasses.replace(
+                    cur_m,
+                    max_position_size_usdc=strict_pos_size,
+                    min_buy_notional_usdc=strict_min_buy,
+                )
+            )
             storage.set_state("min_buy_notional_v1_10usdt", "1")
+            storage.set_state("min_buy_notional_v2_strict10", "1")
             changed = True
         return changed
 
@@ -625,10 +633,14 @@ class CloudBotApplication:
 
         saved_risk = eng.default_risk_settings()
         eff_settings = profile.apply_to_risk_settings(saved_risk, leverage=lev)
-        # Kullanıcının kaydettiği açık pozisyon üst sınırını (1..999; 999 = bakiye yettiğince sınırsız) koru
+        # Kullanıcının kaydettiği açık pozisyon üst sınırını (1..999) ve kesin 10 USDT minimum alım tabanını koru
+        eff_min_buy = max(Decimal("10.00"), getattr(saved_risk, "min_buy_notional_usdc", Decimal("10.00")))
+        eff_pos_cap = max(eff_min_buy, eff_settings.max_position_size_usdc)
         eff_settings = dataclasses.replace(
             eff_settings,
             max_open_positions=max(1, min(999, int(saved_risk.max_open_positions))),
+            max_position_size_usdc=eff_pos_cap,
+            min_buy_notional_usdc=eff_min_buy,
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
         symbols = self._parse_scan_symbols(raw_syms)
@@ -1480,9 +1492,11 @@ class CloudBotApplication:
         if "max_position_size_usdc" in payload:
             try:
                 val = Decimal(str(payload["max_position_size_usdc"]))
-                if Decimal("5") <= val <= Decimal("250"):
+                if Decimal("10") <= val <= Decimal("250"):
                     pos_size = val
                     risk_changed = True
+                elif val < Decimal("10"):
+                    notes.append("10 USDT altı alım kapalıdır; işlem başı tutar en az 10 USDT olmalıdır.")
             except InvalidOperation:
                 pass
 
@@ -1510,7 +1524,10 @@ class CloudBotApplication:
                 take_profit_pct=prof_now.take_profit_pct,
                 leverage=lev_now,
                 min_net_profit_exit_pct=prof_now.min_net_profit_exit_pct,
-                min_buy_notional_usdc=getattr(cur_risk, "min_buy_notional_usdc", Decimal("10.00")),
+                min_buy_notional_usdc=max(
+                    Decimal("10.00"),
+                    getattr(cur_risk, "min_buy_notional_usdc", Decimal("10.00")),
+                ),
             )
             st.save_risk_settings(updated_risk)
             notes.append("Risk ve pozisyon limitleri kaydedildi.")

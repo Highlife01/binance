@@ -239,7 +239,11 @@ class VirtualExecutionSimulator:
             exec_price = avg_book_price
 
         gross_usdc = filled_qty * exec_price
-        if gross_usdc < filters.min_notional:
+        min_buy_floor = max(
+            filters.min_notional,
+            getattr(settings, "min_buy_notional_usdc", Decimal("0")),
+        )
+        if gross_usdc < min_buy_floor:
             unfilled_notional = SimulatedOrderResult(
                 order_id=order_id,
                 symbol=filters.symbol,
@@ -256,7 +260,7 @@ class VirtualExecutionSimulator:
                 strategy_source=strategy_source,
                 explanation=(
                     f"Kısmi/mevcut likidite tutarı ({gross_usdc:.2f} {filters.quote_asset}), minimum emir tutarının "
-                    f"({filters.min_notional:.2f} {filters.quote_asset}) altında kaldığı için emir gerçekleşmedi."
+                    f"({min_buy_floor:.2f} {filters.quote_asset}) altında kaldığı için emir gerçekleşmedi."
                 ),
                 created_at_iso=now_iso,
             )

@@ -710,3 +710,64 @@ def test_sub_min_notional_devalued_position_is_recycled_on_new_buy(tmp_path):
     assert len(open_pos) == 1
     assert open_pos[0].position_id == "ZEC-DUST-1"
     assert open_pos[0].quantity > D("4.5")
+
+
+def test_strict_10_usd_min_buy_blocks_legacy_db_settings_and_step_rounding(tmp_path):
+    from dataclasses import replace
+    import json
+    from tests.test_cloud_api import _make_app
+
+    # 1. Exact live-DB scenario: min_buy_notional_v1_10usdt == '1' yet risk_settings_json lacks min_buy_notional_usdc
+    app, _, _ = _make_app(tmp_path)
+    eng = app._get_engine()
+    eng.storage.set_state(
+        "risk_settings_json",
+        json.dumps(
+            {
+                "max_open_positions": 999,
+                "max_position_size_usdc": "15",
+                "daily_loss_limit_usdc": "10",
+                "max_daily_new_positions": 999,
+            }
+        ),
+    )
+    eng.storage.set_state("min_buy_notional_v1_10usdt", "1")
+    eng.storage.set_state("min_buy_notional_v2_strict10", "")
+
+    app._ensure_cloud_defaults(eng.storage)
+    saved_json = json.loads(eng.storage.get_state("risk_settings_json") or "{}")
+    assert D(saved_json["min_buy_notional_usdc"]) == D("10.00")
+    assert app._active_cloud_params(eng)["settings"].min_buy_notional_usdc == D("10.00")
+
+    # 2. /api/settings refuses max_position_size_usdc < 10
+    r_low = app.handle(
+        "POST",
+        "/api/settings",
+        {"Authorization": "Bearer owner-token"},
+        b'{"max_position_size_usdc": "7.50"}',
+    )
+    assert r_low.status == 200
+    assert D(r_low.body["dashboard"]["risk_settings"]["max_position_size_usdc"]) >= D("10.00")
+
+    # 3. Live Spot executor blocks step-rounded sub-10 USD buy (e.g. 10.05 budget @ $65, step 0.01 -> 0.15 * 65 = $9.75)
+    executor, storage, exchange = setup(tmp_path / "sub10_step")
+    exchange.free_quote = "10.20"
+    ltc_like = replace(
+        filters(),
+        min_notional=D("1.00"),      # Exchange allows $1 (like DOGE/PENGU), but user rule forbids < $10!
+        step_size=D("0.01"),
+        market_step_size=D("0.01"),
+        min_qty=D("0.01"),
+        market_min_qty=D("0.01"),
+    )
+    with pytest.raises(LiveExecutionError, match="10.00"):
+        executor.execute_live_market_buy(
+            filters=ltc_like,
+            approved_qty=D("0.16"),
+            approved_notional=D("10.40"),  # price = $65.00; wallet 10.20 / 1.001 = 10.189 -> 0.15 * 65 = $9.75 < $10!
+            signal_key="SUB10-STEP-BLOCK",
+            strategy_source="TEST",
+            settings=RiskSettings(leverage=1, max_position_size_usdc=D("15.00"), min_buy_notional_usdc=D("10.00")),
+            ui_live_confirmed=True,
+        )
+

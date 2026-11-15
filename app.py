@@ -1284,11 +1284,11 @@ def main() -> None:
             with fc1:
                 new_max_pos_usdc = st.number_input(
                     f" İşlem Başına Öz Teminat Üst Sınırı ({selected_quote})",
-                    min_value=5.0,
-                    max_value=float(cfg.initial_balance_usdc),
-                    value=float(settings.max_position_size_usdc),
+                    min_value=10.0,
+                    max_value=max(10.0, float(cfg.initial_balance_usdc)),
+                    value=max(10.0, float(settings.max_position_size_usdc)),
                     step=1.0,
-                    help="2x kaldıraçta 10 USDT teminat ~20 USDT pozisyon açar. Minimum emir tutarı aşılırsa işlem reddedilir.",
+                    help="10 USDT/USDC altına alım kapalıdır. 2x kaldıraçta 10 USDT teminat ~20 USDT pozisyon açar.",
                 )
                 new_daily_loss = st.number_input(
                     f"Günlük Zarar Eşiği ({selected_quote} — Europe/Istanbul)",
@@ -1362,6 +1362,7 @@ def main() -> None:
                     hourly_margin_interest_rate=getattr(
                         settings, "hourly_margin_interest_rate", Decimal("0.000005")
                     ),
+                    min_buy_notional_usdc=Decimal("10.00"),
                 )
                 storage.save_risk_settings(updated)
                 st.success("Risk ve kaldıraç ayarları SQLite veritabanına kaydedildi.")

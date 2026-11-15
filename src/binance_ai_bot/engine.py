@@ -887,16 +887,25 @@ class TradingSystemEngine:
                                 scaled_notional = max(buy_notional * mult, min_quant_floor)
                                 if scaled_notional < buy_notional:
                                     scaled_qty = quantize_down(scaled_notional / best_ask, market.filters.market_step_size)
+                                    if scaled_qty * best_ask < min_quant_floor and (scaled_qty + market.filters.market_step_size) < buy_qty:
+                                        scaled_qty = scaled_qty + market.filters.market_step_size
                                     eff_min_q = max(market.filters.min_qty, market.filters.market_min_qty)
                                     if (
                                         scaled_qty >= eff_min_q
-                                        and scaled_qty * best_ask >= market.filters.min_notional
+                                        and scaled_qty * best_ask >= min_quant_floor
                                         and scaled_qty < buy_qty
                                     ):
                                         buy_qty = scaled_qty
                                         buy_notional = scaled_qty * best_ask
+                        hard_min_buy = getattr(buy_settings, "min_buy_notional_usdc", Decimal("0"))
                         sig_key = f"{market.symbol}:{market.interval}:{tech_signal.candle_open_time_ms}:AL"
-                        if is_live_spot:
+                        if hard_min_buy > Decimal("0") and buy_notional < hard_min_buy:
+                            block_reason = (
+                                f"{market.symbol} hesaplanan alım tutarı ({buy_notional:.2f} {quote_ccy}), "
+                                f"minimum alım alt sınırının ({hard_min_buy:.2f} {quote_ccy}) altında kaldığı için alım yapılmadı."
+                            )
+                            info_msg = block_reason
+                        elif is_live_spot:
                             try:
                                 ord_res = self.live_executor.execute_live_market_buy(
                                     filters=market.filters,
@@ -1261,9 +1270,11 @@ class TradingSystemEngine:
                 target = max(capped, min_buy_floor)
                 if target < notional:
                     new_qty = quantize_down(target / price, market.filters.market_step_size)
+                    if new_qty * price < min_buy_floor and (new_qty + market.filters.market_step_size) < qty:
+                        new_qty = new_qty + market.filters.market_step_size
                     if (
                         new_qty >= max(market.filters.min_qty, market.filters.market_min_qty)
-                        and new_qty * price >= market.filters.min_notional
+                        and new_qty * price >= min_buy_floor
                         and new_qty < qty
                     ):
                         qty = new_qty

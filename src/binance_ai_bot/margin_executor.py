@@ -260,18 +260,32 @@ class BinanceLiveMarginExecutor:
         )
         max_borrow = Decimal(str(mb_resp.get("amount", "0")))
         total_buying_power = status_info["quote_free"] + max_borrow
-        if total_buying_power < filters.min_notional:
+        cfg_min_buy = getattr(settings, "min_buy_notional_usdc", Decimal("0"))
+        min_buy_floor = max(filters.min_notional, cfg_min_buy)
+        if total_buying_power < min_buy_floor:
             raise LiveExecutionError(
                 f"Marjin cüzdanındaki serbest {q_ccy} ({status_info['quote_free']:.2f}) + borç limiti "
-                f"({max_borrow:.2f}) minimum emir tutarını ({filters.min_notional:.2f} {q_ccy}) karşılamıyor."
+                f"({max_borrow:.2f}) minimum emir tutarını ({min_buy_floor:.2f} {q_ccy}) karşılamıyor."
             )
         if (
             approved_notional is not None
             and approved_notional > Decimal("0")
             and approved_notional > total_buying_power * Decimal("0.985")
         ):
-            scale = (total_buying_power * Decimal("0.985")) / approved_notional
+            capped_power = total_buying_power * Decimal("0.985")
+            if capped_power < min_buy_floor:
+                raise LiveExecutionError(
+                    f"Marjin güvenli alım gücü ({capped_power:.2f} {q_ccy}), minimum alım alt sınırının "
+                    f"({min_buy_floor:.2f} {q_ccy}) altında kaldığı için işlem açılmadı."
+                )
+            scale = capped_power / approved_notional
             scaled_qty = quantize_down(approved_qty * scale, filters.market_step_size)
+            est_px = approved_notional / approved_qty if approved_qty > Decimal("0") else Decimal("0")
+            if cfg_min_buy > Decimal("0") and est_px > Decimal("0") and scaled_qty * est_px < min_buy_floor:
+                raise LiveExecutionError(
+                    f"Marjin lot yuvarlaması sonrası tutar (~{(scaled_qty * est_px):.2f} {q_ccy}), "
+                    f"minimum alım alt sınırının ({min_buy_floor:.2f} {q_ccy}) altında kaldığı için işlem açılmadı."
+                )
             if scaled_qty >= max(filters.min_qty, filters.market_min_qty):
                 qty = scaled_qty
 
