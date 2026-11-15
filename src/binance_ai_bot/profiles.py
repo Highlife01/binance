@@ -105,6 +105,7 @@ class TradingProfile:
             max_entry_spread_pct=self.max_entry_spread_pct,
             expert_mode=self.expert_mode,
             risk_per_trade_pct=self.risk_per_trade_pct,
+            min_buy_notional_usdc=getattr(base, "min_buy_notional_usdc", Decimal("0")),
         )
 
 
@@ -126,7 +127,7 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
             rsi_buy_min=26.0,
             rsi_buy_max=68.0,
             rsi_overbought_exit=69.0,
-            min_volume_ratio=0.12,
+            min_volume_ratio=0.35,
             require_close_above_fast=False,
             require_rising_momentum=False,
             fast_exit=True,

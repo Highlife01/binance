@@ -753,10 +753,10 @@ class CloudBotApplication:
             if _SYMBOL_RE.fullmatch(sym) and sym.endswith("USDT") and sym not in seen_u:
                 seen_u.add(sym)
                 universe.append(sym)
-        # Radardaki erken/güçlü yükselenleri (+%2..+%35, >=5M USDT hacim) en fazla 4 ek aday olarak havuza ekle
+        # Radardaki erken/güçlü yükselenleri (+%2..+%35, >=5M USDT hacim) en fazla 8 ek aday olarak havuza ekle
         added_gainers = 0
         for g in gainers:
-            if added_gainers >= 4:
+            if added_gainers >= 8:
                 break
             sym = str(g.get("symbol", "")).upper()
             chg = float(g.get("change_pct_24h", 0) or 0)

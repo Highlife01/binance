@@ -15,6 +15,7 @@ from binance_ai_bot.expert import (
     dynamic_exits,
     inverse_vol_capped_notional,
     loss_streak_cooldown,
+    macro_bear_block,
     orderbook_microstructure_block,
     pick_scan_symbols,
     post_exit_reentry_block,
@@ -507,3 +508,85 @@ def test_tradingagents_risk_manager_red_vetoes_buy_decision(tmp_path: Path):
     )
     assert decision.action == "BEKLE"
     assert "Risk Yöneticisi vetosu" in decision.reason
+
+
+def test_profile_preserves_min_buy_notional_floor():
+    from binance_ai_bot.profiles import get_profile
+
+    base = RiskSettings(
+        max_open_positions=999,
+        max_position_size_usdc=Decimal("15.00"),
+        daily_loss_limit_usdc=Decimal("2.00"),
+        min_buy_notional_usdc=Decimal("10.00"),
+    )
+    eff = get_profile("AL_YUKSELINCE_SAT").apply_to_risk_settings(base, leverage=1)
+    assert eff.min_buy_notional_usdc == Decimal("10.00")
+
+
+def test_macro_bear_block_rejects_dead_cat_bounce_and_allows_decoupled_uptrend():
+    # 105-bar (26h) BTC bear market: drops from 75000 -> 65000 (-13.3%)
+    btc_bear = _candles([75_000.0 - 95.0 * i for i in range(105)])
+    # Dead-cat bounce altcoin: drops from 100 -> 82 (-18%) over 95 bars, then bounces +1.5% over last 10 bars
+    alt_deadcat_closes = [100.0 - 0.19 * i for i in range(95)] + [81.95 + 0.14 * i for i in range(10)]
+    alt_deadcat = _candles(alt_deadcat_closes)
+    # Decoupled uptrend coin (like DODOUSDT): rises steadily from 0.10 -> 0.125 (+25%)
+    decoupled_bull = _candles([0.10 + 0.00024 * i for i in range(105)])
+
+    assert macro_bear_block(alt_deadcat, btc_bear, is_btc=False) is not None
+    assert macro_bear_block(btc_bear, btc_bear, is_btc=True) is not None
+    assert macro_bear_block(decoupled_bull, btc_bear, is_btc=False) is None
+
+
+def test_trailing_armed_position_is_not_cut_early_by_1m_sat_flicker(tmp_path: Path):
+    from binance_ai_bot.config import AppConfig
+    from binance_ai_bot.engine import TradingSystemEngine
+    from binance_ai_bot.profiles import get_profile
+
+    prof = get_profile("AL_YUKSELINCE_SAT")
+
+    class _FlickerMarket(FakeMarketClient):
+        def fetch_verified_market_bundle(self, symbol: str, interval: str, allow_stablecoin_conversion: bool = False):
+            b = super().fetch_verified_market_bundle(symbol, interval, allow_stablecoin_conversion)
+            # Force RSI/EMA drop on the last 3 bars so tech_signal emits SAT while bid is still above trailing stop
+            cs = list(b.closed_candles)
+            last_p = cs[-4].close
+            for k in (-3, -2, -1):
+                p_new = last_p - Decimal("0.60")
+                cs[k] = dataclasses.replace(cs[k], open=last_p, close=p_new, high=last_p, low=p_new)
+                last_p = p_new
+            bid_px = Decimal("102.00")
+            ob = OrderBookSnapshot(
+                symbol=symbol,
+                bids=[OrderBookLevel(price=bid_px, quantity=Decimal("500"))],
+                asks=[OrderBookLevel(price=bid_px + Decimal("0.01"), quantity=Decimal("500"))],
+                fetched_at_utc=datetime.now(timezone.utc),
+                source_url="test",
+            )
+            return dataclasses.replace(b, closed_candles=cs, order_book=ob)
+
+    cfg = AppConfig(sqlite_db_path=tmp_path / "trail_hold.db", initial_balance_usdc=Decimal("100"), quote_asset="USDT")
+    eng = TradingSystemEngine(cfg, market_client=_FlickerMarket())
+    settings = prof.apply_to_risk_settings(eng.default_risk_settings(), leverage=1)
+    now = datetime.now(timezone.utc)
+    pos = Position(
+        position_id="TRAIL-ARMED-1",
+        symbol="SOLUSDT",
+        quantity=Decimal("1.0"),
+        entry_price=Decimal("100.00"),
+        cost_basis_usdc=Decimal("100.00"),
+        entry_fee_usdc=Decimal("0.08"),
+        opened_at_iso=now.isoformat(),
+        signal_key="s1",
+        strategy_source="TEST",
+        stop_loss_price=Decimal("101.20"),   # Trailing already armed above entry (100.00)!
+        take_profit_price=Decimal("103.00"),
+        status="OPEN",
+    )
+    eng.storage.insert_position(pos, track="MAIN")
+    step = eng.run_analysis_step(
+        symbol="SOLUSDT", interval="1m", settings=settings, ai_enabled_by_user=False, strategy_params=prof.strategy
+    )
+    assert step.executed_order is None
+    assert step.final_action == "BEKLE"
+    assert eng.storage.get_position("TRAIL-ARMED-1", track="MAIN").status == "OPEN"
+

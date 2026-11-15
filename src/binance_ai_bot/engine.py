@@ -42,6 +42,7 @@ from .expert import (
     dynamic_exits,
     inverse_vol_capped_notional,
     loss_streak_cooldown,
+    macro_bear_block,
     orderbook_imbalance,
     orderbook_microstructure_block,
     post_exit_reentry_block,
@@ -523,7 +524,9 @@ class TradingSystemEngine:
                 returns_by_symbol=self._symbol_returns_cache,
                 open_symbols=[p.symbol for p in open_positions if not is_substep_dust_position(p)],
                 inventory_ratio=inv_ratio,
-                strict_quant_gate=False,
+                strict_quant_gate=bool(
+                    getattr(settings, "expert_mode", False) and len(market.closed_candles) >= 90
+                ),
             )
             self.latest_quant_summaries[market.symbol] = quant_assessment.to_summary_dict()
         except Exception:
@@ -642,15 +645,18 @@ class TradingSystemEngine:
                 floor_px = pos.entry_price * (Decimal("1") + lock_pct)
                 new_stop = max(best_bid * (Decimal("1") - trail_pct), floor_px, pos.stop_loss_price or Decimal("0"))
                 if new_stop < best_bid:
+                    new_tp = best_bid * (Decimal("1") + trail_pct)
                     self.storage.update_position_remaining(
                         pos.position_id,
                         quantity=pos.quantity,
                         cost_basis_usdc=pos.cost_basis_usdc,
                         entry_fee_usdc=pos.entry_fee_usdc,
                         stop_loss_price=new_stop,
-                        take_profit_price=best_bid * (Decimal("1") + trail_pct),
+                        take_profit_price=new_tp,
                         update_exit_targets=True,
                     )
+                    pos = dataclasses.replace(pos, stop_loss_price=new_stop, take_profit_price=new_tp)
+                    symbol_open_pos = pos
                     tp_hit = False
                     trailing_note = (
                         f"{market.symbol} trailing stop yükseltildi: {new_stop:.6g} (anlık {best_bid:.6g})."
@@ -754,12 +760,35 @@ class TradingSystemEngine:
                 accrued_int = compute_accrued_margin_interest(symbol_open_pos, now_utc, hourly_rate)
                 eff_min_profit_pct = min_profit_pct + (accrued_int / symbol_open_pos.cost_basis_usdc)
             min_exit_px = symbol_open_pos.entry_price * (Decimal("1") + eff_min_profit_pct)
-            if best_bid >= min_exit_px and tech_signal.action == "SAT":
-                final_action = "SAT"
-                info_msg = (
-                    f"{market.symbol} kâr bölgesinde (+%{eff_min_profit_pct * Decimal('100'):.2f} üzeri) "
-                    f"ivme yavaşladığı için net kâr kilitleniyor (Giriş: {symbol_open_pos.entry_price:.6g}, Anlık: {best_bid:.6g})."
-                )
+            base_tp_pct = max(eff_min_profit_pct, getattr(settings, "take_profit_pct", eff_min_profit_pct))
+            base_tp_px = symbol_open_pos.entry_price * (Decimal("1") + base_tp_pct)
+            trailing_armed = (
+                getattr(settings, "trailing_stop_pct", Decimal("0")) > Decimal("0")
+                and symbol_open_pos.stop_loss_price is not None
+                and symbol_open_pos.stop_loss_price > symbol_open_pos.entry_price
+            )
+            is_quick_1m_noise = str(tech_signal.reason or "").startswith("Hızlı ivme kaybı")
+            if trailing_armed:
+                if final_action == "SAT":
+                    final_action = "BEKLE"
+                    info_msg = trailing_note or (
+                        f"{market.symbol} iz-süren kâr kilidi aktif "
+                        f"(Stop: {symbol_open_pos.stop_loss_price:.6g} > Giriş: {symbol_open_pos.entry_price:.6g}); "
+                        "erken satılmadı, yükselişin devamı takip ediliyor."
+                    )
+            elif best_bid >= min_exit_px and tech_signal.action == "SAT":
+                if is_quick_1m_noise and best_bid < base_tp_px:
+                    final_action = "BEKLE"
+                    info_msg = (
+                        f"{market.symbol} kâr büyümesi bekleniyor (Anlık: {best_bid:.6g}, "
+                        f"Tam Hedef: {base_tp_px:.6g}); tek mumluk ivme gürültüsünde erken satılmadı."
+                    )
+                else:
+                    final_action = "SAT"
+                    info_msg = (
+                        f"{market.symbol} kâr bölgesinde (+%{eff_min_profit_pct * Decimal('100'):.2f} üzeri) "
+                        f"ivme yavaşladığı için net kâr kilitleniyor (Giriş: {symbol_open_pos.entry_price:.6g}, Anlık: {best_bid:.6g})."
+                    )
             elif final_action == "SAT" and best_bid < min_exit_px:
                 final_action = "BEKLE"
                 info_msg = (
@@ -851,10 +880,11 @@ class TradingSystemEngine:
                                 and best_ask > Decimal("0")
                             ):
                                 mult = Decimal(str(quant_assessment.sizing_multiplier))
-                                scaled_notional = max(
-                                    buy_notional * mult,
+                                min_quant_floor = max(
                                     market.filters.min_notional * Decimal("1.05"),
+                                    getattr(buy_settings, "min_buy_notional_usdc", Decimal("0")),
                                 )
+                                scaled_notional = max(buy_notional * mult, min_quant_floor)
                                 if scaled_notional < buy_notional:
                                     scaled_qty = quantize_down(scaled_notional / best_ask, market.filters.market_step_size)
                                     eff_min_q = max(market.filters.min_qty, market.filters.market_min_qty)
@@ -1132,7 +1162,7 @@ class TradingSystemEngine:
         if cached and (now_mono - cached[0]) < ttl_sec:
             return cached[1]
         try:
-            candles = fetch(symbol, interval, 60)
+            candles = fetch(symbol, interval, 105)
         except Exception:
             return None
         self._candle_cache[key] = (now_mono, candles)
@@ -1146,7 +1176,7 @@ class TradingSystemEngine:
         *,
         market: MarketBundle | None = None,
     ) -> str | None:
-        """Uzman trader ön elemesi: zarar serisi, düşen bıçak, BTC risk-off, mum belirsizliği/aykırılığı ve defter."""
+        """Uzman trader ön elemesi: zarar serisi, düşen bıçak, BTC risk-off, 24sa makro rejim ve defter."""
         cooldown = loss_streak_cooldown(self.storage.get_recent_closed_pnls(track, symbol, 4), now_utc)
         if cooldown:
             return f"{symbol} {cooldown}"
@@ -1167,6 +1197,10 @@ class TradingSystemEngine:
             why = regime_block(trend_info(btc_candles))
             if why:
                 return why
+        if coin_candles:
+            why = macro_bear_block(coin_candles, btc_candles, is_btc=(symbol == "BTCUSDT"))
+            if why:
+                return f"{symbol}: {why}"
         return None
 
     def _expert_context_notes(self, symbol: str, order_book: Any = None) -> list[str]:

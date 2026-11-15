@@ -68,9 +68,11 @@ def trend_info(candles_15m: Sequence[Candle]) -> TrendInfo:
 
 
 def coin_knife_block(info: TrendInfo) -> str | None:
-    """Net düşüş trendinde ve son 1 saatte sert düşen coini (düşen bıçak) alma."""
-    if info.state == "DOWN" and info.ret_1h_pct <= -0.40:
-        return f"15dk trend düşüşte ve son 1 saatte %{info.ret_1h_pct:.2f} düştü (düşen bıçak)"
+    """Net 15dk düşüş trendindeki coini (veya sert düşen bıçağı) tepki mumunda alma."""
+    if info.state == "DOWN":
+        if info.ret_1h_pct <= -0.40:
+            return f"15dk trend düşüşte ve son 1 saatte %{info.ret_1h_pct:.2f} düştü (düşen bıçak)"
+        return f"15dk ana trend düşüşte ({info.label()}); düşüş trendinde tepki alımı engellendi"
     return None
 
 
@@ -78,6 +80,67 @@ def regime_block(btc: TrendInfo) -> str | None:
     """BTC net risk-off ise (düşüş trendi + sert 1 saatlik düşüş) tüm alımlar durur."""
     if btc.state == "DOWN" and btc.ret_1h_pct <= -0.80:
         return f"BTC risk-off rejimi (15dk düşüş trendi, 1 saatte %{btc.ret_1h_pct:.2f})"
+    return None
+
+
+def macro_bear_block(
+    coin_candles_15m: Sequence[Candle],
+    btc_candles_15m: Sequence[Candle] | None = None,
+    *,
+    is_btc: bool = False,
+) -> str | None:
+    """
+    24 saatlik (96 x 15dk mum) makro rejim ve göreceli güç (RS) filtresi:
+    - Yalnızca >=96 kapanmış 15dk mum mevcutsa devreye girer (kısa veri varsa fail-open).
+    - BTC 24 saatlik ayı rejimindeyken (EMA96 altı veya EMA20<EMA50 veya 24sa <= -%1.0), korele zayıf
+      coinlerin sahte tepki yükselişlerini (dead-cat bounce) engeller; yalnızca bağımsız yükseliş
+      trendindeki (fiyat > EMA96, EMA20 > EMA50 >= EMA96, 24sa >= +%1.5, 6sa >= +%0.3) coinlere izin verir.
+    - BTC sağlıklı/yükseliş rejimindeyken de kendi 24 saatlik trendi çökmüş coinleri eler.
+    """
+    if len(coin_candles_15m) < 96:
+        return None
+    closes = [float(c.close) for c in coin_candles_15m]
+    cl = closes[-1]
+    if cl <= 0 or closes[-96] <= 0 or closes[-25] <= 0:
+        return None
+    e20 = _ema(closes, 20)[-1]
+    e50 = _ema(closes, 50)[-1]
+    e96 = _ema(closes, 96)[-1]
+    ret_6h = (cl / closes[-25] - 1.0) * 100.0
+    ret_24h = (cl / closes[-96] - 1.0) * 100.0
+
+    if btc_candles_15m is not None and len(btc_candles_15m) >= 96:
+        b_closes = [float(c.close) for c in btc_candles_15m]
+        bcl = b_closes[-1]
+        if bcl > 0 and b_closes[-96] > 0 and b_closes[-25] > 0 and b_closes[-5] > 0:
+            be20 = _ema(b_closes, 20)[-1]
+            be50 = _ema(b_closes, 50)[-1]
+            be96 = _ema(b_closes, 96)[-1]
+            br1h = (bcl / b_closes[-5] - 1.0) * 100.0
+            br6h = (bcl / b_closes[-25] - 1.0) * 100.0
+            br24h = (bcl / b_closes[-96] - 1.0) * 100.0
+            btc_bear = (bcl < be96) or (be20 < be50 * 0.999) or (br24h <= -1.0) or (br6h <= -1.2)
+            if btc_bear:
+                if is_btc:
+                    if not (bcl > be96 and be20 > be50 and br6h >= 0.4):
+                        return f"BTC 24sa düşüş rejiminde (24sa %{br24h:+.2f}, EMA96 altı)"
+                else:
+                    rs_bull = (
+                        cl > e96
+                        and e20 > e50
+                        and e50 >= e96 * 0.998
+                        and ret_24h >= 1.5
+                        and ret_6h >= 0.3
+                        and br1h > -0.80
+                    )
+                    if not rs_bull:
+                        return (
+                            f"BTC 24sa ayı rejiminde (%{br24h:+.2f}); bağımsız yükseliş trendi yok "
+                            f"(coin 24sa %{ret_24h:+.2f}, 6sa %{ret_6h:+.2f})"
+                        )
+
+    if (cl < e96 * 0.995 and ret_24h <= -1.0) or (e20 < e50 * 0.999 and cl < e96) or ret_6h <= -1.5:
+        return f"24sa makro trend zayıf/düşüşte (24sa %{ret_24h:+.2f}, 6sa %{ret_6h:+.2f}, EMA96 altı)"
     return None
 
 
@@ -316,15 +379,18 @@ def score_universe(
         if range_pct < 1.5 or range_pct > 55.0:
             continue
         liq = max(0.0, min((math.log10(qvol) - 6.7) / 2.8, 1.0))
-        vol_score = min(range_pct, 15.0) / 15.0
-        if chg <= 0.0:
-            mom_score = 0.10
+        raw_vol = min(range_pct, 15.0) / 15.0
+        vol_score = raw_vol * 0.25 if chg < -1.0 else (raw_vol * 0.65 if chg < 0.0 else raw_vol)
+        if chg < -1.0:
+            mom_score = 0.0
+        elif chg <= 0.0:
+            mom_score = 0.08
         elif chg <= 25.0:
-            mom_score = min(chg / 15.0, 1.0)
+            mom_score = min(chg / 12.0, 1.0)
         else:
             mom_score = max(0.35, 1.0 - (chg - 25.0) / 60.0)
         spread_score = 1.0 - min(spread / max_spread, 1.0)
-        score = 0.30 * liq + 0.30 * vol_score + 0.25 * mom_score + 0.15 * spread_score
+        score = 0.28 * liq + 0.27 * vol_score + 0.30 * mom_score + 0.15 * spread_score
         ranked.append(
             {
                 "symbol": str(c["symbol"]),
