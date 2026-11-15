@@ -25,6 +25,11 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .binance_http import (
+    BinanceTransportState,
+    execute_signed_binance_request,
+    sign_hmac_sha256,
+)
 from .config import AppConfig
 from .domain import (
     Position,
@@ -54,15 +59,10 @@ class BinanceLiveMarginExecutor:
         self.config = config
         self.storage = storage
         self._external_client = http_client
+        self._transport_state = BinanceTransportState()
 
     def _sign_params(self, params: dict[str, Any]) -> str:
-        query_str = urlencode(params)
-        signature = hmac.new(
-            self.config.binance_api_secret.encode("utf-8"),
-            query_str.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return f"{query_str}&signature={signature}"
+        return sign_hmac_sha256(self.config.binance_api_secret, params)
 
     def _request_signed(
         self,
@@ -78,68 +78,41 @@ class BinanceLiveMarginExecutor:
                 "Canlı Marjin işlem için .env dosyasında BINANCE_API_KEY ve BINANCE_API_SECRET tanımlı olmalıdır."
             )
 
-        base_url = self.config.binance_live_base_url
-        full_url = f"{base_url}{path}"
-        assert_live_margin_request(
-            method,
-            full_url,
-            config_live_enabled=self.config.enable_live_trading,
-            ui_live_confirmed=ui_live_confirmed,
-            ui_margin_confirmed=ui_margin_confirmed,
-        )
+        def _margin_special_error(status_code: int, api_code: int | None, safe_body: str) -> Exception | None:
+            if "-3003" in safe_body or "Margin account does not exist" in safe_body:
+                return LiveExecutionError(
+                    "Binance Çapraz Marjin (Cross Margin) cüzdanınız henüz açılmamış görünüyor (-3003). "
+                    "Binance uygulamasından Cüzdanlar -> Marjin (Cross) ekranına girip kısa testi onaylayarak "
+                    "Marjin hesabını açın ve Spot cüzdanınızdan Marjin cüzdanına USDT aktarın.",
+                    api_code=api_code,
+                    status_code=status_code,
+                )
+            return None
 
-        client = self._external_client or httpx.Client(timeout=10.0)
-        close_after = self._external_client is None
-        try:
-            time_url = f"{base_url}/api/v3/time"
-            assert_live_margin_request(
-                "GET",
-                time_url,
+        return execute_signed_binance_request(
+            state=self._transport_state,
+            base_url=self.config.binance_live_base_url,
+            method=method,
+            path=path,
+            api_key=self.config.binance_api_key,
+            api_secret=self.config.binance_api_secret,
+            recv_window_ms=self.config.binance_recv_window_ms,
+            timeout_sec=10.0,
+            params=params,
+            external_client=self._external_client,
+            security_assert_fn=lambda m, u: assert_live_margin_request(
+                m,
+                u,
                 config_live_enabled=self.config.enable_live_trading,
                 ui_live_confirmed=ui_live_confirmed,
                 ui_margin_confirmed=ui_margin_confirmed,
-            )
-            try:
-                t_resp = client.get(time_url)
-                server_time_ms = int(t_resp.json()["serverTime"])
-            except Exception as exc:
-                raise LiveExecutionError(_friendly_network_error(exc, time_url)) from exc
-
-            local_ms = int(time.time() * 1000)
-            drift_ms = abs(server_time_ms - local_ms)
-            if drift_ms > 30_000:
-                raise LiveExecutionError(
-                    f"Windows sistem saatiniz Binance sunucusundan {drift_ms // 1000} sn sapmış durumda. "
-                    "Lütfen Windows Tarih ve Saat ayarlarından 'Şimdi eşitle' yapın."
-                )
-
-            payload = dict(params or {})
-            payload["recvWindow"] = self.config.binance_recv_window_ms
-            payload["timestamp"] = server_time_ms
-            signed_query = self._sign_params(payload)
-            headers = {"X-MBX-APIKEY": self.config.binance_api_key}
-
-            req_url = f"{full_url}?{signed_query}"
-            try:
-                resp = client.request(method.upper(), req_url, headers=headers)
-            except Exception as exc:
-                raise LiveExecutionError(_friendly_network_error(exc, full_url)) from exc
-
-            if resp.status_code != 200:
-                safe_body = redact_secrets(resp.text[:260])
-                if "-3003" in safe_body or "Margin account does not exist" in safe_body:
-                    raise LiveExecutionError(
-                        "Binance Çapraz Marjin (Cross Margin) cüzdanınız henüz açılmamış görünüyor (-3003). "
-                        "Binance uygulamasından Cüzdanlar -> Marjin (Cross) ekranına girip kısa testi onaylayarak "
-                        "Marjin hesabını açın ve Spot cüzdanınızdan Marjin cüzdanına USDT aktarın."
-                    )
-                raise LiveExecutionError(
-                    f"Binance Canlı Marjin API hatası (HTTP {resp.status_code}): {safe_body}"
-                )
-            return resp.json()
-        finally:
-            if close_after:
-                client.close()
+            ),
+            error_cls=LiveExecutionError,
+            error_prefix="Binance Canlı Marjin API hatası",
+            ambiguous_post_paths=frozenset({"/sapi/v1/margin/order"}),
+            body_snippet_limit=260,
+            special_error_mapper=_margin_special_error,
+        )
 
     def fetch_live_margin_balances(
         self,

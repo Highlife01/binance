@@ -464,6 +464,7 @@ class CloudBotApplication:
                 take_profit_pct=prof.take_profit_pct,
                 leverage=2,
                 min_net_profit_exit_pct=prof.min_net_profit_exit_pct,
+                min_buy_notional_usdc=Decimal("10.00"),
             )
             storage.save_risk_settings(base)
             changed = True
@@ -553,6 +554,19 @@ class CloudBotApplication:
                 )
                 storage.save_risk_settings(upgraded_u)
             storage.set_state("unlimited_open_positions_v1", "1")
+            changed = True
+        if storage.get_state("min_buy_notional_v1_10usdt", "") != "1":
+            cur_m = storage.load_risk_settings(
+                RiskSettings(
+                    max_open_positions=999,
+                    max_position_size_usdc=Decimal("15.00"),
+                    daily_loss_limit_usdc=Decimal("2.00"),
+                    min_buy_notional_usdc=Decimal("10.00"),
+                )
+            )
+            if cur_m.min_buy_notional_usdc < Decimal("10.00") and cur_m.max_position_size_usdc >= Decimal("10.00"):
+                storage.save_risk_settings(dataclasses.replace(cur_m, min_buy_notional_usdc=Decimal("10.00")))
+            storage.set_state("min_buy_notional_v1_10usdt", "1")
             changed = True
         return changed
 
@@ -1351,7 +1365,11 @@ class CloudBotApplication:
         default_tf = _coerce_research_interval(payload.get("interval"), params_active["profile"].interval)
 
         question = _safe_text(payload.get("question", ""), 300) or "SOLUSDT 5m 360 mum RSI dip stratejisi test et"
-        if default_sym and default_sym not in question.upper():
+        has_explicit_pair = any(
+            tok.strip(".,:;!?()[]{}").endswith(("USDT", "USDC")) and len(tok.strip(".,:;!?()[]{}")) > 4
+            for tok in question.upper().split()
+        )
+        if default_sym and not has_explicit_pair:
             question = f"{default_sym} {question}"
         if default_tf and default_tf not in question.lower():
             question = f"{question} {default_tf}"
@@ -1492,6 +1510,7 @@ class CloudBotApplication:
                 take_profit_pct=prof_now.take_profit_pct,
                 leverage=lev_now,
                 min_net_profit_exit_pct=prof_now.min_net_profit_exit_pct,
+                min_buy_notional_usdc=getattr(cur_risk, "min_buy_notional_usdc", Decimal("10.00")),
             )
             st.save_risk_settings(updated_risk)
             notes.append("Risk ve pozisyon limitleri kaydedildi.")

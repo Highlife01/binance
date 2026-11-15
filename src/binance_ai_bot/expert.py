@@ -413,3 +413,186 @@ def pick_scan_symbols(
     start = cursor % len(rest)
     rotated = (rest + rest)[start : start + slots]
     return top + rotated, (start + slots) % len(rest)
+
+
+# ---------------------------------------------------------------------------
+# Kronos / FreqAI / Hummingbot / skfolio esinli ileri seviye nicel koruma katmanı
+# ---------------------------------------------------------------------------
+def candle_uncertainty_block(
+    candles: Sequence[Candle],
+    *,
+    window: int = 6,
+    max_wick_ratio: float = 0.80,
+) -> str | None:
+    """
+    Kronos esinli OHLCV belirsizlik (gürültü/sinyal) koruması:
+    Son `window` kapalı mumda fitil oranı aşırı yüksek (`> max_wick_ratio`) ve net yönlü
+    ilerleme çok zayıfsa (kararsız testere/whipsaw rejimi) yeni alımı durdurur.
+    """
+    closed = [c for c in candles if c.is_closed]
+    if len(closed) < window:
+        return None
+    recent = closed[-window:]
+    wick_ratios: list[float] = []
+    total_range = 0.0
+    for c in recent:
+        hi = float(c.high)
+        lo = float(c.low)
+        op = float(c.open)
+        cl = float(c.close)
+        rng = hi - lo
+        if rng <= 0.0:
+            continue
+        body = abs(cl - op)
+        wick_ratios.append(max(0.0, (rng - body) / rng))
+        total_range += rng
+    if len(wick_ratios) < max(3, window // 2) or total_range <= 0.0:
+        return None
+    avg_wick = sum(wick_ratios) / len(wick_ratios)
+    net_move = abs(float(recent[-1].close) - float(recent[0].open))
+    efficiency = net_move / total_range
+    if avg_wick >= max_wick_ratio and efficiency < 0.15:
+        return (
+            f"yüksek mum belirsizliği/testere rejimi "
+            f"(fitil %{avg_wick * 100:.0f}, yön verimliliği %{efficiency * 100:.0f})"
+        )
+    return None
+
+
+def anomaly_outlier_block(
+    candles: Sequence[Candle],
+    *,
+    lookback: int = 20,
+    max_return_z: float = 3.5,
+    max_volume_z: float = 4.5,
+) -> str | None:
+    """
+    FreqAI Dissimilarity Index (DI) esinli aykırı değer / manipülasyon mumu koruması:
+    Son kapalı mum, son `lookback` mumluk dağılıma göre aşırı z-skoru sıçraması
+    (flash pump/dump veya dev üst fitilli tükeniş mumu) gösteriyorsa tepe kovalamayı engeller.
+    """
+    closed = [c for c in candles if c.is_closed]
+    if len(closed) < lookback + 2:
+        return None
+    hist = closed[-(lookback + 1) : -1]
+    latest = closed[-1]
+    hist_rets: list[float] = []
+    hist_vols: list[float] = []
+    for c in hist:
+        op = float(c.open)
+        cl = float(c.close)
+        if op > 0.0:
+            hist_rets.append((cl - op) / op)
+        hist_vols.append(float(c.volume))
+    if len(hist_rets) < 10 or float(latest.open) <= 0.0:
+        return None
+
+    def _zscore(val: float, series: list[float]) -> float:
+        mean = sum(series) / len(series)
+        var = sum((x - mean) ** 2 for x in series) / len(series)
+        std = math.sqrt(var)
+        return (val - mean) / std if std > 1e-12 else 0.0
+
+    latest_ret = (float(latest.close) - float(latest.open)) / float(latest.open)
+    ret_z = abs(_zscore(latest_ret, hist_rets))
+    vol_z = _zscore(float(latest.volume), hist_vols)
+
+    rng = float(latest.high) - float(latest.low)
+    upper_wick_ratio = (
+        (float(latest.high) - max(float(latest.open), float(latest.close))) / rng
+        if rng > 0.0
+        else 0.0
+    )
+
+    if ret_z >= max_return_z:
+        return f"aykırı mum hareketi (getiri z={ret_z:.1f}; FreqAI DI koruması)"
+    if vol_z >= max_volume_z and upper_wick_ratio >= 0.55:
+        return (
+            f"anormal hacim + üst fitil tükenişi "
+            f"(hacim z={vol_z:.1f}, üst fitil %{upper_wick_ratio * 100:.0f})"
+        )
+    return None
+
+
+def orderbook_imbalance(order_book: Any, *, levels: int = 5) -> float | None:
+    """
+    Hummingbot esinli emir defteri ilk `levels` kademe alıcı/satıcı dengesi [-1.0, +1.0].
+    Pozitif değer alış derinliğinin, negatif değer satış duvarının ağır bastığını gösterir.
+    """
+    bids = getattr(order_book, "bids", None) or []
+    asks = getattr(order_book, "asks", None) or []
+    bid_vol = sum(float(lvl.quantity) for lvl in bids[:levels] if float(lvl.quantity) > 0)
+    ask_vol = sum(float(lvl.quantity) for lvl in asks[:levels] if float(lvl.quantity) > 0)
+    total = bid_vol + ask_vol
+    if total <= 0.0:
+        return None
+    return (bid_vol - ask_vol) / total
+
+
+def orderbook_microstructure_block(
+    order_book: Any,
+    *,
+    intended_notional: Decimal = Decimal("0"),
+    max_slippage_pct: Decimal = Decimal("0.0025"),
+    min_imbalance: float = -0.65,
+    levels: int = 5,
+) -> str | None:
+    """
+    Hummingbot / NautilusTrader esinli emir defteri derinlik ve kayma (slippage) koruması:
+    1) Ağır satış duvarı dengesizliğini (`imbalance < min_imbalance`),
+    2) Planlanan alım tutarı için tahmini VWAP kaymasını (`> max_slippage_pct`) ve sığ defteri engeller.
+    """
+    imb = orderbook_imbalance(order_book, levels=levels)
+    if imb is not None and imb < min_imbalance:
+        return f"emir defterinde yoğun satış baskısı (imbalance={imb:.2f})"
+
+    if intended_notional <= Decimal("0"):
+        return None
+    asks = getattr(order_book, "asks", None) or []
+    best_ask = getattr(order_book, "best_ask", None)
+    if not asks or best_ask is None or best_ask <= Decimal("0"):
+        return None
+
+    remaining = intended_notional
+    total_qty = Decimal("0")
+    total_cost = Decimal("0")
+    for lvl in asks[:levels]:
+        px = Decimal(str(lvl.price))
+        qty = Decimal(str(lvl.quantity))
+        if px <= 0 or qty <= 0:
+            continue
+        lvl_notional = px * qty
+        take_notional = min(remaining, lvl_notional)
+        total_qty += take_notional / px
+        total_cost += take_notional
+        remaining -= take_notional
+        if remaining <= Decimal("0"):
+            break
+
+    if remaining > Decimal("0") and total_cost < intended_notional * Decimal("0.95"):
+        return f"emir defteri sığ (ilk {levels} kademe {intended_notional:.2f} USDT alımı karşılamıyor)"
+
+    if total_qty > Decimal("0"):
+        vwap = total_cost / total_qty
+        slippage_pct = (vwap - best_ask) / best_ask
+        if slippage_pct > max_slippage_pct:
+            return f"tahmini emir defteri kayması yüksek (%{slippage_pct * Decimal('100'):.3f})"
+    return None
+
+
+def inverse_vol_capped_notional(
+    approved_notional: Decimal,
+    atr_pct: Decimal | None,
+    *,
+    target_vol_pct: Decimal = Decimal("0.015"),
+    min_scale: Decimal = Decimal("0.45"),
+) -> Decimal:
+    """
+    skfolio esinli Ters-Volatilite (Risk Parity) pozisyon ölçekleme:
+    ATR volatilitesi hedef eşiğin (`%1.5`) üzerindeyse pozisyon tutarını orantılı küçültür
+    (en fazla `min_scale` oranına kadar), asla büyütmez.
+    """
+    if approved_notional <= Decimal("0") or atr_pct is None or atr_pct <= target_vol_pct:
+        return approved_notional
+    scale = max(min_scale, target_vol_pct / atr_pct)
+    return approved_notional * min(Decimal("1"), scale)

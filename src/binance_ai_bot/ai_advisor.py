@@ -47,6 +47,10 @@ PROFESYONEL TRADER İLKELERİ:
 - Komisyon ve spread kârı yer: beklenen hareket maliyetin belirgin üstünde değilse işlem yok.
 - Açık pozisyonda kâr bölgesinde momentum zayıflıyorsa SAT ile kârı kilitle; zarardaki pozisyonu umutla tutmak yerine plana (stop) bırak.
 - Emin değilsen BEKLE.
+TRADINGAGENTS ÇOKLU ROL PROTOKOLÜ (TEK ÇAĞRIDA):
+1. Boğa vs. Ayı Tartışması: `boga_tezi` alanında yükseliş argümanını, `ayi_tezi` alanında ise en güçlü karşı/risk argümanını özetle (onay yanlılığını kır).
+2. Risk Yöneticisi Süzgeci: `risk_onayi` alanında volatilite, spread, 15dk trend ve emir defteri dengesini denetleyip ONAY, TEMKINLI veya RED ver.
+3. Portföy Yöneticisi Nihai Kararı: `risk_onayi` RED ise (açık pozisyon yoksa) `karar` mutlaka BEKLE olmalıdır.
 """
 
 
@@ -275,6 +279,9 @@ class GeminiDecisionAdvisor:
             if effective_action == "SAT" and not has_open_position:
                 effective_action = "BEKLE"
                 effective_reason = f"Açık spot pozisyon bulunmadığından SAT sinyali BEKLE olarak uygulandı ({parsed_obj.kisa_gerekce})"
+            elif effective_action == "AL" and parsed_obj.risk_onayi == "RED":
+                effective_action = "BEKLE"
+                effective_reason = f"TradingAgents Risk Yöneticisi vetosu (RED): {parsed_obj.kisa_gerekce}"
 
             stored_dict: dict[str, Any] = parsed_obj.model_dump()
             stored_dict["karar"] = effective_action

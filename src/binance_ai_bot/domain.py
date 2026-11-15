@@ -171,6 +171,20 @@ class GeminiStructuredResponse(BaseModel):
         le=100,
         description="Modelin kendi öz-beyan puanı (doğrulanmış başarı olasılığı değildir).",
     )
+    boga_tezi: str = Field(
+        default="",
+        max_length=240,
+        description="TradingAgents Boğa (Bull) analistinin kısa yükseliş tezi.",
+    )
+    ayi_tezi: str = Field(
+        default="",
+        max_length=240,
+        description="TradingAgents Ayı (Bear) analistinin kısa düşüş/risk tezi.",
+    )
+    risk_onayi: Literal["ONAY", "TEMKINLI", "RED"] = Field(
+        default="ONAY",
+        description="TradingAgents Risk Yöneticisinin son süzgeç kararı (ONAY, TEMKINLI, RED).",
+    )
 
     @field_validator("kisa_gerekce")
     @classmethod
@@ -206,6 +220,7 @@ class RiskSettings:
 
     max_open_positions: int = 1
     max_position_size_usdc: Decimal = Decimal("10.00")
+    min_buy_notional_usdc: Decimal = Decimal("0")
     daily_loss_limit_usdc: Decimal = Decimal("2.00")
     max_daily_new_positions: int = 3
     daily_limit_exit_policy: str = "HOLD_EXISTING"  # HOLD_EXISTING | AUTO_CLOSE
@@ -299,7 +314,6 @@ def is_effective_dust_position(
             and mark_price is not None
             and mark_price > Decimal("0")
             and (q_pos * mark_price) < filters.min_notional
-            and pos.cost_basis_usdc < filters.min_notional
         ):
             return True
     return False

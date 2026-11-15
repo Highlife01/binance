@@ -7,11 +7,15 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
-from binance_ai_bot.domain import Candle, Position
+from binance_ai_bot.domain import Candle, OrderBookLevel, OrderBookSnapshot, Position
 from binance_ai_bot.expert import (
+    anomaly_outlier_block,
+    candle_uncertainty_block,
     coin_knife_block,
     dynamic_exits,
+    inverse_vol_capped_notional,
     loss_streak_cooldown,
+    orderbook_microstructure_block,
     pick_scan_symbols,
     post_exit_reentry_block,
     rank_top_gainers,
@@ -375,3 +379,131 @@ def test_engine_blocks_rebuy_after_profit_even_without_expert_mode(tmp_path: Pat
     assert step.executed_order is None
     assert "karlı satış sonrası bekletme" in step.block_or_info_message
     assert all(p.symbol != "BTCUSDT" for p in eng.storage.get_open_positions(track="MAIN"))
+
+
+def _mk_candle(i: int, op: str, hi: str, lo: str, cl: str, vol: str = "100") -> Candle:
+    return Candle(
+        open_time_ms=i * 60_000,
+        open=Decimal(op),
+        high=Decimal(hi),
+        low=Decimal(lo),
+        close=Decimal(cl),
+        volume=Decimal(vol),
+        close_time_ms=(i + 1) * 60_000 - 1,
+        quote_volume=Decimal(vol) * Decimal(cl),
+        trade_count=10,
+        is_closed=True,
+    )
+
+
+def test_kronos_candle_uncertainty_and_freqai_outlier_guards():
+    # 6 yüksek fitilli testere mumu (yön verimliliği düşük) -> Kronos belirsizlik filtresi engeller
+    chop = [
+        _mk_candle(i, "100", "105", "95", "100.2" if i % 2 == 0 else "99.9")
+        for i in range(6)
+    ]
+    assert "belirsizliği" in (candle_uncertainty_block(chop) or "")
+
+    # Temiz yükseliş mumları -> engel yok
+    clean = [_mk_candle(i, str(100 + i), str(101.2 + i), str(99.8 + i), str(101 + i)) for i in range(6)]
+    assert candle_uncertainty_block(clean) is None
+
+    # 21 normal mum + 1 aşırı z-skorlu sıçrama mumu -> FreqAI DI koruması engeller
+    normal = [_mk_candle(i, "100", "100.6", "99.7", "100.2" if i % 2 == 0 else "99.9", "100") for i in range(21)]
+    spike = _mk_candle(21, "100", "112", "99.9", "110", "1200")
+    assert "aykırı mum" in (anomaly_outlier_block(normal + [spike]) or "")
+    assert anomaly_outlier_block(normal + [_mk_candle(21, "100", "100.5", "99.8", "100.1", "105")]) is None
+
+
+def test_hummingbot_orderbook_microstructure_and_skfolio_inverse_vol():
+    # Yoğun satış duvarı -> engeller
+    sell_heavy = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(Decimal("100"), Decimal("1"))],
+        asks=[OrderBookLevel(Decimal("100.05"), Decimal("20"))],
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url="test",
+    )
+    assert "satış baskısı" in (orderbook_microstructure_block(sell_heavy) or "")
+
+    # Yüksek kaymalı (VWAP slippage) sığ defter -> engeller
+    slip_book = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(Decimal("99.9"), Decimal("10"))],
+        asks=[
+            OrderBookLevel(Decimal("100.0"), Decimal("0.1")),   # 10 USDT
+            OrderBookLevel(Decimal("101.0"), Decimal("10")),    # 1010 USDT (%1 yukarı)
+        ],
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url="test",
+    )
+    assert "kayması yüksek" in (
+        orderbook_microstructure_block(slip_book, intended_notional=Decimal("100")) or ""
+    )
+
+    # Sağlıklı derinlik -> izin verir
+    healthy_book = OrderBookSnapshot(
+        symbol="BTCUSDT",
+        bids=[OrderBookLevel(Decimal("99.95"), Decimal("50"))],
+        asks=[OrderBookLevel(Decimal("100.00"), Decimal("50"))],
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url="test",
+    )
+    assert orderbook_microstructure_block(healthy_book, intended_notional=Decimal("100")) is None
+
+    # skfolio Ters-Volatilite ölçekleme: yüksek ATR (%3) tutarı yarıya indirir; düşük ATR (%1) büyütmez
+    assert inverse_vol_capped_notional(Decimal("100"), Decimal("0.03")) == Decimal("50")
+    assert inverse_vol_capped_notional(Decimal("100"), Decimal("0.01")) == Decimal("100")
+
+
+def test_tradingagents_risk_manager_red_vetoes_buy_decision(tmp_path: Path):
+    import json
+    from binance_ai_bot.ai_advisor import GeminiDecisionAdvisor
+    from binance_ai_bot.config import AppConfig
+    from binance_ai_bot.domain import TechnicalSignal
+
+    app, _, market_client = _make_app(tmp_path)
+    eng = app._get_engine()
+    bundle = market_client.fetch_verified_market_bundle("BTCUSDT", interval="1m")
+    tech = TechnicalSignal(
+        symbol="BTCUSDT",
+        interval="1m",
+        candle_open_time_ms=bundle.closed_candles[-1].open_time_ms,
+        candle_close_time_ms=bundle.closed_candles[-1].close_time_ms,
+        action="AL",
+        reason="EMA + RSI al sinyali",
+        close_price=Decimal("70000"),
+        ema_fast=Decimal("69900"),
+        ema_slow=Decimal("69500"),
+        rsi_14=Decimal("58"),
+        macd_line=Decimal("20"),
+        macd_signal=Decimal("8"),
+        macd_hist=Decimal("12"),
+        volume_ratio=Decimal("1.5"),
+        atr_14=Decimal("500"),
+    )
+
+    def fake_gemini(_prompt: str, _model: str, _timeout: int):
+        payload = {
+            "karar": "AL",
+            "kisa_gerekce": "Kısa vadeli momentum yukarı yönlü.",
+            "veri_zamani": "2026-11-14T12:00:00Z",
+            "risk_notlari": ["Yüksek direnç yakın"],
+            "model_oz_beyan_endeksi": 72,
+            "boga_tezi": "EMA ve hacim yukarı kırılımı destekliyor.",
+            "ayi_tezi": "Üst dirençte satış duvarı mevcut.",
+            "risk_onayi": "RED",
+        }
+        return json.dumps(payload), 100, 50
+
+    cfg = dataclasses.replace(eng.config, gemini_api_key="AIza" + "x" * 35)
+    advisor = GeminiDecisionAdvisor(cfg, eng.storage, raw_generate_fn=fake_gemini)
+    decision = advisor.evaluate(
+        market=bundle,
+        tech_signal=tech,
+        recent_returns_pct=[0.1, 0.2],
+        has_open_position=False,
+        ai_enabled_by_user=True,
+    )
+    assert decision.action == "BEKLE"
+    assert "Risk Yöneticisi vetosu" in decision.reason

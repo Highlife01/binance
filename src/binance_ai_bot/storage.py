@@ -378,6 +378,7 @@ class SQLiteStorage:
             "leverage": int(settings.leverage),
             "hourly_margin_interest_rate": str(settings.hourly_margin_interest_rate),
             "min_net_profit_exit_pct": str(getattr(settings, "min_net_profit_exit_pct", Decimal("0"))),
+            "min_buy_notional_usdc": str(getattr(settings, "min_buy_notional_usdc", Decimal("0"))),
         }
         self.set_state("risk_settings_json", json.dumps(payload, ensure_ascii=False))
 
@@ -427,6 +428,14 @@ class SQLiteStorage:
                         data.get(
                             "min_net_profit_exit_pct",
                             getattr(fallback, "min_net_profit_exit_pct", Decimal("0")),
+                        )
+                    )
+                ),
+                min_buy_notional_usdc=Decimal(
+                    str(
+                        data.get(
+                            "min_buy_notional_usdc",
+                            getattr(fallback, "min_buy_notional_usdc", Decimal("0")),
                         )
                     )
                 ),

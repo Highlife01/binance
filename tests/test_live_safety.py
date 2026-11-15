@@ -1,5 +1,6 @@
 """Live execution regressions using only an in-memory HTTP transport and temp DBs."""
 
+import time
 from datetime import datetime, timezone
 from decimal import Decimal as D
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from binance_ai_bot.config import AppConfig
 from binance_ai_bot.domain import Position, RiskSettings
 from binance_ai_bot.live_executor import BinanceLiveSpotExecutor, LiveExecutionError
+from binance_ai_bot.margin_executor import BinanceLiveMarginExecutor
 from binance_ai_bot.market_data import parse_symbol_filters
 from binance_ai_bot.risk import compute_open_position_unrealized_net_pnl
 from binance_ai_bot.storage import SQLiteStorage
@@ -443,3 +445,268 @@ def test_definitive_api_rejection_does_not_create_inventory_or_retry(tmp_path):
     assert storage.get_live_intent("BUY-1")["status"] == "REJECTED"
     assert storage.get_open_positions(track="LIVE_SPOT") == []
     assert exchange.order_queries == 0 and len(exchange.posts) == 1
+
+
+def test_margin_executor_sets_api_code_and_ambiguous_on_uncertain_order_failure(tmp_path):
+    storage = SQLiteStorage(tmp_path / "margin_ambiguous.db")
+    cfg = AppConfig(
+        enable_live_trading=True,
+        binance_api_key="k" * 24,
+        binance_api_secret="s" * 24,
+        binance_live_base_url="https://api.binance.com",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v3/time":
+            return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
+        if req.url.path == "/sapi/v1/margin/order" and req.method == "POST":
+            return httpx.Response(503, json={"code": -1001, "msg": "Disconnected"})
+        return httpx.Response(404, json={"msg": "unexpected"})
+
+    executor = BinanceLiveMarginExecutor(
+        cfg, storage, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    with pytest.raises(LiveExecutionError) as exc_info:
+        executor._request_signed(
+            "POST",
+            "/sapi/v1/margin/order",
+            {"symbol": "BTCUSDT", "side": "BUY"},
+            ui_live_confirmed=True,
+            ui_margin_confirmed=True,
+        )
+    assert exc_info.value.api_code == -1001
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.ambiguous is True
+
+
+def test_signed_request_tracks_weight_and_enforces_429_cooldown(tmp_path):
+    storage = SQLiteStorage(tmp_path / "rate_limit.db")
+    cfg = AppConfig(
+        enable_live_trading=True,
+        binance_api_key="k" * 24,
+        binance_api_secret="s" * 24,
+        binance_live_base_url="https://api.binance.com",
+    )
+    calls = {"account": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v3/time":
+            return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
+        if req.url.path == "/api/v3/account":
+            calls["account"] += 1
+            if calls["account"] == 1:
+                return httpx.Response(
+                    200,
+                    headers={"X-MBX-USED-WEIGHT-1M": "420"},
+                    json={"balances": []},
+                )
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "12", "X-MBX-USED-WEIGHT-1M": "1200"},
+                json={"code": -1003, "msg": "Too many requests"},
+            )
+        return httpx.Response(404, json={"msg": "unexpected"})
+
+    executor = BinanceLiveSpotExecutor(
+        cfg, storage, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    executor._request_signed("GET", "/api/v3/account", {}, ui_live_confirmed=True)
+    assert executor._transport_state.last_used_weight_1m == 420
+
+    with pytest.raises(LiveExecutionError) as err1:
+        executor._request_signed("GET", "/api/v3/account", {}, ui_live_confirmed=True)
+    assert err1.value.status_code == 429
+    assert err1.value.api_code == -1003
+    assert err1.value.retryable is True
+    assert executor._transport_state.last_used_weight_1m == 1200
+
+    # Cooldown aktifken yeni istek ağa gitmeden reddedilmeli
+    with pytest.raises(LiveExecutionError, match="hız sınırı koruması aktif"):
+        executor._request_signed("GET", "/api/v3/account", {}, ui_live_confirmed=True)
+    assert calls["account"] == 2
+
+
+def test_signed_get_caches_clock_and_resyncs_once_on_1021(tmp_path):
+    storage = SQLiteStorage(tmp_path / "clock_resync.db")
+    cfg = AppConfig(
+        enable_live_trading=True,
+        binance_api_key="k" * 24,
+        binance_api_secret="s" * 24,
+        binance_live_base_url="https://api.binance.com",
+    )
+    calls = {"time": 0, "account": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v3/time":
+            calls["time"] += 1
+            return httpx.Response(200, json={"serverTime": int(time.time() * 1000)})
+        if req.url.path == "/api/v3/account":
+            calls["account"] += 1
+            if calls["account"] == 2:
+                return httpx.Response(400, json={"code": -1021, "msg": "Timestamp outside recvWindow"})
+            return httpx.Response(200, json={"balances": []})
+        return httpx.Response(404, json={"msg": "unexpected"})
+
+    executor = BinanceLiveSpotExecutor(
+        cfg, storage, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    executor._request_signed("GET", "/api/v3/account", {}, ui_live_confirmed=True)
+    assert calls["time"] == 1
+    # 2. çağrı TTL içinde /api/v3/time'a gitmemeli, ama -1021 alınca saati yenileyip tekrar denemeli
+    executor._request_signed("GET", "/api/v3/account", {}, ui_live_confirmed=True)
+    assert calls["time"] == 2
+    assert calls["account"] == 3
+
+
+def test_protective_exit_signal_retries_after_rejected_intent_in_same_candle(tmp_path):
+    from binance_ai_bot.engine import TradingSystemEngine
+    from tests.test_cloud_api import FakeMarketClient
+
+    storage = SQLiteStorage(tmp_path / "retry_exit.db")
+    cfg = AppConfig(
+        enable_live_trading=True,
+        binance_api_key="k" * 24,
+        binance_api_secret="s" * 24,
+        binance_live_base_url="https://api.binance.com",
+    )
+    market = FakeMarketClient()
+    bundle = market.fetch_verified_market_bundle("BTCUSDT", interval="1m")
+    market.fetch_verified_market_bundle = lambda *a, **kw: bundle  # type: ignore[method-assign]
+    eng = TradingSystemEngine(config=cfg, storage=storage, market_client=market)
+    candle_ts = bundle.closed_candles[-1].open_time_ms
+    best_bid = bundle.order_book.best_bid or D("70000")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pos = Position(
+        position_id="LIVE-POS-2d4c6ce057edee429631",
+        symbol="BTCUSDT",
+        quantity=D("0.5"),
+        entry_price=best_bid - D("5"),
+        cost_basis_usdc=D("0.5") * (best_bid - D("5")),
+        entry_fee_usdc=D("0.05"),
+        opened_at_iso=now_iso,
+        signal_key="BUY-1",
+        strategy_source="TEST",
+        stop_loss_price=best_bid + D("1"),  # entry üstü trailing kâr kilidi -> TRAILING_KAR tetiklenir
+        take_profit_price=best_bid + D("50"),
+        status="OPEN",
+        leverage=1,
+        borrowed_usdc=D("0"),
+    )
+    storage.insert_position(pos, track="LIVE_SPOT")
+    # Aynı mumda daha önce başarısız (REJECTED) olmuş bir TRAILING_KAR intent'i var
+    rejected_key = f"TRAILING_KAR:{pos.position_id}:{candle_ts}"
+    storage.save_live_intent(
+        rejected_key,
+        {
+            "signal_key": rejected_key,
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "client_order_id": "cid-old",
+            "status": "REJECTED",
+            "order_params": {},
+        },
+    )
+
+    seen_keys: list[str] = []
+
+    def fake_sell(*, position, filters, signal_key, strategy_source, close_reason, ui_live_confirmed, estimated_bid=None, stop_requested=None):
+        seen_keys.append(signal_key)
+        raise LiveExecutionError("test stop")
+
+    eng.live_executor.reconcile_pending_orders = lambda **kw: None  # type: ignore[method-assign]
+    eng.live_executor.fetch_live_spot_balances = lambda **kw: {"USDT": D("100"), "BTC": D("0.5")}  # type: ignore[method-assign]
+    eng.live_executor.execute_live_market_sell = fake_sell  # type: ignore[method-assign]
+    settings = RiskSettings(stop_loss_pct=D("0.01"), take_profit_pct=D("0.02"), leverage=1, expert_mode=False)
+    step = eng.run_analysis_step(
+        symbol="BTCUSDT",
+        interval="1m",
+        settings=settings,
+        ai_enabled_by_user=False,
+        execution_mode="LIVE_SPOT",
+        ui_live_confirmed=True,
+    )
+    assert seen_keys == [f"{rejected_key}:r1"], (step.block_or_info_message, step.error_message)
+
+
+def test_live_spot_sell_blocks_sub_min_notional_before_binance_order(tmp_path):
+    executor, storage, exchange = setup(tmp_path)
+    buy(executor)
+    pos = storage.get_open_positions(track="LIVE_SPOT")[0]
+    with pytest.raises(LiveExecutionError, match="minimum emir alt sınırının"):
+        executor.execute_live_market_sell(
+            position=pos,
+            filters=filters(),
+            signal_key="SELL-LOW-NOTIONAL",
+            strategy_source="TEST",
+            close_reason="ZARAR_KES",
+            ui_live_confirmed=True,
+            estimated_bid=D("0.40"),  # 10 TEST * 0.40 = 4.00 USDT < min_notional(5)
+        )
+    # Borsa emri gönderilmemiş olmalı (sadece BUY post'u var)
+    assert len(exchange.posts) == 1
+    assert storage.get_live_intent("SELL-LOW-NOTIONAL") is None
+
+
+def test_min_buy_notional_10_usd_blocks_smaller_buys(tmp_path):
+    from binance_ai_bot.domain import OrderBookLevel, OrderBookSnapshot
+    from binance_ai_bot.risk import RiskManager
+
+    storage = SQLiteStorage(tmp_path / "min_buy_10.db")
+    storage.set_cash_balance(D("8.50"), track="MAIN")
+    rm = RiskManager(storage)
+    book = OrderBookSnapshot(
+        symbol="TESTUSDT",
+        bids=[OrderBookLevel(D("1.00"), D("100"))],
+        asks=[OrderBookLevel(D("1.00"), D("100"))],
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url="test",
+    )
+    settings = RiskSettings(max_position_size_usdc=D("15.00"), min_buy_notional_usdc=D("10.00"))
+    chk = rm.check_buy_entry(
+        filters=filters(),
+        order_book=book,
+        settings=settings,
+        now_utc=datetime.now(timezone.utc),
+        track="MAIN",
+    )
+    assert chk.allowed is False
+    assert "10.00" in chk.reason
+
+
+def test_sub_min_notional_devalued_position_is_recycled_on_new_buy(tmp_path):
+    from binance_ai_bot.domain import is_effective_dust_position
+
+    executor, storage, exchange = setup(tmp_path)
+    # Başlangıçta 5.20 USDT maliyetle açılmış ama fiyatı düşünce 4.49 USDT (<5.00) kalmış pozisyon
+    dust_pos = Position(
+        position_id="ZEC-DUST-1",
+        symbol="TESTUSDT",
+        quantity=D("4.5"),
+        entry_price=D("1.155"),
+        cost_basis_usdc=D("5.20"),
+        entry_fee_usdc=D("0.005"),
+        opened_at_iso=datetime.now(timezone.utc).isoformat(),
+        signal_key="BUY-OLD",
+        strategy_source="TEST",
+        stop_loss_price=D("0.90"),
+        take_profit_price=D("1.40"),
+        status="OPEN",
+    )
+    storage.insert_position(dust_pos, track="LIVE_SPOT")
+    assert is_effective_dust_position(dust_pos, filters(), mark_price=D("0.99")) is True
+
+    # Üstüne 10 USDT yeni alım yapıldığında eski pozisyonla birleşip (recycle_dust) satılabilir hale gelmeli
+    res = executor.execute_live_market_buy(
+        filters=filters(),
+        approved_qty=D("10"),
+        approved_notional=D("10"),
+        signal_key="BUY-TOPUP-1",
+        strategy_source="TEST",
+        settings=RiskSettings(leverage=1, min_buy_notional_usdc=D("10")),
+        ui_live_confirmed=True,
+    )
+    assert res.status == "FILLED"
+    open_pos = storage.get_open_positions(track="LIVE_SPOT")
+    assert len(open_pos) == 1
+    assert open_pos[0].position_id == "ZEC-DUST-1"
+    assert open_pos[0].quantity > D("4.5")

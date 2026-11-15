@@ -19,7 +19,7 @@ from .domain import (
     RiskCheckResult,
     RiskSettings,
     SymbolFilters,
-    is_substep_dust_position,
+    is_effective_dust_position,
     quantize_down,
 )
 from .security import STABLECOIN_OR_FIAT_ASSETS
@@ -261,7 +261,11 @@ class RiskManager:
         active_open_positions = [
             pos
             for pos in open_positions
-            if not is_substep_dust_position(pos, filters if pos.symbol == filters.symbol else None)
+            if not is_effective_dust_position(
+                pos,
+                filters if pos.symbol == filters.symbol else None,
+                mark_price=best_ask if pos.symbol == filters.symbol else None,
+            )
         ]
         for pos in active_open_positions:
             if pos.symbol == filters.symbol:
@@ -315,25 +319,27 @@ class RiskManager:
         max_notional_limit = settings.max_position_size_usdc * Decimal(lev)
         target_gross_usdc = min(max_notional_limit, max_affordable_gross)
 
-        # Binance minimum notional ile çelişki kontrolü (teminat sınırını ASLA otomatik büyütme!)
-        if filters.min_notional > max_notional_limit:
+        min_buy_floor = max(filters.min_notional, getattr(settings, "min_buy_notional_usdc", Decimal("10.00")))
+
+        # Binance minimum notional ve kullanıcı alt sınırı kontrolü (teminat sınırını ASLA otomatik büyütme!)
+        if min_buy_floor > max_notional_limit:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
-                    f"{filters.symbol} minimum emir tutarı ({filters.min_notional:.2f} {filters.quote_asset}), "
+                    f"{filters.symbol} minimum alım tutarı ({min_buy_floor:.2f} {filters.quote_asset}), "
                     f"belirlenen pozisyon üst sınırını ({max_notional_limit:.2f} {filters.quote_asset}) aşıyor. "
                     "Risk sınırı otomatik büyütülmedi; işlem açılmadı."
                 ),
                 daily_total_loss_usdc=daily_loss,
             )
 
-        if filters.min_notional > max_affordable_gross:
+        if min_buy_floor > max_affordable_gross:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
                     f"Kullanılabilir teminat/bakiye ({cash_usdc:.2f} {filters.quote_asset}, komisyon sonrası en çok "
-                    f"{max_affordable_gross:.2f} {filters.quote_asset} işlem gücü), {filters.symbol} minimum emir tutarını "
-                    f"({filters.min_notional:.2f} {filters.quote_asset}) karşılamıyor."
+                    f"{max_affordable_gross:.2f} {filters.quote_asset} işlem gücü), {filters.symbol} minimum alım tutarını "
+                    f"({min_buy_floor:.2f} {filters.quote_asset}) karşılamıyor."
                 ),
                 daily_total_loss_usdc=daily_loss,
             )
@@ -382,12 +388,12 @@ class RiskManager:
             qty = quantize_down(eff_max_qty, eff_step)
 
         actual_notional = qty * best_ask if order_type == "MARKET" else qty * ref_price
-        if actual_notional < filters.min_notional:
+        if actual_notional < min_buy_floor:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
-                    f"Miktar adımı yuvarlaması sonrası emir tutarı ({actual_notional:.2f} USDC), "
-                    f"Binance minimum emir tutarının ({filters.min_notional:.2f} USDC) altına düştü. "
+                    f"Miktar adımı yuvarlaması sonrası emir tutarı ({actual_notional:.2f} {filters.quote_asset}), "
+                    f"minimum alım alt sınırının ({min_buy_floor:.2f} {filters.quote_asset}) altına düştü. "
                     "Pozisyon sınırı aşılmaması için işlem açılmadı."
                 ),
                 daily_total_loss_usdc=daily_loss,

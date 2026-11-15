@@ -28,13 +28,18 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .binance_http import (
+    BinanceTransportState,
+    execute_signed_binance_request,
+    sign_hmac_sha256,
+)
 from .config import AppConfig
 from .domain import (
     Position,
     RiskSettings,
     SimulatedOrderResult,
     SymbolFilters,
-    is_substep_dust_position,
+    is_effective_dust_position,
     quantize_down,
 )
 from .market_data import _friendly_network_error
@@ -45,10 +50,20 @@ from .storage import SQLiteStorage
 class LiveExecutionError(RuntimeError):
     """Canlı Spot bağlantı, yetki veya emir doğrulama hatası."""
 
-    def __init__(self, message: str, *, api_code: int | None = None, ambiguous: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        api_code: int | None = None,
+        ambiguous: bool = False,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.api_code = api_code
         self.ambiguous = ambiguous
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 def _format_decimal_clean(val: Decimal) -> str:
@@ -70,15 +85,10 @@ class BinanceLiveSpotExecutor:
         self.config = config
         self.storage = storage
         self._external_client = http_client
+        self._transport_state = BinanceTransportState()
 
     def _sign_params(self, params: dict[str, Any]) -> str:
-        query_str = urlencode(params)
-        signature = hmac.new(
-            self.config.binance_api_secret.encode("utf-8"),
-            query_str.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return f"{query_str}&signature={signature}"
+        return sign_hmac_sha256(self.config.binance_api_secret, params)
 
     def _request_signed(
         self,
@@ -93,80 +103,28 @@ class BinanceLiveSpotExecutor:
                 "Canlı Spot işlem için .env dosyasında BINANCE_API_KEY ve BINANCE_API_SECRET tanımlı olmalıdır."
             )
 
-        base_url = self.config.binance_live_base_url
-        full_url = f"{base_url}{path}"
-        assert_live_spot_request(
-            method,
-            full_url,
-            config_live_enabled=self.config.enable_live_trading,
-            ui_live_confirmed=ui_live_confirmed,
-        )
-
-        client = self._external_client or httpx.Client(timeout=10.0)
-        close_after = self._external_client is None
-        try:
-            # Önce sunucu saatini alarak yerel saat kaymasından (-1021 Timestamp) koru
-            time_url = f"{base_url}/api/v3/time"
-            assert_live_spot_request(
-                "GET",
-                time_url,
+        return execute_signed_binance_request(
+            state=self._transport_state,
+            base_url=self.config.binance_live_base_url,
+            method=method,
+            path=path,
+            api_key=self.config.binance_api_key,
+            api_secret=self.config.binance_api_secret,
+            recv_window_ms=self.config.binance_recv_window_ms,
+            timeout_sec=10.0,
+            params=params,
+            external_client=self._external_client,
+            security_assert_fn=lambda m, u: assert_live_spot_request(
+                m,
+                u,
                 config_live_enabled=self.config.enable_live_trading,
                 ui_live_confirmed=ui_live_confirmed,
-            )
-            try:
-                t_resp = client.get(time_url)
-                server_time_ms = int(t_resp.json()["serverTime"])
-            except Exception as exc:
-                raise LiveExecutionError(_friendly_network_error(exc, time_url)) from exc
-
-            local_ms = int(time.time() * 1000)
-            drift_ms = abs(server_time_ms - local_ms)
-            if drift_ms > 30_000:
-                raise LiveExecutionError(
-                    f"Windows sistem saatiniz Binance sunucusundan {drift_ms // 1000} sn sapmış durumda. "
-                    "Lütfen Windows Tarih ve Saat ayarlarından 'Şimdi eşitle' yapın."
-                )
-
-            payload = dict(params or {})
-            payload["recvWindow"] = self.config.binance_recv_window_ms
-            payload["timestamp"] = server_time_ms
-            signed_query = self._sign_params(payload)
-            headers = {"X-MBX-APIKEY": self.config.binance_api_key}
-
-            req_url = f"{full_url}?{signed_query}"
-            try:
-                resp = client.request(method.upper(), req_url, headers=headers)
-            except Exception as exc:
-                raise LiveExecutionError(
-                    _friendly_network_error(exc, full_url),
-                    ambiguous=method.upper() == "POST" and path == "/api/v3/order",
-                ) from exc
-
-            if resp.status_code != 200:
-                safe_body = redact_secrets(resp.text[:240])
-                try:
-                    api_code = int(resp.json().get("code", 0))
-                except (ValueError, TypeError, AttributeError):
-                    api_code = None
-                raise LiveExecutionError(
-                    f"Binance Canlı Spot API hatası (HTTP {resp.status_code}): {safe_body}",
-                    api_code=api_code,
-                    ambiguous=(
-                        resp.status_code >= 500 or resp.status_code == 408
-                        or api_code in {-1000, -1001, -1006, -1007}
-                        or (api_code == -2010 and "duplicate" in resp.text.lower())
-                    ),
-                )
-            try:
-                return resp.json()
-            except ValueError as exc:
-                raise LiveExecutionError(
-                    "Binance yanıtı çözümlenemedi; emir sonucu doğrulanmalıdır.",
-                    ambiguous=method.upper() == "POST" and path == "/api/v3/order",
-                ) from exc
-        finally:
-            if close_after:
-                client.close()
+            ),
+            error_cls=LiveExecutionError,
+            error_prefix="Binance Canlı Spot API hatası",
+            ambiguous_post_paths=frozenset({"/api/v3/order"}),
+            body_snippet_limit=240,
+        )
 
     def fetch_live_spot_balances(
         self, *, ui_live_confirmed: bool, quote_asset: str = "USDC"
@@ -537,14 +495,28 @@ class BinanceLiveSpotExecutor:
                 raise LiveExecutionError("Sonucu doğrulanmamış canlı emir var; yeni alımlar durduruldu.")
             if self.storage.get_state("live_unvalued_commissions", "{}") not in {"", "{}", None}:
                 raise LiveExecutionError("Üçüncü varlık komisyonları değerlenmeden yeni canlı alım yapılamaz.")
+            est_price = (
+                (approved_notional / approved_qty)
+                if (approved_notional is not None and approved_notional > 0 and approved_qty > 0)
+                else None
+            )
             opened = self.storage.get_open_positions(track="LIVE_SPOT")
             active_opened = [
                 p
                 for p in opened
-                if not is_substep_dust_position(p, filters if p.symbol == filters.symbol else None)
+                if not is_effective_dust_position(
+                    p,
+                    filters if p.symbol == filters.symbol else None,
+                    mark_price=est_price if p.symbol == filters.symbol else None,
+                )
             ]
             dust_same_sym = next(
-                (p for p in opened if p.symbol == filters.symbol and is_substep_dust_position(p, filters)),
+                (
+                    p
+                    for p in opened
+                    if p.symbol == filters.symbol
+                    and is_effective_dust_position(p, filters, mark_price=est_price)
+                ),
                 None,
             )
             if any(p.symbol == filters.symbol for p in active_opened) or len(active_opened) >= settings.max_open_positions:
@@ -575,8 +547,14 @@ class BinanceLiveSpotExecutor:
                     min(approved_notional, settings.max_position_size_usdc,
                         free_quote / (1 + settings.estimated_fee_rate)), Decimal("0.00000001"),
                 )
-                if budget < filters.min_notional:
-                    raise LiveExecutionError("Güncel bakiye ve komisyon payıyla minimum emir tutarı karşılanamıyor.")
+                min_buy_floor = max(
+                    filters.min_notional,
+                    getattr(settings, "min_buy_notional_usdc", Decimal("0")),
+                )
+                if budget < min_buy_floor:
+                    raise LiveExecutionError(
+                        f"Güncel bakiye ve komisyon payıyla minimum emir tutarı ({min_buy_floor:.2f} {filters.quote_asset}) karşılanamıyor."
+                    )
                 intent["quote_budget"] = str(budget)
                 del intent["order_params"]["quantity"]
                 intent["order_params"]["quoteOrderQty"] = _format_decimal_clean(budget)
@@ -585,6 +563,7 @@ class BinanceLiveSpotExecutor:
     def execute_live_market_sell(
         self, *, position: Position, filters: SymbolFilters, signal_key: str,
         strategy_source: str, close_reason: str, ui_live_confirmed: bool,
+        estimated_bid: Decimal | None = None,
         stop_requested: Callable[[], bool] | None = None,
     ) -> SimulatedOrderResult:
         """Sell only currently tracked inventory, retaining every unfilled residual."""
@@ -603,6 +582,14 @@ class BinanceLiveSpotExecutor:
             qty = quantize_down(min(current.quantity, balances.get(filters.base_asset, Decimal(0))), filters.market_step_size)
             if qty <= 0 or qty < max(filters.min_qty, filters.market_min_qty):
                 raise LiveExecutionError(f"Satılabilir {filters.base_asset} minimumun altında; kalan miktar açık kayıtta korunuyor.")
+            if estimated_bid is not None and estimated_bid > Decimal(0):
+                est_notional = qty * estimated_bid
+                if est_notional < filters.min_notional:
+                    raise LiveExecutionError(
+                        f"Satılabilir {qty} {filters.base_asset} tutarı (~{est_notional:.2f} {filters.quote_asset}) "
+                        f"borsa minimum emir alt sınırının ({filters.min_notional:.2f} {filters.quote_asset}) altında; "
+                        "kalan miktar açık kayıtta korunuyor."
+                    )
             intent = self._new_intent(
                 filters=filters, quantity=qty, signal_key=signal_key, side="SELL",
                 strategy_source=strategy_source, position_id=current.position_id, close_reason=close_reason,

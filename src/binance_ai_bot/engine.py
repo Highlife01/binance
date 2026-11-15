@@ -35,10 +35,15 @@ from .domain import (
 )
 from .quant_desk import QuantBundleAssessment, SelfRetrainingSignalModel, evaluate_quant_bundle
 from .expert import (
+    anomaly_outlier_block,
     atr_pct_of_price,
+    candle_uncertainty_block,
     coin_knife_block,
     dynamic_exits,
+    inverse_vol_capped_notional,
     loss_streak_cooldown,
+    orderbook_imbalance,
+    orderbook_microstructure_block,
     post_exit_reentry_block,
     regime_block,
     risk_capped_notional,
@@ -534,6 +539,7 @@ class TradingSystemEngine:
                         strategy_source="RISK_KORUMA",
                         close_reason=close_reason,
                         ui_live_confirmed=ui_live_confirmed,
+                        estimated_bid=best_bid,
                         stop_requested=stop_requested,
                     )
                     self._resolve_live_unvalued_commissions(quote_ccy, settings)
@@ -663,7 +669,16 @@ class TradingSystemEngine:
                     if liq_hit
                     else ("TRAILING_KAR" if locked_trailing else ("ZARAR_KES" if stop_hit else "KAR_AL"))
                 )
-                exit_sig = f"{exit_tag}:{pos.position_id}:{tech_signal.candle_open_time_ms}"
+                base_exit_sig = f"{exit_tag}:{pos.position_id}:{tech_signal.candle_open_time_ms}"
+                exit_sig = base_exit_sig
+                if is_live_spot:
+                    retry_idx = 0
+                    while True:
+                        prev_intent = self.storage.get_live_intent(exit_sig)
+                        if prev_intent is None or prev_intent.get("status") not in {"REJECTED", "APPLIED"}:
+                            break
+                        retry_idx += 1
+                        exit_sig = f"{base_exit_sig}:r{retry_idx}"
                 closed_ord, exit_err = _run_protective_sell(pos, exit_sig, exit_tag)
                 if exit_err is not None:
                     return StepCycleSummary(
@@ -704,7 +719,7 @@ class TradingSystemEngine:
         )
         ai_context_notes: list[str] | None = None
         if getattr(settings, "expert_mode", False) and ai_enabled_by_user and not skip_ai_prefilter:
-            ai_context_notes = self._expert_context_notes(market.symbol) or None
+            ai_context_notes = self._expert_context_notes(market.symbol, market.order_book) or None
         ai_decision = self.ai_advisor.evaluate(
             market=market,
             tech_signal=tech_signal,
@@ -784,7 +799,7 @@ class TradingSystemEngine:
                     )
                     info_msg = block_reason
                 elif getattr(settings, "expert_mode", False) and (
-                    expert_why := self._expert_entry_block(market.symbol, active_track, now_utc)
+                    expert_why := self._expert_entry_block(market.symbol, active_track, now_utc, market=market)
                 ):
                     block_reason = f"Uzman filtre: {expert_why}; alım atlandı."
                     info_msg = block_reason
@@ -815,6 +830,13 @@ class TradingSystemEngine:
                     if not risk_chk.allowed:
                         block_reason = risk_chk.reason
                         info_msg = f"AL sinyali risk denetiminde durduruldu: {risk_chk.reason}"
+                    elif getattr(settings, "expert_mode", False) and (
+                        ob_why := orderbook_microstructure_block(
+                            market.order_book, intended_notional=risk_chk.approved_notional_usdc
+                        )
+                    ):
+                        block_reason = f"Emir defteri filtresi: {ob_why}; alım atlandı."
+                        info_msg = block_reason
                     else:
                         buy_settings = settings
                         buy_qty = risk_chk.approved_quantity
@@ -1116,11 +1138,25 @@ class TradingSystemEngine:
         self._candle_cache[key] = (now_mono, candles)
         return candles
 
-    def _expert_entry_block(self, symbol: str, track: str, now_utc: datetime) -> str | None:
-        """Uzman trader ön elemesi: zarar serisi bekletmesi, düşen bıçak ve BTC risk-off filtresi."""
+    def _expert_entry_block(
+        self,
+        symbol: str,
+        track: str,
+        now_utc: datetime,
+        *,
+        market: MarketBundle | None = None,
+    ) -> str | None:
+        """Uzman trader ön elemesi: zarar serisi, düşen bıçak, BTC risk-off, mum belirsizliği/aykırılığı ve defter."""
         cooldown = loss_streak_cooldown(self.storage.get_recent_closed_pnls(track, symbol, 4), now_utc)
         if cooldown:
             return f"{symbol} {cooldown}"
+        if market is not None:
+            if why := anomaly_outlier_block(market.closed_candles):
+                return f"{symbol}: {why}"
+            if why := candle_uncertainty_block(market.closed_candles):
+                return f"{symbol}: {why}"
+            if why := orderbook_microstructure_block(market.order_book):
+                return f"{symbol}: {why}"
         coin_candles = self._htf_candles(symbol)
         if coin_candles:
             why = coin_knife_block(trend_info(coin_candles))
@@ -1133,8 +1169,8 @@ class TradingSystemEngine:
                 return why
         return None
 
-    def _expert_context_notes(self, symbol: str) -> list[str]:
-        """Yapay zekâya (güvenilmeyen not olarak) trend ve rejim bağlamı."""
+    def _expert_context_notes(self, symbol: str, order_book: Any = None) -> list[str]:
+        """Yapay zekâya (güvenilmeyen not olarak) trend, rejim ve emir defteri bağlamı."""
         notes: list[str] = []
         coin_candles = self._htf_candles(symbol)
         if coin_candles:
@@ -1142,6 +1178,10 @@ class TradingSystemEngine:
         btc_candles = coin_candles if symbol == "BTCUSDT" else self._htf_candles("BTCUSDT")
         if btc_candles:
             notes.append(f"BTC 15dk trend: {trend_info(btc_candles).label()}")
+        if order_book is not None:
+            imb = orderbook_imbalance(order_book)
+            if imb is not None:
+                notes.append(f"Emir defteri dengesi (ilk 5 kademe): {imb:+.2f}")
         return notes
 
     def _expert_adjust_buy(
@@ -1178,8 +1218,13 @@ class TradingSystemEngine:
                 )
             except Exception:
                 capped = notional
+            capped = inverse_vol_capped_notional(capped, atr_pct)
             if capped < notional:
-                target = max(capped, market.filters.min_notional * Decimal("1.05"))
+                min_buy_floor = max(
+                    market.filters.min_notional * Decimal("1.05"),
+                    getattr(settings, "min_buy_notional_usdc", Decimal("10.00")),
+                )
+                target = max(capped, min_buy_floor)
                 if target < notional:
                     new_qty = quantize_down(target / price, market.filters.market_step_size)
                     if (
