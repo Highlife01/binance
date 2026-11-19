@@ -16,7 +16,7 @@ def test_leverage_targets_keep_stop_far_from_liquidation_and_lock_profit_sooner(
     prof = get_profile("AL_YUKSELINCE_SAT")
     base = RiskSettings(max_open_positions=5, max_position_size_usdc=Decimal("15"))
     s1 = prof.apply_to_risk_settings(base, leverage=1)
-    assert s1.stop_loss_pct == Decimal("0.035")
+    assert s1.stop_loss_pct == Decimal("0.0185")
     assert s1.min_net_profit_exit_pct == Decimal("0.0080")
     assert s1.take_profit_pct == Decimal("0.0115")
 
@@ -33,6 +33,8 @@ def test_leverage_targets_keep_stop_far_from_liquidation_and_lock_profit_sooner(
         assert s.min_net_profit_exit_pct <= prev_min
         assert s.min_net_profit_exit_pct * lev > Decimal("0.0080")
         assert s.take_profit_pct > s.min_net_profit_exit_pct
+        prev_sl = s.stop_loss_pct
+        prev_min = s.min_net_profit_exit_pct
         prev_sl, prev_min = s.stop_loss_pct, s.min_net_profit_exit_pct
 
 

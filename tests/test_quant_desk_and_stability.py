@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from decimal import Decimal
 import gzip
@@ -780,8 +781,10 @@ def test_cloud_migrates_5_limit_and_buys_more_than_5_positions_until_cash_runs_o
             max_position_size_usdc=Decimal("15.00"),
             daily_loss_limit_usdc=Decimal("10.00"),
             max_daily_new_positions=60,
+            max_unprotected_positions=0,
         )
     )
+    eng.storage.set_state("profitability_pack_v1", "1")
     eng.storage.set_state("cloud_leverage", "1")
     eng.storage.set_state("cloud_ai_enabled", "0")
     eng.storage.set_state("cloud_scan_symbols", ",".join(symbols))
@@ -801,6 +804,11 @@ def test_cloud_migrates_5_limit_and_buys_more_than_5_positions_until_cash_runs_o
 
     # Migration automatically upgraded saved max_open_positions from 5 -> 999
     assert eng.default_risk_settings().max_open_positions == 999
+
+    # Disable basket dump cap for this offline concurrency migration test
+    eng.storage.save_risk_settings(
+        dataclasses.replace(eng.default_risk_settings(), max_unprotected_positions=0)
+    )
 
     tick = app.handle("POST", "/api/cron/tick", {"X-Cron-Secret": cfg.cron_secret}, b"")
     assert tick.status == 200

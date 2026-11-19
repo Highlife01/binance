@@ -579,6 +579,41 @@ class CloudBotApplication:
             storage.set_state("min_buy_notional_v1_10usdt", "1")
             storage.set_state("min_buy_notional_v2_strict10", "1")
             changed = True
+        if storage.get_state("profitability_pack_v1", "") != "1":
+            prof_p = get_profile(storage.get_state("cloud_profile", "AL_YUKSELINCE_SAT") or "AL_YUKSELINCE_SAT")
+            cur_p = storage.load_risk_settings(
+                RiskSettings(
+                    max_open_positions=999,
+                    max_position_size_usdc=Decimal("15.00"),
+                    daily_loss_limit_usdc=Decimal("2.00"),
+                    min_buy_notional_usdc=Decimal("10.00"),
+                )
+            )
+            upgraded_p = dataclasses.replace(
+                cur_p,
+                stop_loss_pct=prof_p.stop_loss_pct,
+                take_profit_pct=prof_p.take_profit_pct,
+                min_net_profit_exit_pct=prof_p.min_net_profit_exit_pct,
+                max_unprotected_positions=3,
+            )
+            storage.save_risk_settings(upgraded_p)
+            for trk in ("LIVE_SPOT", "MAIN", "LIVE_MARGIN"):
+                for pos in storage.get_open_positions(track=trk):
+                    if pos.stop_loss_price is not None and pos.stop_loss_price > pos.entry_price:
+                        continue
+                    tight_sl = pos.entry_price * (Decimal("1") - prof_p.stop_loss_pct)
+                    new_sl = max(pos.stop_loss_price or Decimal("0"), tight_sl)
+                    storage.update_position_remaining(
+                        pos.position_id,
+                        quantity=pos.quantity,
+                        cost_basis_usdc=pos.cost_basis_usdc,
+                        entry_fee_usdc=pos.entry_fee_usdc,
+                        stop_loss_price=new_sl,
+                        take_profit_price=pos.take_profit_price,
+                        update_exit_targets=True,
+                    )
+            storage.set_state("profitability_pack_v1", "1")
+            changed = True
         return changed
 
     @staticmethod
@@ -644,6 +679,7 @@ class CloudBotApplication:
             max_open_positions=max(1, min(999, int(saved_risk.max_open_positions))),
             max_position_size_usdc=eff_pos_cap,
             min_buy_notional_usdc=eff_min_buy,
+            max_unprotected_positions=getattr(saved_risk, "max_unprotected_positions", 3),
         )
         raw_syms = st.get_state("cloud_scan_symbols", ",".join(DEFAULT_SCAN_SYMBOLS))
         symbols = self._parse_scan_symbols(raw_syms)
@@ -763,8 +799,11 @@ class CloudBotApplication:
         ranked, gainers = self._refresh_market_radar(eng, force=False)
         universe: list[str] = []
         seen_u: set[str] = set()
+        _allowed_b = frozenset({"BNBUSDT", "ARBUSDT", "CKBUSDT", "TRBUSDT", "PHBUSDT", "RLBUSDT"})
         for r in ranked:
             sym = str(r.get("symbol", "")).upper()
+            if sym.endswith("BUSDT") and sym not in _allowed_b:
+                continue
             if _SYMBOL_RE.fullmatch(sym) and sym.endswith("USDT") and sym not in seen_u:
                 seen_u.add(sym)
                 universe.append(sym)
@@ -774,6 +813,8 @@ class CloudBotApplication:
             if added_gainers >= 8:
                 break
             sym = str(g.get("symbol", "")).upper()
+            if sym.endswith("BUSDT") and sym not in _allowed_b:
+                continue
             chg = float(g.get("change_pct_24h", 0) or 0)
             qvol = float(g.get("quote_volume_24h", 0) or 0)
             if (

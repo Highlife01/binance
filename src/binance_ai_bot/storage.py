@@ -379,6 +379,7 @@ class SQLiteStorage:
             "hourly_margin_interest_rate": str(settings.hourly_margin_interest_rate),
             "min_net_profit_exit_pct": str(getattr(settings, "min_net_profit_exit_pct", Decimal("0"))),
             "min_buy_notional_usdc": str(getattr(settings, "min_buy_notional_usdc", Decimal("0"))),
+            "max_unprotected_positions": int(getattr(settings, "max_unprotected_positions", 3)),
         }
         self.set_state("risk_settings_json", json.dumps(payload, ensure_ascii=False))
 
@@ -437,6 +438,12 @@ class SQLiteStorage:
                             "min_buy_notional_usdc",
                             getattr(fallback, "min_buy_notional_usdc", Decimal("0")),
                         )
+                    )
+                ),
+                max_unprotected_positions=int(
+                    data.get(
+                        "max_unprotected_positions",
+                        getattr(fallback, "max_unprotected_positions", 3),
                     )
                 ),
             )

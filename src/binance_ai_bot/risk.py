@@ -291,6 +291,25 @@ class RiskManager:
                 daily_total_loss_usdc=daily_loss,
             )
 
+        # 3b. Korunmasız (stopu kâra/başabaşa kilitlenmemiş) açık pozisyon sınır kontrolü (sepet dump sigortası)
+        max_unprot = getattr(settings, "max_unprotected_positions", 3)
+        if max_unprot > 0:
+            unprotected_count = sum(
+                1
+                for p in active_open_positions
+                if p.stop_loss_price is None or p.stop_loss_price <= p.entry_price
+            )
+            if unprotected_count >= max_unprot:
+                return RiskCheckResult(
+                    allowed=False,
+                    reason=(
+                        f"Maksimum korunmasız (stopu kâra kilitlenmemiş) açık pozisyon sınırına "
+                        f"({unprotected_count}/{max_unprot}) ulaşıldı. "
+                        "Mevcut pozisyonlar kâra geçip stopları başabaşa kilitlenene kadar sepet riski koruması devrede."
+                    ),
+                    daily_total_loss_usdc=daily_loss,
+                )
+
         # 4. Günlük yeni pozisyon adedi sınırı
         daily_count = self.storage.count_daily_new_positions(ist_date, track=track)
         if daily_count >= settings.max_daily_new_positions:

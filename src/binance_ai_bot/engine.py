@@ -633,19 +633,45 @@ class TradingSystemEngine:
             stop_hit = pos.stop_loss_price is not None and best_bid <= pos.stop_loss_price
             tp_hit = pos.take_profit_price is not None and best_bid >= pos.take_profit_price
 
-            # Hareket eden (trailing) stop: Kâr-Al hedefine ulaşınca hemen satmak yerine stop'u kârın
-            # üzerine çekip hedefi yukarı taşır; güçlü yükselişin devamını yakalar, düşüşte kâr kilitli kalır.
+            # 1) BAŞABAŞ KÂR KİLİDİ (Breakeven Stop Ratchet):
+            # Fiyat girişin +%0.60 üzerine çıktığında, stop'u anında komisyonu temizleyen net kâr
+            # seviyesine (+%0.18 gross, ~+%0.03 net) yükseltir. Kârın tam zarara dönmesini engeller.
             trail_pct = getattr(settings, "trailing_stop_pct", Decimal("0"))
+            be_threshold = pos.entry_price * Decimal("1.0060")
+            be_stop_level = pos.entry_price * Decimal("1.0018")
+            if not liq_hit and best_bid >= be_threshold:
+                if pos.stop_loss_price is None or pos.stop_loss_price < be_stop_level:
+                    if be_stop_level < best_bid:
+                        self.storage.update_position_remaining(
+                            pos.position_id,
+                            quantity=pos.quantity,
+                            cost_basis_usdc=pos.cost_basis_usdc,
+                            entry_fee_usdc=pos.entry_fee_usdc,
+                            stop_loss_price=be_stop_level,
+                            take_profit_price=pos.take_profit_price,
+                            update_exit_targets=True,
+                        )
+                        pos = dataclasses.replace(pos, stop_loss_price=be_stop_level)
+                        symbol_open_pos = pos
+                        stop_hit = False
+                        trailing_note = (
+                            f"{market.symbol} başabaş kâr kilidi aktif: Stop {be_stop_level:.6g} "
+                            f"(+%0.18 net kâr garantisi) seviyesine kilitlendi (anlık {best_bid:.6g})."
+                        )
+
+            # 2) HAREKET EDEN (TRAILING) STOP:
+            # Fiyat Kâr-Al hedefine ulaştığında hemen körü körüne satmak yerine stop'u kârın üzerine
+            # çekip hedefi yukarı taşır; güçlü ivmeyle uçan coinlerde kârı maksimize eder.
             if tp_hit and not liq_hit and not stop_hit and trail_pct > Decimal("0"):
                 lock_pct = getattr(settings, "min_net_profit_exit_pct", Decimal("0"))
                 if getattr(pos, "borrowed_usdc", Decimal("0")) > Decimal("0") and pos.cost_basis_usdc > Decimal("0"):
                     lock_pct += compute_accrued_margin_interest(
                         pos, now_utc, getattr(settings, "hourly_margin_interest_rate", Decimal("0.000005"))
                     ) / pos.cost_basis_usdc
-                floor_px = pos.entry_price * (Decimal("1") + lock_pct)
+                floor_px = max(pos.entry_price * (Decimal("1") + lock_pct), be_stop_level)
                 new_stop = max(best_bid * (Decimal("1") - trail_pct), floor_px, pos.stop_loss_price or Decimal("0"))
-                if new_stop < best_bid:
-                    new_tp = best_bid * (Decimal("1") + trail_pct)
+                if new_stop < best_bid and (pos.stop_loss_price is None or new_stop > pos.stop_loss_price):
+                    new_tp = max(best_bid * (Decimal("1") + trail_pct), pos.take_profit_price or Decimal("0"))
                     self.storage.update_position_remaining(
                         pos.position_id,
                         quantity=pos.quantity,
@@ -661,7 +687,23 @@ class TradingSystemEngine:
                     trailing_note = (
                         f"{market.symbol} trailing stop yükseltildi: {new_stop:.6g} (anlık {best_bid:.6g})."
                     )
-            if liq_hit or stop_hit or tp_hit:
+
+            # 3) ZOMBİ POZİSYON TIMEOUT (Zombie Position Profit Harvester):
+            # Pozisyon 3 saatten (>180 dk) uzun süredir açık bekliyorsa ve anlık fiyat girişin üzerindeyse
+            # (+%0.20 üzeri, tüm komisyonları temizleyen kâr), sermayeyi ölü bekletmemek için kârla kapatır.
+            zombie_exit = False
+            if not liq_hit and not stop_hit:
+                try:
+                    opened_dt = datetime.fromisoformat(pos.opened_at_iso)
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    age_seconds = (now_utc - opened_dt).total_seconds()
+                except Exception:
+                    age_seconds = 0.0
+                if age_seconds >= 180 * 60 and best_bid >= pos.entry_price * Decimal("1.0020"):
+                    zombie_exit = True
+
+            if liq_hit or stop_hit or tp_hit or zombie_exit:
                 if stop_requested and stop_requested():
                     return blocked("Durdurma isteği alındı; emir gönderilmedi.")
                 locked_trailing = (
@@ -673,7 +715,15 @@ class TradingSystemEngine:
                 exit_tag = (
                     "LIKIDASYON"
                     if liq_hit
-                    else ("TRAILING_KAR" if locked_trailing else ("ZARAR_KES" if stop_hit else "KAR_AL"))
+                    else (
+                        "ZOMBI_POZISYON_KARI"
+                        if zombie_exit
+                        else (
+                            "TRAILING_KAR"
+                            if locked_trailing
+                            else ("ZARAR_KES" if stop_hit else "KAR_AL")
+                        )
+                    )
                 )
                 base_exit_sig = f"{exit_tag}:{pos.position_id}:{tech_signal.candle_open_time_ms}"
                 exit_sig = base_exit_sig
@@ -765,7 +815,7 @@ class TradingSystemEngine:
             trailing_armed = (
                 getattr(settings, "trailing_stop_pct", Decimal("0")) > Decimal("0")
                 and symbol_open_pos.stop_loss_price is not None
-                and symbol_open_pos.stop_loss_price > symbol_open_pos.entry_price
+                and symbol_open_pos.stop_loss_price > (symbol_open_pos.entry_price * Decimal("1.0025"))
             )
             is_quick_1m_noise = str(tech_signal.reason or "").lstrip().startswith(
                 ("Hızlı çıkış", "Hızlı ivme kaybı")

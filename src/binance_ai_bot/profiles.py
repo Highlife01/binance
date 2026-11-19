@@ -62,16 +62,16 @@ class TradingProfile:
             return (self.stop_loss_pct, self.take_profit_pct, self.min_net_profit_exit_pct)
 
         # AL_YUKSELINCE_SAT için kaldıraç kademelerine özel mühendislik tablosu:
-        # - 1x: Fiyat +%0.80 kâr kilidi / +%1.15 TP / -%3.50 SL (Teminatta ~+%0.65 / +%1.00 net kâr)
-        # - 2x: Fiyat +%0.65 kâr kilidi / +%0.90 TP / -%2.20 SL (Teminatta ~+%1.00 / +%1.50 net kâr, SL -%4.4 teminat)
-        # - 3x: Fiyat +%0.55 kâr kilidi / +%0.80 TP / -%1.50 SL (Teminatta ~+%1.20 / +%1.95 net kâr, SL -%4.5 teminat)
-        # - 4x: Fiyat +%0.50 kâr kilidi / +%0.75 TP / -%1.15 SL (Teminatta ~+%1.40 / +%2.40 net kâr, SL -%4.6 teminat)
-        # - 5x: Fiyat +%0.48 kâr kilidi / +%0.70 TP / -%0.95 SL (Teminatta ~+%1.65 / +%2.75 net kâr, SL -%4.75 teminat; likidasyon -%12'den çok uzak)
+        # - 1x: Fiyat +%0.80 kâr kilidi / +%1.15 TP / -%1.85 SL (Teminatta ~+%0.65 / +%1.00 net kâr)
+        # - 2x: Fiyat +%0.65 kâr kilidi / +%0.90 TP / -%1.50 SL (Teminatta ~+%1.00 / +%1.50 net kâr, SL -%3.0 teminat)
+        # - 3x: Fiyat +%0.55 kâr kilidi / +%0.80 TP / -%1.15 SL (Teminatta ~+%1.20 / +%1.95 net kâr, SL -%3.45 teminat)
+        # - 4x: Fiyat +%0.50 kâr kilidi / +%0.75 TP / -%0.95 SL (Teminatta ~+%1.40 / +%2.40 net kâr, SL -%3.8 teminat)
+        # - 5x: Fiyat +%0.48 kâr kilidi / +%0.70 TP / -%0.80 SL (Teminatta ~+%1.65 / +%2.75 net kâr, SL -%4.0 teminat; likidasyon -%12'den çok uzak)
         table: dict[int, tuple[Decimal, Decimal, Decimal]] = {
-            2: (Decimal("0.0220"), Decimal("0.0090"), Decimal("0.0065")),
-            3: (Decimal("0.0150"), Decimal("0.0080"), Decimal("0.0055")),
-            4: (Decimal("0.0115"), Decimal("0.0075"), Decimal("0.0050")),
-            5: (Decimal("0.0095"), Decimal("0.0070"), Decimal("0.0048")),
+            2: (Decimal("0.0150"), Decimal("0.0090"), Decimal("0.0065")),
+            3: (Decimal("0.0115"), Decimal("0.0080"), Decimal("0.0055")),
+            4: (Decimal("0.0095"), Decimal("0.0075"), Decimal("0.0050")),
+            5: (Decimal("0.0080"), Decimal("0.0070"), Decimal("0.0048")),
         }
         return table.get(eff_lev, (self.stop_loss_pct, self.take_profit_pct, self.min_net_profit_exit_pct))
 
@@ -106,6 +106,7 @@ class TradingProfile:
             expert_mode=self.expert_mode,
             risk_per_trade_pct=self.risk_per_trade_pct,
             min_buy_notional_usdc=getattr(base, "min_buy_notional_usdc", Decimal("0")),
+            max_unprotected_positions=getattr(base, "max_unprotected_positions", 3),
         )
 
 
@@ -118,23 +119,23 @@ TRADING_PROFILES: dict[str, TradingProfile] = {
             "alabildiği kadar farklı coinde eşzamanlı pozisyon açar, ufak geri çekilmelerde zararına "
             "erken satış yapmaz, komisyon sonrası net kârı görünce (+%0.80–%1.15 brüt / "
             "+%0.65–%1.00 net) anında satıp nakde döner "
-            "(%3.5 acil çöküş koruması + günlük zarar sigortası aktiftir)."
+            "(%1.85 acil çöküş koruması + günlük zarar sigortası aktiftir)."
         ),
         interval="1m",
         strategy=StrategyParams(
             ema_fast_span=5,
             ema_slow_span=13,
-            rsi_buy_min=26.0,
+            rsi_buy_min=35.0,
             rsi_buy_max=68.0,
             rsi_overbought_exit=69.0,
-            min_volume_ratio=0.35,
-            require_close_above_fast=False,
-            require_rising_momentum=False,
+            min_volume_ratio=0.80,
+            require_close_above_fast=True,
+            require_rising_momentum=True,
             fast_exit=True,
             dip_rebound_buy=True,
         ),
         max_daily_new_positions=999,
-        stop_loss_pct=Decimal("0.035"),
+        stop_loss_pct=Decimal("0.0185"),
         take_profit_pct=Decimal("0.0115"),
         ai_daily_call_limit=400,
         ai_min_call_interval_seconds=25,

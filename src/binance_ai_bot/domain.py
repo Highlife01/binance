@@ -236,6 +236,7 @@ class RiskSettings:
     max_entry_spread_pct: Decimal = Decimal("0")  # >0 ise alış-satış farkı bu orandan genişse yeni alım yapılmaz
     expert_mode: bool = False  # True: çoklu zaman dilimi/BTC rejimi filtresi, ATR dinamik stop/hedef, zarar serisi bekletmesi
     risk_per_trade_pct: Decimal = Decimal("0")  # >0 ise işlem başına kayıp bütçesi = özsermaye x bu oran (pozisyon büyüklüğü tavanı)
+    max_unprotected_positions: int = 3  # Korunmasız (stopu kâra kilitlenmemiş) açık pozisyon tavanı (sepet dump sigortası)
 
 
 @dataclass(frozen=True)

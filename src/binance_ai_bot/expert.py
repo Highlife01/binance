@@ -21,6 +21,12 @@ from typing import Any, Iterable, Sequence
 from .domain import Candle, Position
 
 _LEVERAGED_SUFFIXES = ("DOWN", "BULL", "BEAR")
+_ALLOWED_B_CRYPTO = frozenset({"BNBUSDT", "ARBUSDT", "CKBUSDT", "TRBUSDT", "PHBUSDT", "RLBUSDT"})
+_TOKENIZED_EQUITIES = frozenset({
+    "SOXSBUSDT", "SOXLBUSDT", "QQQBUSDT", "TQQQBUSDT", "NVDABUSDT", "MSTRBUSDT",
+    "CRCLBUSDT", "SPCXBUSDT", "SNDKBUSDT", "INTCBUSDT", "SKHYBUSDT", "MUBUSDT",
+    "GOOGLBUSDT", "AAPLBUSDT", "TSLABUSDT", "AMZNBUSDT", "MSFTBUSDT", "COINBUSDT",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +238,7 @@ def loss_streak_cooldown(
 
 
 _PROFIT_EXIT_REASONS = frozenset(
-    {"KAR_AL", "TRAILING_KAR", "KARDA_STRATEJI_SAT", "TAKE_PROFIT", "KURAL_SAT"}
+    {"KAR_AL", "TRAILING_KAR", "KARDA_STRATEJI_SAT", "TAKE_PROFIT", "KURAL_SAT", "ZOMBI_POZISYON_KARI"}
 )
 
 
@@ -322,6 +328,9 @@ def _iter_valid_usdt_tickers(
             continue
         base = str(getattr(flt, "base_asset", ""))
         if any(base.endswith(sfx) and len(base) > len(sfx) + 1 for sfx in _LEVERAGED_SUFFIXES):
+            continue
+        # Sentetik hisse/ETF tokenlarını (*BUSDT) ele, yalnızca gerçek kriptoları geçir
+        if sym in _TOKENIZED_EQUITIES or (sym.endswith("BUSDT") and len(sym) >= 8 and sym not in _ALLOWED_B_CRYPTO):
             continue
         try:
             last = float(t.get("lastPrice", 0))
